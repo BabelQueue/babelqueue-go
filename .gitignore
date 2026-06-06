@@ -1,0 +1,13 @@
+# Go build / test artifacts
+*.test
+*.out
+*.prof
+/bin/
+/dist/
+coverage.txt
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/

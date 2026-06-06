@@ -1,0 +1,33 @@
+name: Release
+
+on:
+  push:
+    tags: [ "v*" ]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+
+      - name: Test
+        run: go test -race -count=1 ./...
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+
+      # Go modules are served by the module proxy on tag; this nudges it to index
+      # the new version so `go get ...@<tag>` resolves immediately.
+      - name: Warm the Go module proxy
+        run: |
+          GOPROXY=https://proxy.golang.org go list -m \
+            github.com/babelqueue/babelqueue-go@${GITHUB_REF_NAME} || true
