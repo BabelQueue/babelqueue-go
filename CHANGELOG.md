@@ -9,6 +9,28 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-06
+
+### Added
+- **Runtime** — `App` (`NewApp`) with `Handle`, `Publish`, `Consume`/`Run` and a
+  bounded `Drain`. Routes by URN over the canonical envelope; attempts-based
+  retry → opt-in dead-letter queue; unknown-URN strategies
+  (`fail`/`delete`/`release`/`dead_letter`). Options: `WithDefaultQueue`,
+  `WithMaxAttempts`, `WithUnknownURNStrategy`, `WithDeadLetter`,
+  `WithDeadLetterQueue`, `WithDeadLetterSuffix`, `WithPollTimeout`.
+- **Transport** abstraction — `Transport` interface + `ReceivedMessage`, with an
+  in-process `InMemoryTransport`. The runtime stays **zero-dependency**; broker
+  drivers ship as separate modules:
+  - `github.com/babelqueue/babelqueue-go/redis` — Redis transport (reliable
+    BLMOVE + processing list), on `go-redis`.
+  - `github.com/babelqueue/babelqueue-go/amqp` — RabbitMQ transport (durable
+    queue, persistent delivery, contract AMQP properties, `basic.get` + manual
+    ack), on `amqp091-go`.
+
+### Notes
+- The core module remains zero-dependency; only the `redis`/`amqp` submodules
+  pull a broker driver.
+
 ## [0.1.0] - 2026-06-06
 
 ### Added
@@ -32,5 +54,6 @@ The envelope wire format is versioned separately by `meta.schema_version`
 - Pre-1.0: the public API may change before the `1.0.0` tag.
 - **Zero dependencies** (standard library only); Go `>=1.21`.
 
-[Unreleased]: https://github.com/BabelQueue/babelqueue-go/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/BabelQueue/babelqueue-go/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/BabelQueue/babelqueue-go/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/BabelQueue/babelqueue-go/releases/tag/v0.1.0

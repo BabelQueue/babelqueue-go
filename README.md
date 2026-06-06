@@ -101,15 +101,63 @@ body, _ := dl.Encode()
 `Annotate` returns a copy — the original envelope is preserved unchanged inside
 the dead-lettered message, so any-language consumers can still read it.
 
-## What this core is (and isn't)
+## Runtime — produce & consume
+
+The core is just the codec. An **optional, still-zero-dependency** runtime (`App`)
+ties it to a broker through a small `Transport` interface, with URN routing,
+attempts-based retry → dead-letter, and unknown-URN strategies:
+
+```go
+import babelqueue "github.com/babelqueue/babelqueue-go"
+
+app := babelqueue.NewApp(transport, // a Transport (see below)
+    babelqueue.WithDefaultQueue("orders"),
+    babelqueue.WithMaxAttempts(3),
+    babelqueue.WithDeadLetter(true),
+)
+
+app.Handle("urn:babel:orders:created", func(ctx context.Context, env babelqueue.Envelope) error {
+    // ... handle env.Data; return an error to retry / dead-letter
+    return nil
+})
+
+app.Publish(ctx, "urn:babel:orders:created", map[string]any{"order_id": 1042})
+app.Consume(ctx) // blocks; routes by URN until ctx is cancelled
+```
+
+`InMemoryTransport` (in the core) backs tests and local runs with zero deps. Broker
+drivers live in **separate modules**, so the core itself never pulls a dependency:
+
+```bash
+go get github.com/babelqueue/babelqueue-go/redis   # Redis  (go-redis)
+go get github.com/babelqueue/babelqueue-go/amqp    # RabbitMQ (amqp091-go)
+```
+
+```go
+import (
+    babelqueue "github.com/babelqueue/babelqueue-go"
+    "github.com/babelqueue/babelqueue-go/redis"
+)
+
+tr, _ := redis.New("redis://localhost:6379/0")        // reliable BLMOVE + processing list
+app := babelqueue.NewApp(tr, babelqueue.WithDefaultQueue("orders"))
+```
+
+The RabbitMQ transport (`amqp.New("amqp://…")`) publishes to a durable queue with
+persistent delivery and the contract AMQP properties (`type`=URN,
+`correlation_id`=trace_id, `x-schema-version`/`x-source-lang`/`x-attempts`), and
+consumes with `basic.get` + manual ack. Implement `babelqueue.Transport` yourself
+to back the runtime with any other broker.
+
+## What this core is
 
 It enforces the **contract**: the envelope shape, URN identity, trace propagation,
-schema-version gating and the dead-letter block. It is intentionally **not** a
-worker/runtime — retry loops, acks and broker wiring stay in your own code (or a
-future thin adapter), exactly as with the other SDK cores.
+schema-version gating and the dead-letter block — with **zero dependencies**. The
+optional `App` runtime and `InMemoryTransport` are zero-dep too; only the Redis and
+RabbitMQ transport modules pull a broker driver, and only if you import them.
 
 Unknown-URN strategy constants (`StrategyFail`, `StrategyDelete`,
-`StrategyRelease`, `StrategyDeadLetter`) are provided for adapters to act on.
+`StrategyRelease`, `StrategyDeadLetter`) drive the runtime's unknown-URN handling.
 
 ## Conformance
 

@@ -32,8 +32,48 @@ jobs:
             exit 1
           fi
 
-      - name: go vet
-        run: go vet ./...
+      - name: Vet & test core (zero dependencies)
+        run: |
+          go vet ./...
+          go test -race -count=1 ./...
 
-      - name: Test
+      - name: Build & vet transport modules
+        run: |
+          (cd redis && go build ./... && go vet ./...)
+          (cd amqp && go build ./... && go vet ./...)
+
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 5
+      rabbitmq:
+        image: rabbitmq:3
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "rabbitmq-diagnostics -q ping"
+          --health-interval 10s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+
+      - name: Redis transport integration tests
+        working-directory: redis
+        env:
+          REDIS_URL: redis://localhost:6379/0
+        run: go test -race -count=1 ./...
+
+      - name: RabbitMQ transport integration tests
+        working-directory: amqp
+        env:
+          AMQP_URL: amqp://guest:guest@localhost:5672/
         run: go test -race -count=1 ./...

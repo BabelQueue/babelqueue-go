@@ -2,7 +2,10 @@ name: Release
 
 on:
   push:
-    tags: [ "v*" ]
+    tags:
+      - "v*"        # core module
+      - "redis/v*"  # github.com/babelqueue/babelqueue-go/redis
+      - "amqp/v*"   # github.com/babelqueue/babelqueue-go/amqp
 
 permissions:
   contents: write
@@ -17,7 +20,7 @@ jobs:
         with:
           go-version: "stable"
 
-      - name: Test
+      - name: Test core
         run: go test -race -count=1 ./...
 
       - name: Create GitHub Release
@@ -26,8 +29,13 @@ jobs:
           generate_release_notes: true
 
       # Go modules are served by the module proxy on tag; this nudges it to index
-      # the new version so `go get ...@<tag>` resolves immediately.
+      # the tagged module (core or a transport submodule) so `go get` resolves it.
       - name: Warm the Go module proxy
         run: |
-          GOPROXY=https://proxy.golang.org go list -m \
-            github.com/babelqueue/babelqueue-go@${GITHUB_REF_NAME} || true
+          TAG="${GITHUB_REF_NAME}"
+          case "$TAG" in
+            redis/*) MODULE="github.com/babelqueue/babelqueue-go/redis"; VER="${TAG#redis/}" ;;
+            amqp/*)  MODULE="github.com/babelqueue/babelqueue-go/amqp";  VER="${TAG#amqp/}" ;;
+            *)       MODULE="github.com/babelqueue/babelqueue-go";       VER="$TAG" ;;
+          esac
+          GOPROXY=https://proxy.golang.org go list -m "${MODULE}@${VER}" || true
