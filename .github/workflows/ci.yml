@@ -42,6 +42,35 @@ jobs:
           (cd redis && go build ./... && go vet ./...)
           (cd amqp && go build ./... && go vet ./...)
 
+  lint:
+    name: Static analysis (staticcheck)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+          check-latest: true
+      - name: Install staticcheck
+        run: go install honnef.co/go/tools/cmd/staticcheck@latest
+      - name: staticcheck (core + transport modules)
+        run: |
+          staticcheck ./...
+          (cd redis && staticcheck ./...)
+          (cd amqp && staticcheck ./...)
+
+  coverage:
+    name: Coverage gate (>=90%)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "stable"
+          check-latest: true
+      - name: Core coverage gate
+        run: bash scripts/check-coverage.sh 90
+
   integration:
     runs-on: ubuntu-latest
     services:
@@ -90,3 +119,16 @@ jobs:
           diff -ru "$RUNNER_TEMP/conformance/fixtures"      "testdata/conformance/fixtures"
           diff -ru "$RUNNER_TEMP/conformance/schema"        "testdata/conformance/schema"
           echo "Vendored conformance is in sync with the canonical suite."
+
+  ci-green:
+    name: CI green
+    runs-on: ubuntu-latest
+    needs: [test, lint, coverage, integration, conformance]
+    if: ${{ always() }}
+    steps:
+      - name: Fail if any required job did not pass
+        run: |
+          if ${{ contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled') }}; then
+            echo "A required job failed or was cancelled."
+            exit 1
+          fi

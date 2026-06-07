@@ -9,6 +9,25 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.0.0] - 2026-06-07
+
+**1.0.0 — the public API is now SemVer-stable**: breaking changes require a MAJOR,
+following the deprecation policy. The wire envelope is unchanged
+(`schema_version: 1`). The `…/redis` and `…/amqp` transport modules are released as
+`v1.0.0` alongside and now require the core at `v1.0.0`. Full reference at
+[babelqueue.com](https://babelqueue.com).
+
+### Internal
+- CI adds **staticcheck** (core + `redis`/`amqp` modules) and a **>=90% core
+  coverage gate** (`scripts/check-coverage.sh`, currently 92%); added runtime
+  tests covering `Consume`/`Run`, the dead-letter options and the unknown-URN
+  strategies.
+- **GR-8 latency benchmark** (`bench_test.go`): `BenchmarkEnvelopeRoundTrip` /
+  `BenchmarkBarePayloadJSON` plus `TestCodecOverheadWithinBudget`, which asserts the
+  envelope encode/decode path adds **≤2%** over plain-JSON serialization vs a
+  conservative 750µs broker round-trip (measured ~0.3%; corroborated at ~1.4% over a
+  live loopback Redis round-trip).
+
 ## [0.2.0] - 2026-06-06
 
 ### Added
@@ -54,6 +73,7 @@ The envelope wire format is versioned separately by `meta.schema_version`
 - Pre-1.0: the public API may change before the `1.0.0` tag.
 - **Zero dependencies** (standard library only); Go `>=1.21`.
 
-[Unreleased]: https://github.com/BabelQueue/babelqueue-go/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/BabelQueue/babelqueue-go/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/BabelQueue/babelqueue-go/compare/v0.2.0...v1.0.0
 [0.2.0]: https://github.com/BabelQueue/babelqueue-go/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/BabelQueue/babelqueue-go/releases/tag/v0.1.0
