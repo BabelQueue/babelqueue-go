@@ -41,6 +41,10 @@ jobs:
         run: |
           (cd redis && go build ./... && go vet ./...)
           (cd amqp && go build ./... && go vet ./...)
+          # The SQS module's unit + conformance tests are network-free (fake
+          # client), so they run here across the Go matrix; the live ElasticMQ
+          # round-trip is `-tags=integration` in the integration job below.
+          (cd sqs && go build ./... && go vet ./... && go test -race -count=1 ./...)
 
   lint:
     name: Static analysis (staticcheck)
@@ -58,6 +62,7 @@ jobs:
           staticcheck ./...
           (cd redis && staticcheck ./...)
           (cd amqp && staticcheck ./...)
+          (cd sqs && staticcheck ./...)
 
   coverage:
     name: Coverage gate (>=90%)
@@ -88,6 +93,13 @@ jobs:
         options: >-
           --health-cmd "rabbitmq-diagnostics -q ping"
           --health-interval 10s --health-timeout 5s --health-retries 10
+      # Free, SQS-compatible broker for the SQS transport's live round-trip.
+      # The native image is shell-less, so readiness is polled by a TCP-probe
+      # step below rather than a container `--health-cmd`.
+      elasticmq:
+        image: softwaremill/elasticmq-native:1.6.11
+        ports:
+          - 9324:9324
     steps:
       - uses: actions/checkout@v5
 
@@ -106,6 +118,25 @@ jobs:
         env:
           AMQP_URL: amqp://guest:guest@localhost:5672/
         run: go test -race -count=1 ./...
+
+      - name: Wait for ElasticMQ
+        run: |
+          for i in $(seq 1 30); do
+            if (echo > /dev/tcp/localhost/9324) >/dev/null 2>&1; then
+              echo "ElasticMQ port 9324 open"; exit 0
+            fi
+            sleep 2
+          done
+          echo "ElasticMQ did not open port 9324"; exit 1
+
+      - name: Amazon SQS transport integration tests (ElasticMQ)
+        working-directory: sqs
+        env:
+          SQS_ENDPOINT: http://localhost:9324
+          AWS_REGION: us-east-1
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+        run: go test -tags=integration -race -count=1 ./...
 
   conformance:
     name: Conformance suite in sync

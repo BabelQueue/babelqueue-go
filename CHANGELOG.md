@@ -7,7 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 The envelope wire format is versioned separately by `meta.schema_version`
 (currently **1**) — see the contract at [babelqueue.com](https://babelqueue.com).
 
-## [Unreleased]
+## [1.1.0] - 2026-06-12
+
+The new `…/sqs` module is published as the Go submodule tag `sqs/v1.0.0`
+(`go get github.com/babelqueue/babelqueue-go/sqs`); the core, `redis` and `amqp`
+modules are unchanged at `v1.0.0`.
+
+### Added
+- **Amazon SQS transport** — new `…/sqs` module (`github.com/babelqueue/babelqueue-go/sqs`),
+  a `babelqueue.Transport` over the official AWS SDK (`aws-sdk-go-v2`). Implements
+  [§3 of the broker-bindings contract](https://babelqueue.com): the canonical
+  envelope is the `MessageBody`, projected onto native `MessageAttributes`
+  (`bq-job`/`bq-trace-id`/`bq-message-id`/`bq-schema-version`/`bq-source-lang`/`bq-created-at`);
+  visibility-timeout reserve → `DeleteMessage` ack; `attempts` reconciled to
+  `ApproximateReceiveCount − 1` (never lowering a runtime-incremented count). Options:
+  `WithRegion`, `WithEndpoint` (LocalStack/ElasticMQ), `WithQueueURLPrefix`,
+  `WithWaitTimeSeconds`, `WithVisibilityTimeout`, `WithFIFO`, `WithMessageGroupID`,
+  `WithContentDedup`, `WithClient`. Unit-tested against a fake SQS client (≈90%);
+  `-tags=integration` runs a LocalStack round-trip (covers the AWS config path). The
+  envelope is unchanged (`schema_version: 1`); SQS is purely additive. Ships as a
+  per-SDK MINOR.
 
 ## [1.0.0] - 2026-06-07
 
@@ -73,7 +92,8 @@ following the deprecation policy. The wire envelope is unchanged
 - Pre-1.0: the public API may change before the `1.0.0` tag.
 - **Zero dependencies** (standard library only); Go `>=1.21`.
 
-[Unreleased]: https://github.com/BabelQueue/babelqueue-go/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/BabelQueue/babelqueue-go/compare/v1.1.0...HEAD
+[1.1.0]: https://github.com/BabelQueue/babelqueue-go/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/BabelQueue/babelqueue-go/compare/v0.2.0...v1.0.0
 [0.2.0]: https://github.com/BabelQueue/babelqueue-go/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/BabelQueue/babelqueue-go/releases/tag/v0.1.0
