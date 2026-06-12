@@ -17,7 +17,7 @@ const conformanceDir = "../testdata/conformance"
 type sqsManifest struct {
 	SQS struct {
 		AttributeProjection struct {
-			EnvelopeFile      string                  `json:"envelope_file"`
+			EnvelopeFile      string                     `json:"envelope_file"`
 			MessageAttributes map[string]goldenAttribute `json:"message_attributes"`
 		} `json:"attribute_projection"`
 		AttemptsReconciliation struct {
