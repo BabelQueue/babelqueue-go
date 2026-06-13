@@ -69,6 +69,13 @@ jobs:
         run: |
           (cd kafka && go build ./... && go vet ./... && go test -race -count=1 ./...)
 
+      - name: Build & vet the Apache ActiveMQ Artemis module
+        # The pure-Go Azure/go-amqp (AMQP 1.0, no CGo) sits behind this module's Go 1.23 floor;
+        # its unit tests are network-free (fake Sender/Receiver/Client seam).
+        if: ${{ matrix.go == '1.23' || matrix.go == '1.24' }}
+        run: |
+          (cd artemis && go build ./... && go vet ./... && go test -race -count=1 ./...)
+
   lint:
     name: Static analysis (staticcheck)
     runs-on: ubuntu-latest
@@ -89,6 +96,7 @@ jobs:
           (cd azureservicebus && staticcheck ./...)
           (cd pulsar && staticcheck ./...)
           (cd kafka && staticcheck ./...)
+          (cd artemis && staticcheck ./...)
 
   coverage:
     name: Coverage gate (>=90%)
