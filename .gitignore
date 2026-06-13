@@ -11,3 +11,6 @@ coverage.txt
 *.swp
 .idea/
 .vscode/
+
+# CommitBrief local config and cache
+.commitbrief/
