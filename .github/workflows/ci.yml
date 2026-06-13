@@ -54,6 +54,14 @@ jobs:
         run: |
           (cd azureservicebus && go build ./... && go vet ./... && go test -race -count=1 ./...)
 
+      - name: Build & vet the Apache Pulsar module
+        # The pure-Go pulsar-client-go (no CGo, no libpulsar) sits behind this module's Go
+        # 1.23 floor, so build/test it only on matrix entries that satisfy it (its unit tests
+        # are network-free — a fake client).
+        if: ${{ matrix.go == '1.23' || matrix.go == '1.24' }}
+        run: |
+          (cd pulsar && go build ./... && go vet ./... && go test -race -count=1 ./...)
+
   lint:
     name: Static analysis (staticcheck)
     runs-on: ubuntu-latest
@@ -72,6 +80,7 @@ jobs:
           (cd amqp && staticcheck ./...)
           (cd sqs && staticcheck ./...)
           (cd azureservicebus && staticcheck ./...)
+          (cd pulsar && staticcheck ./...)
 
   coverage:
     name: Coverage gate (>=90%)

@@ -3,9 +3,10 @@ name: Release
 on:
   push:
     tags:
-      - "v*"        # core module
-      - "redis/v*"  # github.com/babelqueue/babelqueue-go/redis
-      - "amqp/v*"   # github.com/babelqueue/babelqueue-go/amqp
+      - "v*"            # core module
+      - "redis/v*"      # github.com/babelqueue/babelqueue-go/redis
+      - "amqp/v*"       # github.com/babelqueue/babelqueue-go/amqp
+      - "pulsar/v*"     # github.com/babelqueue/babelqueue-go/pulsar
 
 permissions:
   contents: write
@@ -34,8 +35,9 @@ jobs:
         run: |
           TAG="${GITHUB_REF_NAME}"
           case "$TAG" in
-            redis/*) MODULE="github.com/babelqueue/babelqueue-go/redis"; VER="${TAG#redis/}" ;;
-            amqp/*)  MODULE="github.com/babelqueue/babelqueue-go/amqp";  VER="${TAG#amqp/}" ;;
-            *)       MODULE="github.com/babelqueue/babelqueue-go";       VER="$TAG" ;;
+            redis/*)  MODULE="github.com/babelqueue/babelqueue-go/redis";  VER="${TAG#redis/}" ;;
+            amqp/*)   MODULE="github.com/babelqueue/babelqueue-go/amqp";   VER="${TAG#amqp/}" ;;
+            pulsar/*) MODULE="github.com/babelqueue/babelqueue-go/pulsar"; VER="${TAG#pulsar/}" ;;
+            *)        MODULE="github.com/babelqueue/babelqueue-go";        VER="$TAG" ;;
           esac
           GOPROXY=https://proxy.golang.org go list -m "${MODULE}@${VER}" || true
