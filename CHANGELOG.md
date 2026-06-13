@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 The envelope wire format is versioned separately by `meta.schema_version`
 (currently **1**) — see the contract at [babelqueue.com](https://babelqueue.com).
 
+## [1.2.0] - 2026-06-13
+
+The new `…/azureservicebus` module is published as the Go submodule tag
+`azureservicebus/v1.0.0` (`go get github.com/babelqueue/babelqueue-go/azureservicebus`); the
+core, `redis`, `amqp` and `sqs` modules are unchanged. **Requires Go 1.23+** (the Azure SDK floor).
+
+### Added
+- **Azure Service Bus transport** — new `…/azureservicebus` module
+  (`github.com/babelqueue/babelqueue-go/azureservicebus`), a `babelqueue.Transport` over the
+  official Azure SDK (`azure-sdk-for-go/.../azservicebus`). Implements
+  [§4 of the broker-bindings contract](https://babelqueue.com/docs/spec/1.x/broker-bindings#azure-service-bus):
+  the canonical envelope is the message `Body`, projected onto native fields (`Subject` = URN,
+  `CorrelationID` = `trace_id`, `MessageID` = `meta.id`) plus the `bq-` application properties;
+  PeekLock reserve → `CompleteMessage` ack; `attempts` reconciled to
+  `max(body, DeliveryCount − 1)`. Options: `WithConnectionString`, `WithAzureClient`,
+  `WithClient`, `WithMaxWaitTime`. Unit-tested against fake senders/receivers (no Azure, no
+  network). The envelope is unchanged (`schema_version: 1`); ASB is purely additive. Ships as a
+  per-SDK MINOR.
+
 ## [1.1.0] - 2026-06-12
 
 The new `…/sqs` module is published as the Go submodule tag `sqs/v1.0.0`
@@ -92,7 +111,8 @@ following the deprecation policy. The wire envelope is unchanged
 - Pre-1.0: the public API may change before the `1.0.0` tag.
 - **Zero dependencies** (standard library only); Go `>=1.21`.
 
-[Unreleased]: https://github.com/BabelQueue/babelqueue-go/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/BabelQueue/babelqueue-go/compare/v1.2.0...HEAD
+[1.2.0]: https://github.com/BabelQueue/babelqueue-go/compare/v1.1.0...v1.2.0
 [1.1.0]: https://github.com/BabelQueue/babelqueue-go/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/BabelQueue/babelqueue-go/compare/v0.2.0...v1.0.0
 [0.2.0]: https://github.com/BabelQueue/babelqueue-go/compare/v0.1.0...v0.2.0

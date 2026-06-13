@@ -46,6 +46,14 @@ jobs:
           # round-trip is `-tags=integration` in the integration job below.
           (cd sqs && go build ./... && go vet ./... && go test -race -count=1 ./...)
 
+      - name: Build & vet the Azure Service Bus module
+        # azure-messaging-servicebus requires Go 1.23+, so build/test this module only
+        # on the matrix entries that satisfy that floor (its unit + conformance tests are
+        # network-free — a fake client).
+        if: ${{ matrix.go == '1.23' || matrix.go == '1.24' }}
+        run: |
+          (cd azureservicebus && go build ./... && go vet ./... && go test -race -count=1 ./...)
+
   lint:
     name: Static analysis (staticcheck)
     runs-on: ubuntu-latest
@@ -63,6 +71,7 @@ jobs:
           (cd redis && staticcheck ./...)
           (cd amqp && staticcheck ./...)
           (cd sqs && staticcheck ./...)
+          (cd azureservicebus && staticcheck ./...)
 
   coverage:
     name: Coverage gate (>=90%)
