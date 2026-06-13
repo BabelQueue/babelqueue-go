@@ -6,8 +6,8 @@
 // Producing sends the canonical envelope as the message body and projects the contract
 // envelope fields onto the AMQP a JMS peer reads: correlation-id = trace_id (JMSCorrelationID),
 // creation-time = meta.created_at (JMSTimestamp), the x-opt-jms-type message annotation = URN
-// (JMSType, the AMQP-JMS mapping), plus the bq- application properties (string-valued, matching
-// the Java JMS setStringProperty projection) — so a Java/.NET/Node/Python peer can route and
+// (JMSType, the AMQP-JMS mapping), plus the bq_ application properties (string-valued; underscored
+// names, since JMS property names must be valid Java identifiers) — so a Java/.NET/Node/Python peer can route and
 // correlate without parsing the body. Consuming receives one message at a time
 // (Receive -> process -> Ack); the broker's native AMQP delivery-count is reconciled onto the
 // envelope as attempts = max(body, delivery-count) — no −1, because the AMQP counter is 0-based
@@ -207,7 +207,7 @@ func (t *Transport) Close() error {
 
 // message projects the envelope's contract fields onto a native AMQP message: body = envelope
 // JSON (an AMQP value), correlation-id = trace_id, creation-time = meta.created_at, the
-// x-opt-jms-type annotation = URN, plus the bq- application properties. The body stays
+// x-opt-jms-type annotation = URN, plus the bq_ application properties. The body stays
 // authoritative.
 func message(body string) *amqp.Message {
 	m := &amqp.Message{Value: body}
@@ -230,15 +230,17 @@ func message(body string) *amqp.Message {
 	return m
 }
 
-// applicationProperties builds the string-valued bq-* projection (Contract §7.2).
+// applicationProperties builds the string-valued bq_* projection (Contract §7.2). The names use
+// UNDERSCORES, not hyphens: a JMS property name must be a valid Java identifier, and every
+// Artemis SDK uses the same JMS-legal form for cross-protocol parity.
 func applicationProperties(env babelqueue.Envelope) map[string]any {
 	props := map[string]any{
-		"bq-schema-version": strconv.Itoa(env.Meta.SchemaVersion),
-		"bq-attempts":       strconv.Itoa(env.Attempts),
-		"bq-app-id":         "babelqueue",
+		"bq_schema_version": strconv.Itoa(env.Meta.SchemaVersion),
+		"bq_attempts":       strconv.Itoa(env.Attempts),
+		"bq_app_id":         "babelqueue",
 	}
 	if env.Meta.Lang != "" {
-		props["bq-source-lang"] = env.Meta.Lang
+		props["bq_source_lang"] = env.Meta.Lang
 	}
 	return props
 }

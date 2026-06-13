@@ -107,17 +107,17 @@ func TestPublishProjectsBodyCorrelationAnnotationAndProperties(t *testing.T) {
 	if m.Annotations[jmsTypeKey] != urn {
 		t.Errorf("x-opt-jms-type: want %q, got %#v", urn, m.Annotations[jmsTypeKey])
 	}
-	if m.ApplicationProperties["bq-app-id"] != "babelqueue" {
-		t.Errorf("bq-app-id: want babelqueue, got %#v", m.ApplicationProperties["bq-app-id"])
+	if m.ApplicationProperties["bq_app_id"] != "babelqueue" {
+		t.Errorf("bq_app_id: want babelqueue, got %#v", m.ApplicationProperties["bq_app_id"])
 	}
-	if m.ApplicationProperties["bq-schema-version"] != "1" {
-		t.Errorf("bq-schema-version: want \"1\", got %#v", m.ApplicationProperties["bq-schema-version"])
+	if m.ApplicationProperties["bq_schema_version"] != "1" {
+		t.Errorf("bq_schema_version: want \"1\", got %#v", m.ApplicationProperties["bq_schema_version"])
 	}
-	if m.ApplicationProperties["bq-attempts"] != "2" {
-		t.Errorf("bq-attempts: want \"2\", got %#v", m.ApplicationProperties["bq-attempts"])
+	if m.ApplicationProperties["bq_attempts"] != "2" {
+		t.Errorf("bq_attempts: want \"2\", got %#v", m.ApplicationProperties["bq_attempts"])
 	}
-	if m.ApplicationProperties["bq-source-lang"] == nil {
-		t.Error("bq-source-lang: want present")
+	if m.ApplicationProperties["bq_source_lang"] == nil {
+		t.Error("bq_source_lang: want present")
 	}
 }
 
