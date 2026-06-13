@@ -9,6 +9,7 @@ on:
       - "sqs/v*"              # github.com/babelqueue/babelqueue-go/sqs
       - "azureservicebus/v*"  # github.com/babelqueue/babelqueue-go/azureservicebus
       - "pulsar/v*"           # github.com/babelqueue/babelqueue-go/pulsar
+      - "kafka/v*"            # github.com/babelqueue/babelqueue-go/kafka
 
 permissions:
   contents: write
@@ -42,6 +43,7 @@ jobs:
             sqs/*)             MODULE="github.com/babelqueue/babelqueue-go/sqs";             VER="${TAG#sqs/}" ;;
             azureservicebus/*) MODULE="github.com/babelqueue/babelqueue-go/azureservicebus"; VER="${TAG#azureservicebus/}" ;;
             pulsar/*)          MODULE="github.com/babelqueue/babelqueue-go/pulsar";          VER="${TAG#pulsar/}" ;;
+            kafka/*)           MODULE="github.com/babelqueue/babelqueue-go/kafka";           VER="${TAG#kafka/}" ;;
             *)                 MODULE="github.com/babelqueue/babelqueue-go";                 VER="$TAG" ;;
           esac
           GOPROXY=https://proxy.golang.org go list -m "${MODULE}@${VER}" || true
