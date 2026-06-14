@@ -12,6 +12,7 @@ on:
       - "kafka/v*"            # github.com/babelqueue/babelqueue-go/kafka
       - "artemis/v*"          # github.com/babelqueue/babelqueue-go/artemis
       - "asynq/v*"            # github.com/babelqueue/babelqueue-go/asynq
+      - "machinery/v*"        # github.com/babelqueue/babelqueue-go/machinery
 
 permissions:
   contents: write
@@ -48,6 +49,7 @@ jobs:
             kafka/*)           MODULE="github.com/babelqueue/babelqueue-go/kafka";           VER="${TAG#kafka/}" ;;
             artemis/*)         MODULE="github.com/babelqueue/babelqueue-go/artemis";         VER="${TAG#artemis/}" ;;
             asynq/*)           MODULE="github.com/babelqueue/babelqueue-go/asynq";           VER="${TAG#asynq/}" ;;
+            machinery/*)       MODULE="github.com/babelqueue/babelqueue-go/machinery";       VER="${TAG#machinery/}" ;;
             *)                 MODULE="github.com/babelqueue/babelqueue-go";                 VER="$TAG" ;;
           esac
           GOPROXY=https://proxy.golang.org go list -m "${MODULE}@${VER}" || true

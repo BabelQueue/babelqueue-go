@@ -9,11 +9,27 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
-The new `…/asynq` module is published as the Go submodule tag `asynq/v1.0.0`
-(`go get github.com/babelqueue/babelqueue-go/asynq`); the core and other transport
-modules are unchanged. **Requires Go 1.24+** (the asynq floor).
+The new `…/asynq` and `…/machinery` modules are published as the Go submodule tags
+`asynq/v1.0.0` and `machinery/v1.0.0`
+(`go get github.com/babelqueue/babelqueue-go/{asynq,machinery}`); the core and other
+transport modules are unchanged. asynq **requires Go 1.24+** (its floor); machinery floors at
+Go 1.23.
 
 ### Added
+- **machinery adapter** — new `…/machinery` module
+  (`github.com/babelqueue/babelqueue-go/machinery`), a framework adapter over the Redis/AMQP-backed
+  [machinery](https://github.com/RichardKnop/machinery) task queue (not a new broker binding — its
+  storage is Redis/AMQP, [§1/§2](https://babelqueue.com)); the sibling of the `…/asynq` module.
+  machinery is **argument-based**, so the envelope URN (`job`) is the task `Name` (machinery routes
+  on it like every BabelQueue consumer) and a single string `Arg` carries the canonical envelope
+  JSON byte-for-byte (no wrapping, no added fields). Produce:
+  `NewProducer(server).Dispatch(ctx, urn, data, …)` (and `Send` for a pre-built envelope);
+  `Signature`/`SignatureFor` expose the `*tasks.Signature` for setting machinery-native fields
+  (`RetryCount`, `ETA`, `RoutingKey`). Consume: `Register(server, urn, handler)` registers the
+  handler under the URN as the task name, decoding the envelope arg and rejecting an unacceptable
+  envelope with `ErrNotAccepted`; `Bind`/`Envelope` expose the lower-level conversions. Unit- and
+  conformance-tested against fake `Sender`/`Registrar` seams (no broker, no network). The envelope
+  is unchanged (`schema_version: 1`); machinery is purely additive. Ships as a per-SDK MINOR.
 - **asynq adapter** — new `…/asynq` module (`github.com/babelqueue/babelqueue-go/asynq`),
   a framework adapter over the Redis-backed [asynq](https://github.com/hibiken/asynq) task
   queue (not a new broker binding — asynq's storage is Redis, [§1](https://babelqueue.com)).
