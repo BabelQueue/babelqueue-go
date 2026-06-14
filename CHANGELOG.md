@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 The envelope wire format is versioned separately by `meta.schema_version`
 (currently **1**) — see the contract at [babelqueue.com](https://babelqueue.com).
 
+## [Unreleased]
+
+The new `…/asynq` module is published as the Go submodule tag `asynq/v1.0.0`
+(`go get github.com/babelqueue/babelqueue-go/asynq`); the core and other transport
+modules are unchanged. **Requires Go 1.24+** (the asynq floor).
+
+### Added
+- **asynq adapter** — new `…/asynq` module (`github.com/babelqueue/babelqueue-go/asynq`),
+  a framework adapter over the Redis-backed [asynq](https://github.com/hibiken/asynq) task
+  queue (not a new broker binding — asynq's storage is Redis, [§1](https://babelqueue.com)).
+  The canonical envelope JSON is the asynq task `Payload` byte-for-byte (no wrapping, no added
+  fields), and the envelope URN (`job`) is the asynq task `TypeName`, so asynq routes by URN
+  like every BabelQueue consumer. Produce: `NewProducer(client).Dispatch(ctx, urn, data, …)`
+  (and `Enqueue` for a pre-built envelope), with envelope options (`WithQueue`, `WithTraceID`)
+  and asynq task options (`MaxRetry`, `ProcessIn`, …) mixed freely — distinguished by type.
+  Consume: `Register(mux, urn, handler)` routes by URN on an `*asynq.ServeMux`, decoding the
+  payload and rejecting an unacceptable envelope with `ErrNotAccepted`; `Bind`/`Task`/`Envelope`
+  expose the lower-level conversions. Unit- and conformance-tested against a fake `Enqueuer`
+  seam (no Redis, no network). The envelope is unchanged (`schema_version: 1`); asynq is purely
+  additive. Ships as a per-SDK MINOR.
+
 ## [1.2.0] - 2026-06-13
 
 The new `…/azureservicebus` module is published as the Go submodule tag

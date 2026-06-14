@@ -11,6 +11,7 @@ on:
       - "pulsar/v*"           # github.com/babelqueue/babelqueue-go/pulsar
       - "kafka/v*"            # github.com/babelqueue/babelqueue-go/kafka
       - "artemis/v*"          # github.com/babelqueue/babelqueue-go/artemis
+      - "asynq/v*"            # github.com/babelqueue/babelqueue-go/asynq
 
 permissions:
   contents: write
@@ -46,6 +47,7 @@ jobs:
             pulsar/*)          MODULE="github.com/babelqueue/babelqueue-go/pulsar";          VER="${TAG#pulsar/}" ;;
             kafka/*)           MODULE="github.com/babelqueue/babelqueue-go/kafka";           VER="${TAG#kafka/}" ;;
             artemis/*)         MODULE="github.com/babelqueue/babelqueue-go/artemis";         VER="${TAG#artemis/}" ;;
+            asynq/*)           MODULE="github.com/babelqueue/babelqueue-go/asynq";           VER="${TAG#asynq/}" ;;
             *)                 MODULE="github.com/babelqueue/babelqueue-go";                 VER="$TAG" ;;
           esac
           GOPROXY=https://proxy.golang.org go list -m "${MODULE}@${VER}" || true
