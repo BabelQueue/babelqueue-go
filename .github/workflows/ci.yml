@@ -45,6 +45,9 @@ jobs:
           # client), so they run here across the Go matrix; the live ElasticMQ
           # round-trip is `-tags=integration` in the integration job below.
           (cd sqs && go build ./... && go vet ./... && go test -race -count=1 ./...)
+          # The optional OpenTelemetry module (ADR-0025) — its tests use an in-memory
+          # span recorder, so they are network-free and run across the Go matrix.
+          (cd otel && go build ./... && go vet ./... && go test -race -count=1 ./...)
 
       - name: Build & vet the Azure Service Bus module
         # azure-messaging-servicebus requires Go 1.23+, so build/test this module only
