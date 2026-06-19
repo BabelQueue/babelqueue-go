@@ -160,6 +160,9 @@ func (a *App) Drain(ctx context.Context, queue string, max int) (int, error) {
 }
 
 func (a *App) dispatch(ctx context.Context, msg *ReceivedMessage) {
+	if msg.Headers[HeaderReplayBypass] != "" {
+		ctx = withReplay(ctx)
+	}
 	env, _ := Decode([]byte(msg.Body))
 	urn := env.URN()
 

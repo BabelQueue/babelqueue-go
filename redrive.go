@@ -18,6 +18,11 @@ type RedriveOptions struct {
 	// Select, when non-nil, picks which messages to redrive (e.g. by reason or URN).
 	// Unselected messages are returned to the DLQ unchanged.
 	Select func(Envelope) bool
+	// Bypass stamps the bq-replay-bypass transport header on each redriven message, so a
+	// handler can skip external side-effects that already ran (see [BypassExternalEffects]).
+	// It takes effect only when the transport is a [HeaderPublisher]; otherwise it is a no-op
+	// and the per-item Bypassed flag stays false (ADR-0027).
+	Bypass bool
 	// Timeout is the per-pop wait passed to the transport (default 1s).
 	Timeout time.Duration
 }
@@ -31,6 +36,7 @@ type RedriveItem struct {
 	From      string // the DLQ it was read from
 	To        string // target queue (the plan, even on a dry run; "" when skipped/undecodable)
 	Redriven  bool   // true only when actually re-published to To
+	Bypassed  bool   // true when the bq-replay-bypass header was stamped on the redriven message
 }
 
 // RedriveResult summarizes a [Redrive] run.
@@ -124,13 +130,15 @@ func Redrive(ctx context.Context, t Transport, dlq string, opts RedriveOptions) 
 			_ = t.Ack(ctx, p.msg)
 			return res, err
 		}
-		if err := t.Publish(ctx, target, string(body)); err != nil {
+		bypassed, err := publishRedriven(ctx, t, target, string(body), opts.Bypass)
+		if err != nil {
 			_ = t.Publish(ctx, dlq, p.msg.Body) // restore on a publish failure
 			_ = t.Ack(ctx, p.msg)
 			return res, err
 		}
 		_ = t.Ack(ctx, p.msg)
 		item.Redriven = true
+		item.Bypassed = bypassed
 		res.Redriven++
 		res.Items = append(res.Items, item)
 	}
@@ -144,4 +152,16 @@ func sourceQueueOf(env Envelope) string {
 		return env.DeadLetter.OriginalQueue
 	}
 	return env.Meta.Queue
+}
+
+// publishRedriven re-publishes a reset message to queue. When bypass is set and the transport
+// is a [HeaderPublisher], it stamps the bq-replay-bypass header and reports bypassed=true;
+// otherwise it publishes plainly and reports bypassed=false.
+func publishRedriven(ctx context.Context, t Transport, queue, body string, bypass bool) (bool, error) {
+	if bypass {
+		if hp, ok := t.(HeaderPublisher); ok {
+			return true, hp.PublishWithHeaders(ctx, queue, body, map[string]string{HeaderReplayBypass: "1"})
+		}
+	}
+	return false, t.Publish(ctx, queue, body)
 }
