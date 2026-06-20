@@ -3,7 +3,7 @@ module github.com/babelqueue/babelqueue-go/amqp
 go 1.21
 
 require (
-	github.com/babelqueue/babelqueue-go v1.3.0
+	github.com/babelqueue/babelqueue-go v1.6.0
 	github.com/rabbitmq/amqp091-go v1.10.0
 )
 

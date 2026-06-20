@@ -62,6 +62,100 @@ func TestRedisRoundTrip(t *testing.T) {
 	}
 }
 
+// TestRedisHeaderRoundTrip is an integration test (skips without a broker): a message
+// published with a traceparent header (ADR-0028) is delivered back with it on
+// ReceivedMessage.Headers, the body is the unchanged wire envelope, and Ack succeeds —
+// proving the LREM handle still matches the stored frame.
+func TestRedisHeaderRoundTrip(t *testing.T) {
+	tr, err := bqredis.New(brokerURL())
+	if err != nil {
+		t.Skipf("bad redis url: %v", err)
+	}
+	defer tr.Close()
+
+	// Transport implements the optional HeaderPublisher capability after ADR-0028.
+	hp, ok := any(tr).(babelqueue.HeaderPublisher)
+	if !ok {
+		t.Fatal("redis.Transport must implement babelqueue.HeaderPublisher")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	const queue = "bq-test-redis-headers"
+	const traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+
+	env, err := babelqueue.Make("urn:babel:test:ping", map[string]any{"n": 1}, babelqueue.WithQueue(queue))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := env.Encode()
+
+	if err := hp.PublishWithHeaders(ctx, queue, string(body), map[string]string{"traceparent": traceparent}); err != nil {
+		t.Skipf("redis not reachable: %v", err)
+	}
+
+	msg, err := tr.Pop(ctx, queue, time.Second)
+	if err != nil {
+		t.Fatalf("Pop: %v", err)
+	}
+	if msg == nil {
+		t.Fatal("expected a message")
+	}
+	if got := msg.Headers["traceparent"]; got != traceparent {
+		t.Errorf("Headers[traceparent] = %q, want %q", got, traceparent)
+	}
+	if msg.Body != string(body) {
+		t.Errorf("Body = %q, want the unchanged wire envelope %q", msg.Body, string(body))
+	}
+	if err := tr.Ack(ctx, msg); err != nil {
+		t.Fatalf("Ack (handle must match the stored frame): %v", err)
+	}
+}
+
+// TestRedisBareValueBackCompat is an integration test (skips without a broker): a value
+// produced by plain Publish (a bare envelope, e.g. an older or non-otel publisher) still
+// consumes correctly — Headers is nil and Ack matches on the bare value as the handle.
+func TestRedisBareValueBackCompat(t *testing.T) {
+	tr, err := bqredis.New(brokerURL())
+	if err != nil {
+		t.Skipf("bad redis url: %v", err)
+	}
+	defer tr.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	const queue = "bq-test-redis-bare"
+
+	env, err := babelqueue.Make("urn:babel:test:ping", map[string]any{"n": 2}, babelqueue.WithQueue(queue))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := env.Encode()
+
+	if err := tr.Publish(ctx, queue, string(body)); err != nil {
+		t.Skipf("redis not reachable: %v", err)
+	}
+
+	msg, err := tr.Pop(ctx, queue, time.Second)
+	if err != nil {
+		t.Fatalf("Pop: %v", err)
+	}
+	if msg == nil {
+		t.Fatal("expected a message")
+	}
+	if msg.Headers != nil {
+		t.Errorf("Headers = %v, want nil for a bare value", msg.Headers)
+	}
+	if msg.Body != string(body) {
+		t.Errorf("Body = %q, want the bare envelope verbatim", msg.Body)
+	}
+	if err := tr.Ack(ctx, msg); err != nil {
+		t.Fatalf("Ack (handle must equal the bare value): %v", err)
+	}
+}
+
 // TestRedisAppEndToEnd runs a publish + drain through the App over Redis.
 func TestRedisAppEndToEnd(t *testing.T) {
 	tr, err := bqredis.New(brokerURL())

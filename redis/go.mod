@@ -3,7 +3,7 @@ module github.com/babelqueue/babelqueue-go/redis
 go 1.21
 
 require (
-	github.com/babelqueue/babelqueue-go v1.0.0
+	github.com/babelqueue/babelqueue-go v1.6.0
 	github.com/redis/go-redis/v9 v9.7.3
 )
 
