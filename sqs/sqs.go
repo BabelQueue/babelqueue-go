@@ -14,11 +14,18 @@
 // This binding implements §3 of the BabelQueue broker-bindings contract. The
 // envelope is unchanged (schema_version stays 1); SQS is purely additive.
 //
+// It also implements the optional [babelqueue.HeaderPublisher] capability: out-of-band
+// transport headers (e.g. a W3C traceparent for cross-hop span linkage, ADR-0028, or
+// the bq-replay-bypass marker, ADR-0027) ride as String MessageAttributes beside the
+// frozen envelope — never in it (GR-1) — and are surfaced back to the consumer on
+// [babelqueue.ReceivedMessage.Headers].
+//
 // Full spec: https://babelqueue.com
 package sqs
 
 import (
 	"context"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -145,8 +152,28 @@ func newTransport(opts ...Option) *Transport {
 	return t
 }
 
+// maxMessageAttributes is the SQS per-message cap on user MessageAttributes (10).
+// The contract bq-* projection (up to 6) plus traceparent(+tracestate) stays well
+// under it; mergeAttributes enforces the limit so unbounded extra headers can never
+// push a send past it (SQS would reject the whole message otherwise).
+const maxMessageAttributes = 10
+
 // Publish sends body to queue with the contract MessageAttributes projection.
 func (t *Transport) Publish(ctx context.Context, queue, body string) error {
+	return t.publish(ctx, queue, body, nil)
+}
+
+// PublishWithHeaders sends body together with out-of-band transport headers
+// ([babelqueue.HeaderPublisher]). The headers ride as String MessageAttributes
+// beside the frozen envelope (GR-1) — e.g. a W3C traceparent for cross-hop span
+// linkage (ADR-0028) — merged on top of the contract bq-* attributes without
+// clobbering them, and bounded by the 10-attribute SQS limit. A nil/empty map
+// behaves exactly like [Transport.Publish].
+func (t *Transport) PublishWithHeaders(ctx context.Context, queue, body string, headers map[string]string) error {
+	return t.publish(ctx, queue, body, headers)
+}
+
+func (t *Transport) publish(ctx context.Context, queue, body string, headers map[string]string) error {
 	url, err := t.resolveURL(ctx, queue)
 	if err != nil {
 		return err
@@ -154,7 +181,7 @@ func (t *Transport) Publish(ctx context.Context, queue, body string) error {
 	in := &awssqs.SendMessageInput{
 		QueueUrl:          aws.String(url),
 		MessageBody:       aws.String(body),
-		MessageAttributes: attributes(body),
+		MessageAttributes: mergeAttributes(attributes(body), headers),
 	}
 	if t.fifo {
 		group := t.messageGroupID
@@ -213,7 +240,12 @@ func (t *Transport) Pop(ctx context.Context, queue string, timeout time.Duration
 	if rc, ok := m.Attributes[string(types.MessageSystemAttributeNameApproximateReceiveCount)]; ok {
 		body = reconcileAttempts(body, rc)
 	}
-	return &babelqueue.ReceivedMessage{Body: body, Queue: queue, Handle: aws.ToString(m.ReceiptHandle)}, nil
+	return &babelqueue.ReceivedMessage{
+		Body:    body,
+		Queue:   queue,
+		Handle:  aws.ToString(m.ReceiptHandle),
+		Headers: headersFromAttributes(m.MessageAttributes),
+	}, nil
 }
 
 // Ack deletes the reserved message (DeleteMessage on its receipt handle).
@@ -296,6 +328,62 @@ func attributes(body string) map[string]types.MessageAttributeValue {
 	return attrs
 }
 
+// mergeAttributes overlays the out-of-band string headers onto the contract attribute
+// projection as String MessageAttributes, without overwriting an existing bq-*
+// attribute (the contract wins a key collision) and skipping empty keys/values. It
+// stops once the message reaches the 10-attribute SQS limit so unbounded extra headers
+// can never make SQS reject the send (the contract attributes are always preserved
+// first). Keys are merged in sorted order so the bounded subset is deterministic.
+func mergeAttributes(base map[string]types.MessageAttributeValue, headers map[string]string) map[string]types.MessageAttributeValue {
+	if len(headers) == 0 {
+		return base
+	}
+	if base == nil {
+		base = make(map[string]types.MessageAttributeValue, len(headers))
+	}
+	keys := make([]string, 0, len(headers))
+	for k := range headers {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		v := headers[k]
+		if k == "" || v == "" {
+			continue
+		}
+		if _, exists := base[k]; exists {
+			continue // never clobber a contract bq-* attribute
+		}
+		if len(base) >= maxMessageAttributes {
+			break // respect the SQS 10-attribute ceiling
+		}
+		base[k] = types.MessageAttributeValue{DataType: aws.String("String"), StringValue: aws.String(v)}
+	}
+	return base
+}
+
+// headersFromAttributes maps inbound SQS MessageAttributes to a flat
+// map[string]string (the consume-side counterpart of mergeAttributes), reading each
+// attribute's StringValue. It returns nil when none are present so a header-less
+// delivery stays header-less on [babelqueue.ReceivedMessage.Headers]. Both the
+// contract bq-* attributes and any out-of-band headers (e.g. traceparent) surface —
+// the otel module reads only the keys it knows.
+func headersFromAttributes(attrs map[string]types.MessageAttributeValue) map[string]string {
+	if len(attrs) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(attrs))
+	for k, v := range attrs {
+		if s := aws.ToString(v.StringValue); s != "" {
+			out[k] = s
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // reconcileAttempts sets the envelope's top-level attempts to
 // max(current, ApproximateReceiveCount − 1) so a first delivery reads 0 and a
 // natively-redelivered message reflects its true count, without ever lowering a
@@ -320,4 +408,7 @@ func reconcileAttempts(body, receiveCount string) string {
 	return body
 }
 
-var _ babelqueue.Transport = (*Transport)(nil)
+var (
+	_ babelqueue.Transport       = (*Transport)(nil)
+	_ babelqueue.HeaderPublisher = (*Transport)(nil)
+)

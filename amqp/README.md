@@ -32,6 +32,17 @@ app.Publish(ctx, "urn:babel:orders:created", map[string]any{"order_id": 1042})
 app.Consume(ctx)
 ```
 
+## Out-of-band transport headers
+
+This transport implements the optional `babelqueue.HeaderPublisher` capability:
+out-of-band headers ride in the AMQP message headers (`amqp091.Table`) **beside the
+frozen envelope, never in it** (GR-1), and are surfaced back to the consumer on
+`ReceivedMessage.Headers`. So the optional [`otel`](../otel) module's W3C
+`traceparent` (ADR-0028) — and the `bq-replay-bypass` marker (ADR-0027) —
+propagate over RabbitMQ for true cross-hop span parent-child linkage. The header is
+merged on top of the contract `x-*` headers without clobbering them (a contract
+header always wins a key collision).
+
 The BabelQueue core stays zero-dependency; this module is the only place
 `amqp091-go` is pulled in.
 

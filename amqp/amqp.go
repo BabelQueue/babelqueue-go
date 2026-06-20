@@ -6,6 +6,12 @@
 // consumer can route on properties.type without parsing the body. Consuming uses
 // basic.get + manual ack (at-least-once), matching the PHP RabbitMQ driver.
 //
+// It also implements the optional [babelqueue.HeaderPublisher] capability: out-of-band
+// transport headers (e.g. a W3C traceparent for cross-hop span linkage, ADR-0028, or
+// the bq-replay-bypass marker, ADR-0027) ride in the AMQP message headers
+// (amqp091.Table) beside the frozen envelope — never in it (GR-1) — and are surfaced
+// back to the consumer on [babelqueue.ReceivedMessage.Headers].
+//
 //	tr := amqp.New("amqp://guest:guest@localhost:5672/")
 //	app := babelqueue.NewApp(tr, babelqueue.WithDefaultQueue("orders"))
 //
@@ -14,6 +20,7 @@ package amqp
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -74,6 +81,20 @@ func (t *Transport) declare(ch *amqp091.Channel, queue string) error {
 // Publish declares the durable queue and publishes body with persistent delivery
 // and the contract AMQP properties.
 func (t *Transport) Publish(ctx context.Context, queue, body string) error {
+	return t.publish(ctx, queue, body, nil)
+}
+
+// PublishWithHeaders publishes body together with out-of-band transport headers
+// ([babelqueue.HeaderPublisher]). The headers ride in the AMQP message headers
+// (amqp091.Table) beside the frozen envelope (GR-1) — e.g. a W3C traceparent for
+// cross-hop span linkage (ADR-0028). They are merged on top of the contract x-*
+// headers without clobbering them (a contract header always wins a key collision),
+// and empty/blank keys are skipped. A nil/empty map behaves exactly like [Transport.Publish].
+func (t *Transport) PublishWithHeaders(ctx context.Context, queue, body string, headers map[string]string) error {
+	return t.publish(ctx, queue, body, headers)
+}
+
+func (t *Transport) publish(ctx context.Context, queue, body string, headers map[string]string) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	ch, err := t.ensure()
@@ -83,10 +104,13 @@ func (t *Transport) Publish(ctx context.Context, queue, body string) error {
 	if err := t.declare(ch, queue); err != nil {
 		return err
 	}
-	return ch.PublishWithContext(ctx, "", queue, false, false, t.publishing(body))
+	return ch.PublishWithContext(ctx, "", queue, false, false, t.publishing(body, headers))
 }
 
-func (t *Transport) publishing(body string) amqp091.Publishing {
+// publishing builds the AMQP message for body. extra carries optional out-of-band
+// transport headers that are merged into the message header table without overwriting
+// the contract x-* headers (the contract wins a key collision).
+func (t *Transport) publishing(body string, extra map[string]string) amqp091.Publishing {
 	pub := amqp091.Publishing{
 		ContentType:     "application/json",
 		ContentEncoding: "utf-8",
@@ -94,20 +118,68 @@ func (t *Transport) publishing(body string) amqp091.Publishing {
 		AppId:           "babelqueue",
 		Body:            []byte(body),
 	}
+	headers := amqp091.Table{}
+	mergeHeaders(headers, extra)
 	if env, err := babelqueue.Decode([]byte(body)); err == nil {
 		pub.Type = env.Job
 		pub.CorrelationId = env.TraceID
 		pub.MessageId = env.Meta.ID
-		headers := amqp091.Table{"x-attempts": env.Attempts}
+		// Contract x-* headers are written last so they win any key collision with an
+		// out-of-band header — the cross-language projection must never be clobbered.
+		headers["x-attempts"] = env.Attempts
 		if env.Meta.SchemaVersion != 0 {
 			headers["x-schema-version"] = env.Meta.SchemaVersion
 		}
 		if env.Meta.Lang != "" {
 			headers["x-source-lang"] = env.Meta.Lang
 		}
+	}
+	if len(headers) > 0 {
 		pub.Headers = headers
 	}
 	return pub
+}
+
+// mergeHeaders writes the out-of-band string headers into table as AMQP values,
+// skipping empty keys and values. It never removes or overwrites a key already in
+// table, so callers can seed contract headers afterwards and keep them authoritative.
+func mergeHeaders(table amqp091.Table, headers map[string]string) {
+	for k, v := range headers {
+		if k == "" || v == "" {
+			continue
+		}
+		if _, exists := table[k]; exists {
+			continue
+		}
+		table[k] = v
+	}
+}
+
+// headersFromTable maps an inbound AMQP header table to a flat map[string]string,
+// stringifying values defensively (AMQP headers are typed: strings, ints, bytes…).
+// It returns nil when no headers are present so a header-less delivery stays
+// header-less on [babelqueue.ReceivedMessage.Headers].
+func headersFromTable(table amqp091.Table) map[string]string {
+	if len(table) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(table))
+	for k, v := range table {
+		switch val := v.(type) {
+		case string:
+			out[k] = val
+		case []byte:
+			out[k] = string(val)
+		case nil:
+			// skip nil-valued headers
+		default:
+			out[k] = fmt.Sprintf("%v", val)
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // Pop reserves the next message with basic.get (manual ack). When the queue is
@@ -139,7 +211,12 @@ func (t *Transport) Pop(ctx context.Context, queue string, timeout time.Duration
 		}
 		return nil, nil
 	}
-	return &babelqueue.ReceivedMessage{Body: string(delivery.Body), Queue: queue, Handle: delivery}, nil
+	return &babelqueue.ReceivedMessage{
+		Body:    string(delivery.Body),
+		Queue:   queue,
+		Handle:  delivery,
+		Headers: headersFromTable(delivery.Headers),
+	}, nil
 }
 
 // Ack acknowledges the reserved delivery.
@@ -164,4 +241,7 @@ func (t *Transport) Close() error {
 	return nil
 }
 
-var _ babelqueue.Transport = (*Transport)(nil)
+var (
+	_ babelqueue.Transport       = (*Transport)(nil)
+	_ babelqueue.HeaderPublisher = (*Transport)(nil)
+)

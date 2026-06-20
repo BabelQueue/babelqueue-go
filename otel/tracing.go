@@ -1,7 +1,19 @@
-// Package otel adds optional OpenTelemetry tracing to a babelqueue producer or consumer
-// (ADR-0025): produce/consume spans correlated across every hop and SDK through the
-// envelope's trace_id, which maps 1:1 to an OTel TraceID. It lives in its own module so the
-// zero-dependency core never imports OpenTelemetry — wiring a TracerProvider is opt-in.
+// Package otel adds optional OpenTelemetry tracing to a babelqueue producer or consumer. It
+// lives in its own module so the zero-dependency core never imports OpenTelemetry — wiring a
+// TracerProvider is opt-in.
+//
+// Cross-hop trace propagation works at two levels, layered:
+//
+//   - trace_id ↔ TraceID (ADR-0025, v0.1): the envelope's trace_id maps 1:1 to an OTel
+//     TraceID, so every hop that shares a trace_id shares one trace — correlation and per-hop
+//     timing with zero wire/transport change.
+//   - W3C traceparent (ADR-0028, v0.2): the producer also injects the active span context as a
+//     traceparent transport header (beside the frozen envelope, never in it), so the consumer
+//     starts its span as a true child of the producer span — real cross-hop parent-child
+//     linkage. This rides the out-of-band HeaderPublisher / ReceivedMessage.Headers seam
+//     (ADR-0027) and is available on any transport that carries headers. When no traceparent
+//     header is present it falls back to the v0.1 trace_id behaviour — a strict, backward-
+//     compatible upgrade.
 package otel
 
 import (
@@ -79,12 +91,25 @@ func parentOf(ctx context.Context, traceID string) context.Context {
 	return trace.ContextWithRemoteSpanContext(ctx, sc)
 }
 
-// WrapHandler returns handler decorated to emit a CONSUMER span per message, in the OTel
-// trace derived from the envelope's trace_id, recording the handler's error/status. Register
-// it like any handler: app.Handle(urn, otel.WrapHandler(tracer, handler)).
+// WrapHandler returns handler decorated to emit a CONSUMER span per message, recording the
+// handler's error/status. Register it like any handler:
+// app.Handle(urn, otel.WrapHandler(tracer, handler)).
+//
+// Parent selection (ADR-0028 / ADR-0025 Option 2): when the producer carried a W3C
+// traceparent on the transport (surfaced by the runtime via
+// [babelqueue.HeadersFromContext]), the span is started as a true child of the producer's
+// span — real cross-hop parent→child linkage with per-hop span timing. When no traceparent
+// header is present, it falls back to the v0.1 behaviour: a remote parent derived from the
+// envelope's trace_id (ADR-0025 Option 1), which shares the trace but not exact span linkage.
+// So enabling traceparent propagation is a strict, backward-compatible upgrade — no regression
+// for messages produced without it.
 func WrapHandler(tracer trace.Tracer, handler babelqueue.Handler) babelqueue.Handler {
 	return func(ctx context.Context, env babelqueue.Envelope) error {
-		ctx = parentOf(ctx, env.TraceID)
+		if remote, ok := remoteParentFromHeaders(ctx); ok {
+			ctx = remote
+		} else {
+			ctx = parentOf(ctx, env.TraceID)
+		}
 		ctx, span := tracer.Start(ctx, "process "+env.URN(),
 			trace.WithSpanKind(trace.SpanKindConsumer),
 			trace.WithAttributes(consumeAttrs(env)...),
@@ -100,9 +125,20 @@ func WrapHandler(tracer trace.Tracer, handler babelqueue.Handler) babelqueue.Han
 	}
 }
 
-// Publish starts a PRODUCER span "publish <urn>", carries the active trace's TraceID into the
-// message's trace_id, and publishes via app — so the downstream consumer recovers the same
-// trace. It otherwise behaves like [babelqueue.App.Publish], returning the message id.
+// Publish starts a PRODUCER span "publish <urn>" and publishes via app, propagating the trace
+// to the downstream consumer two ways:
+//
+//   - It injects the active span context as a W3C traceparent (and tracestate) onto the
+//     outgoing transport headers, so a consumer can start its span as a true child of this
+//     producer span — real cross-hop parent→child linkage (ADR-0028 / ADR-0025 Option 2). The
+//     header rides beside the frozen envelope, never in it (GR-1), via
+//     [babelqueue.App.PublishWithHeaders]; if the transport can't carry headers it degrades to a
+//     plain publish (the traceparent is simply not propagated — no error).
+//   - It also carries the active trace's TraceID into the message's trace_id (the v0.1
+//     behaviour, ADR-0025 Option 1), so even a consumer that ignores the header — or a transport
+//     that drops it — still recovers the same trace (correlation without exact span linkage).
+//
+// It otherwise behaves like [babelqueue.App.Publish], returning the message id.
 func Publish(
 	ctx context.Context,
 	tracer trace.Tracer,
@@ -121,8 +157,9 @@ func Publish(
 	)
 	defer span.End()
 
+	headers := injectTraceparent(ctx, nil)
 	traceID := UUIDOf(span.SpanContext().TraceID())
-	id, err := app.Publish(ctx, urn, data, append(opts, babelqueue.WithTraceID(traceID))...)
+	id, err := app.PublishWithHeaders(ctx, urn, data, headers, append(opts, babelqueue.WithTraceID(traceID))...)
 	if err != nil {
 		span.RecordError(err)
 		span.SetStatus(codes.Error, err.Error())

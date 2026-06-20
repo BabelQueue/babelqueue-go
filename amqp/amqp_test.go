@@ -58,6 +58,48 @@ func TestAMQPRoundTrip(t *testing.T) {
 	}
 }
 
+// TestAMQPCarriesTraceparentHeader is an integration test: it publishes a message
+// with an out-of-band traceparent header (HeaderPublisher) and asserts the live
+// broker delivers it back on ReceivedMessage.Headers, beside the unchanged envelope.
+// It skips cleanly when no RabbitMQ broker is reachable.
+func TestAMQPCarriesTraceparentHeader(t *testing.T) {
+	tr := bqamqp.New(brokerURL())
+	defer tr.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+
+	const queue = "bq-test-amqp-headers"
+	const traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+
+	env, err := babelqueue.Make("urn:babel:test:traced", map[string]any{"n": 1}, babelqueue.WithQueue(queue))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := env.Encode()
+
+	if err := tr.PublishWithHeaders(ctx, queue, string(body), map[string]string{"traceparent": traceparent}); err != nil {
+		t.Skipf("rabbitmq not reachable: %v", err)
+	}
+
+	msg, err := tr.Pop(ctx, queue, time.Second)
+	if err != nil {
+		t.Fatalf("Pop: %v", err)
+	}
+	if msg == nil {
+		t.Fatal("expected a message")
+	}
+	defer func() { _ = tr.Ack(ctx, msg) }()
+
+	if msg.Headers["traceparent"] != traceparent {
+		t.Errorf("traceparent header = %q, want %q", msg.Headers["traceparent"], traceparent)
+	}
+	// The envelope must be byte-identical — the header rides out of band (GR-1).
+	if msg.Body != string(body) {
+		t.Errorf("envelope body changed: header propagation must not touch the body")
+	}
+}
+
 // TestAMQPAppEndToEnd runs a publish + drain through the App over RabbitMQ.
 func TestAMQPAppEndToEnd(t *testing.T) {
 	tr := bqamqp.New(brokerURL())

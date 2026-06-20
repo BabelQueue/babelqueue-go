@@ -108,6 +108,45 @@ func (a *App) Publish(ctx context.Context, urn string, data map[string]any, opts
 	return env.Meta.ID, nil
 }
 
+// PublishWithHeaders builds the canonical envelope for (urn, data) and publishes it
+// together with out-of-band transport headers, returning the message id (meta.id).
+// The headers ride beside the frozen envelope on the transport's per-message
+// metadata channel (e.g. a W3C traceparent for cross-hop span linkage, ADR-0028) —
+// the envelope itself is never touched (GR-1).
+//
+// It is the produce-side counterpart of the headers the runtime surfaces to a
+// handler via [HeadersFromContext]. When the transport implements [HeaderPublisher]
+// the headers are propagated; otherwise it transparently falls back to a plain
+// publish (the headers are dropped, exactly as [Redrive] degrades — no error, no
+// regression), so callers need not branch on transport capability. Passing nil or
+// empty headers is equivalent to [App.Publish].
+func (a *App) PublishWithHeaders(
+	ctx context.Context,
+	urn string,
+	data map[string]any,
+	headers map[string]string,
+	opts ...Option,
+) (string, error) {
+	env, err := Make(urn, data, append([]Option{WithQueue(a.queue)}, opts...)...)
+	if err != nil {
+		return "", err
+	}
+	body, err := env.Encode()
+	if err != nil {
+		return "", err
+	}
+	if hp, ok := a.transport.(HeaderPublisher); ok && len(headers) > 0 {
+		if err := hp.PublishWithHeaders(ctx, env.Meta.Queue, string(body), headers); err != nil {
+			return "", err
+		}
+		return env.Meta.ID, nil
+	}
+	if err := a.transport.Publish(ctx, env.Meta.Queue, string(body)); err != nil {
+		return "", err
+	}
+	return env.Meta.ID, nil
+}
+
 // Consume processes messages from the default queue (or the optional override)
 // until ctx is cancelled. It blocks; run it in its own goroutine. A single bad
 // message never stops the loop — it is retried or dead-lettered.
@@ -160,6 +199,7 @@ func (a *App) Drain(ctx context.Context, queue string, max int) (int, error) {
 }
 
 func (a *App) dispatch(ctx context.Context, msg *ReceivedMessage) {
+	ctx = withHeaders(ctx, msg.Headers)
 	if msg.Headers[HeaderReplayBypass] != "" {
 		ctx = withReplay(ctx)
 	}

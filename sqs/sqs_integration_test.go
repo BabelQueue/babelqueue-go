@@ -83,6 +83,65 @@ func TestLocalStackRoundTrip(t *testing.T) {
 	}
 }
 
+// TestLocalStackCarriesTraceparentHeader is an integration test: it publishes a
+// message with an out-of-band traceparent header (HeaderPublisher) and asserts
+// LocalStack/ElasticMQ delivers it back on ReceivedMessage.Headers, beside the
+// unchanged envelope. It skips cleanly when no broker is reachable.
+func TestLocalStackCarriesTraceparentHeader(t *testing.T) {
+	endpoint := getenv("SQS_ENDPOINT", "http://localhost:4566")
+	region := getenv("AWS_REGION", "us-east-1")
+	if os.Getenv("AWS_ACCESS_KEY_ID") == "" {
+		t.Setenv("AWS_ACCESS_KEY_ID", "test")
+		t.Setenv("AWS_SECRET_ACCESS_KEY", "test")
+	}
+	ctx := context.Background()
+
+	cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(region))
+	if err != nil {
+		t.Skipf("aws config unavailable: %v", err)
+	}
+	raw := awssqs.NewFromConfig(cfg, func(o *awssqs.Options) { o.BaseEndpoint = aws.String(endpoint) })
+
+	const queue = "bq-it-traced"
+	if _, err := raw.CreateQueue(ctx, &awssqs.CreateQueueInput{QueueName: aws.String(queue)}); err != nil {
+		t.Skipf("LocalStack unreachable (CreateQueue): %v", err)
+	}
+
+	tr, err := sqs.New(ctx, sqs.WithRegion(region), sqs.WithEndpoint(endpoint))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+
+	const traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+	env, err := babelqueue.Make("urn:babel:orders:created", map[string]any{"order_id": 7}, babelqueue.WithQueue(queue))
+	if err != nil {
+		t.Fatalf("Make: %v", err)
+	}
+	body, _ := env.Encode()
+	if err := tr.PublishWithHeaders(ctx, queue, string(body), map[string]string{"traceparent": traceparent}); err != nil {
+		t.Fatalf("PublishWithHeaders: %v", err)
+	}
+
+	var msg *babelqueue.ReceivedMessage
+	for deadline := time.Now().Add(15 * time.Second); time.Now().Before(deadline) && msg == nil; {
+		msg, err = tr.Pop(ctx, queue, time.Second)
+		if err != nil {
+			t.Fatalf("Pop: %v", err)
+		}
+		if msg == nil {
+			time.Sleep(500 * time.Millisecond)
+		}
+	}
+	if msg == nil {
+		t.Fatal("no message received")
+	}
+	defer func() { _ = tr.Ack(ctx, msg) }()
+
+	if msg.Headers["traceparent"] != traceparent {
+		t.Errorf("traceparent header = %q, want %q", msg.Headers["traceparent"], traceparent)
+	}
+}
+
 func getenv(key, fallback string) string {
 	if v := os.Getenv(key); v != "" {
 		return v

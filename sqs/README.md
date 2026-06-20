@@ -55,8 +55,20 @@ name must end in `.fifo`).
 | `meta.created_at` | `MessageAttributes.bq-created-at` (Number, ms) |
 | `attempts` | reconciled to `ApproximateReceiveCount − 1` on receive |
 | reserve / ack | visibility timeout → `DeleteMessage` |
+| out-of-band headers (e.g. `traceparent`) | extra String `MessageAttributes` (see below) |
 
 The envelope is unchanged (`schema_version` stays `1`); SQS is purely additive.
+
+## Out-of-band transport headers
+
+This transport implements the optional `babelqueue.HeaderPublisher` capability:
+out-of-band headers ride as String `MessageAttributes` **beside the frozen envelope,
+never in it** (GR-1), and are surfaced back to the consumer on
+`ReceivedMessage.Headers`. So the optional [`otel`](../otel) module's W3C
+`traceparent` (ADR-0028) — and the `bq-replay-bypass` marker (ADR-0027) — propagate
+over SQS for true cross-hop span parent-child linkage. Headers are merged beside the
+contract `bq-*` attributes without clobbering them, and bounded by the **10-attribute
+SQS limit** (the contract attributes are always preserved first).
 
 ## Test
 

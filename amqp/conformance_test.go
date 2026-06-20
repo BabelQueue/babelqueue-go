@@ -45,7 +45,7 @@ func TestRabbitMQConformance(t *testing.T) {
 		t.Fatalf("fixture: %v", err)
 	}
 
-	pub := (&Transport{}).publishing(string(body))
+	pub := (&Transport{}).publishing(string(body), nil)
 
 	checks := map[string]struct{ got, want string }{
 		"type":           {pub.Type, proj.Properties["type"]},
