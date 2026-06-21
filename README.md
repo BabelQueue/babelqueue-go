@@ -149,6 +149,50 @@ persistent delivery and the contract AMQP properties (`type`=URN,
 consumes with `basic.get` + manual ack. Implement `babelqueue.Transport` yourself
 to back the runtime with any other broker.
 
+## Idempotent consumption (dedupe on `meta.id`)
+
+BabelQueue is **at-least-once**, so handlers should dedupe on the envelope's `meta.id`
+([ADR-0022](https://babelqueue.com)). The `idempotency` subpackage (in the **core**,
+zero-dep) makes that a one-line wrap: a message whose id was already processed is
+skipped instead of re-run.
+
+```go
+import "github.com/babelqueue/babelqueue-go/idempotency"
+
+store := idempotency.NewInMemoryStore() // process-local reference store
+app.Handle("urn:babel:orders:created", idempotency.Wrap(store, func(ctx context.Context, env babelqueue.Envelope) error {
+    // runs at most once per meta.id; a thrown error leaves the id unmarked so retry/DLQ still apply
+    return nil
+}))
+```
+
+`InMemoryStore` is for tests / single-process consumers. A **fleet** of consumers
+needs a *shared, persistent* `Store` — two backends ship as **separate submodules**
+(so the core stays zero-dependency; a driver is pulled in only if you import them):
+
+```bash
+go get github.com/babelqueue/babelqueue-go/idempotency-redis      # Redis    (go-redis)
+go get github.com/babelqueue/babelqueue-go/idempotency-postgres   # Postgres (database/sql + pgx)
+```
+
+```go
+import (
+    "github.com/babelqueue/babelqueue-go/idempotency"
+    redisstore "github.com/babelqueue/babelqueue-go/idempotency-redis"
+)
+
+store, _ := redisstore.New("redis://localhost:6379/0", redisstore.WithTTL(24*time.Hour))
+defer store.Close()
+app.Handle("urn:babel:orders:created", idempotency.Wrap(store, handler))
+```
+
+Both persistent backends implement the **same** `idempotency.Store` interface as the
+in-memory reference, with an **atomic claim** so concurrent consumers serialize on
+`meta.id` — Redis via `SET key val NX PX <ttl>`, Postgres via `INSERT … ON CONFLICT …
+RETURNING` on the primary key (DDL via `schema.sql` / `Store.Migrate`). A duplicate
+delivery is detected as already-seen; an optional `WithTTL` expires ids so they may be
+re-processed once the window lapses. See each submodule's README for details.
+
 ## What this core is
 
 It enforces the **contract**: the envelope shape, URN identity, trace propagation,

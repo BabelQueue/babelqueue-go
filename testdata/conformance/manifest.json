@@ -68,6 +68,80 @@
       "reason": "no 'job' or 'urn' — the message has no identity"
     }
   ],
+  "idempotency": {
+    "description": "Consumer idempotency conformance (ADR-0022). Broker-free: locks the seen-set dedupe contract every SDK's optional idempotency helper (Go idempotency.Wrap, PHP Idempotent::wrap, Python idempotency.wrap, Node Wrap, Java Idempotent.wrap) MUST honour over the frozen schema_version-1 envelope, independent of any transport. The helper does NOT touch the wire envelope — the cases above stay byte-identical; this block governs the consume-side decision (run the handler, or skip-and-ack) keyed on meta.id.",
+    "dedup_key": {
+      "description": "The dedupe key is meta.id verbatim — the canonical per-message identity (distinct from trace_id, which spans a causal chain). A consumer MUST key its seen-set on exactly fixtures/order-created.json's meta.id; two deliveries with the same meta.id are the SAME message (a redelivery), even byte-for-byte identical, and dedupe to one effect. trace_id is NOT the key: messages sharing a trace_id but with distinct meta.id are distinct effects.",
+      "envelope_file": "fixtures/order-created.json",
+      "key_field": "meta.id",
+      "expected_key": "f1e2d3c4-b5a6-4789-90ab-cdef01234567"
+    },
+    "sequences": {
+      "description": "Each sequence drives ONE handler wrapped by the SDK's idempotency helper, backed by ONE seen-set store, through an ordered list of deliveries. For each delivery the SDK MUST derive the effect: 'run' = the wrapped handler is invoked (the side-effect fires) and, on its outcome 'ok', the id is remembered; 'skip' = an already-remembered id is recognised, the handler is NOT invoked, and the delivery is acked (the runtime stops redelivering). 'outcome' is the handler's result for a 'run' delivery: 'ok' = returns/acks (remembered), 'throw' = raises/errors (the id is left UNMARKED so a later redelivery runs it again — retry/DLQ still apply). After replaying the whole sequence, total 'run'+'ok' invocations MUST equal expected_effects. This is at-least-once delivery collapsed to an exactly-once EFFECT by the consumer; it is seen-set post-success dedupe, NOT exactly-once delivery and NOT an in-flight concurrency lock.",
+      "cases": [
+        {
+          "name": "duplicate-delivery-runs-once",
+          "description": "The same meta.id delivered twice (a textbook at-least-once redelivery): first runs the effect, second is skipped. One effect.",
+          "deliveries": [
+            { "meta_id": "id-A", "expect_effect": "run",  "outcome": "ok" },
+            { "meta_id": "id-A", "expect_effect": "skip" }
+          ],
+          "expected_effects": 1
+        },
+        {
+          "name": "at-least-once-redelivery-is-noop",
+          "description": "Three redeliveries of one id (a flaky broker / worker-crash-before-ack storm): the effect fires once; every subsequent redelivery is a no-op skip.",
+          "deliveries": [
+            { "meta_id": "id-A", "expect_effect": "run",  "outcome": "ok" },
+            { "meta_id": "id-A", "expect_effect": "skip" },
+            { "meta_id": "id-A", "expect_effect": "skip" },
+            { "meta_id": "id-A", "expect_effect": "skip" }
+          ],
+          "expected_effects": 1
+        },
+        {
+          "name": "distinct-ids-each-run",
+          "description": "Different meta.ids are different messages — each runs once. Dedupe is per-id, never collapses unrelated messages.",
+          "deliveries": [
+            { "meta_id": "id-A", "expect_effect": "run", "outcome": "ok" },
+            { "meta_id": "id-B", "expect_effect": "run", "outcome": "ok" },
+            { "meta_id": "id-C", "expect_effect": "run", "outcome": "ok" }
+          ],
+          "expected_effects": 3
+        },
+        {
+          "name": "throw-leaves-id-unmarked",
+          "description": "A handler that throws does NOT remember the id, so the next redelivery runs it again (retry semantics survive the guard). The third delivery succeeds and is then deduped on a fourth.",
+          "deliveries": [
+            { "meta_id": "id-A", "expect_effect": "run",  "outcome": "throw" },
+            { "meta_id": "id-A", "expect_effect": "run",  "outcome": "throw" },
+            { "meta_id": "id-A", "expect_effect": "run",  "outcome": "ok" },
+            { "meta_id": "id-A", "expect_effect": "skip" }
+          ],
+          "expected_effects": 3
+        },
+        {
+          "name": "missing-id-fails-open",
+          "description": "A message with no usable meta.id (empty/absent) CANNOT be deduped, so the helper fails open: every delivery runs the handler. The guard never silently drops work it cannot identify.",
+          "deliveries": [
+            { "meta_id": "", "expect_effect": "run", "outcome": "ok" },
+            { "meta_id": "", "expect_effect": "run", "outcome": "ok" }
+          ],
+          "expected_effects": 2
+        },
+        {
+          "name": "forget-allows-rerun",
+          "description": "forget(id) evicts an id from the seen-set, so a later delivery of that id runs again (manual replay / TTL expiry). Locks the third Store method.",
+          "deliveries": [
+            { "meta_id": "id-A", "expect_effect": "run",  "outcome": "ok" },
+            { "meta_id": "id-A", "expect_effect": "skip" },
+            { "meta_id": "id-A", "forget_before": true, "expect_effect": "run", "outcome": "ok" }
+          ],
+          "expected_effects": 2
+        }
+      ]
+    }
+  },
   "sqs": {
     "description": "Amazon SQS binding conformance (broker-bindings.md §3). Every SDK that ships an SQS transport must satisfy these. The envelope body stays byte-identical (the 'cases' above); these lock the native projection + reconciliation the binding adds. Per-message values reuse fixtures/order-created.json so the expected attributes are deterministic.",
     "attribute_projection": {

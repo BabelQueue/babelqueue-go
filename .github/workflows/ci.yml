@@ -48,6 +48,12 @@ jobs:
           # The optional OpenTelemetry module (ADR-0025) — its tests use an in-memory
           # span recorder, so they are network-free and run across the Go matrix.
           (cd otel && go build ./... && go vet ./... && go test -race -count=1 ./...)
+          # Persistent idempotency stores (ADR-0022). Both floor at Go 1.21 (the core's
+          # floor) and their unit tests are DB/broker-free (postgres via go-sqlmock,
+          # redis via a fake client seam), so they run across the whole Go matrix; the
+          # live DB/Redis paths skip unless BABELQUEUE_TEST_PG / BABELQUEUE_TEST_REDIS is set.
+          (cd idempotency-postgres && go build ./... && go vet ./... && go test -race -count=1 ./...)
+          (cd idempotency-redis && go build ./... && go vet ./... && go test -race -count=1 ./...)
 
       - name: Build & vet the Azure Service Bus module
         # azure-messaging-servicebus requires Go 1.23+, so build/test this module only
@@ -117,6 +123,8 @@ jobs:
           (cd artemis && staticcheck ./...)
           (cd asynq && staticcheck ./...)
           (cd machinery && staticcheck ./...)
+          (cd idempotency-postgres && staticcheck ./...)
+          (cd idempotency-redis && staticcheck ./...)
 
   coverage:
     name: Coverage gate (>=90%)
@@ -154,6 +162,16 @@ jobs:
         image: softwaremill/elasticmq-native:1.6.11
         ports:
           - 9324:9324
+      # PostgreSQL for the idempotency-postgres store's live claim/concurrency tests.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s --health-timeout 3s --health-retries 5
     steps:
       - uses: actions/checkout@v5
 
@@ -191,6 +209,18 @@ jobs:
           AWS_ACCESS_KEY_ID: test
           AWS_SECRET_ACCESS_KEY: test
         run: go test -tags=integration -race -count=1 ./...
+
+      - name: Redis idempotency store integration tests
+        working-directory: idempotency-redis
+        env:
+          BABELQUEUE_TEST_REDIS: redis://localhost:6379/0
+        run: go test -race -count=1 ./...
+
+      - name: PostgreSQL idempotency store integration tests
+        working-directory: idempotency-postgres
+        env:
+          BABELQUEUE_TEST_PG: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
+        run: go test -race -count=1 ./...
 
   conformance:
     name: Conformance suite in sync

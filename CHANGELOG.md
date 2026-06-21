@@ -15,7 +15,40 @@ The new `…/asynq` and `…/machinery` modules are published as the Go submodul
 transport modules are unchanged. asynq **requires Go 1.24+** (its floor); machinery floors at
 Go 1.23.
 
+The new `…/idempotency-postgres` and `…/idempotency-redis` modules are persistent
+[`idempotency.Store`](idempotency) backends in their own submodules (own `go.mod`,
+`replace`-based on the core like the transport submodules) — the **core stays
+zero-dependency (GR-7)**; a database/Redis driver is pulled in only if you import them.
+Both floor at **Go 1.21** (the core's floor): postgres on `database/sql` + pgx
+`v5.7.0`, redis on the same `go-redis/v9` the `…/redis` transport uses.
+
 ### Added
+- **persistent idempotency stores (Postgres + Redis)** — two new modules implementing
+  the **unchanged** core `idempotency.Store` interface ([ADR-0022](https://babelqueue.com)),
+  so a fleet of consumers shares one dedupe record keyed on the envelope's `meta.id`
+  instead of every worker keeping its own in-memory set:
+  - `…/idempotency-postgres` (`github.com/babelqueue/babelqueue-go/idempotency-postgres`) —
+    over `database/sql` (pgx driver). The atomic claim is
+    `INSERT … ON CONFLICT (message_id) DO NOTHING/UPDATE … RETURNING` on the table's
+    primary key: exactly one of N concurrent inserts wins (RETURNING proves it), a
+    duplicate hits the conflict, and an expired row is re-claimed atomically by the
+    `DO UPDATE … WHERE expires_at <= now()` branch. DDL ships as `schema.sql` and via
+    `Store.Migrate(ctx)`. `New(ctx, dsn)` owns the pool; `NewWithDB(db)` borrows one;
+    `WithTable`/`WithTTL` configure namespace and expiry.
+  - `…/idempotency-redis` (`github.com/babelqueue/babelqueue-go/idempotency-redis`) —
+    reuses the `go-redis` client the `…/redis` transport uses. The atomic claim is
+    `SET key value NX PX <ttl>`: Redis evaluates `NX` single-threaded so exactly one
+    `SET` creates the key, duplicates see it present, and Redis expires it natively via
+    `PX`. `New(url)` owns the client; `NewWithClient(client)` borrows one;
+    `WithPrefix`/`WithTTL` configure namespace and expiry.
+  - Both add a non-interface `Claim(ctx, id) (bool, error)` exposing the race result
+    (`true` = first delivery / won, `false` = duplicate / parked); `Remember` delegates
+    to `Claim` and discards the bool, so `idempotency.Wrap` accepts either store
+    unchanged. Unit tests are DB/broker-free (Postgres via `go-sqlmock`, Redis via a fake
+    client seam); integration tests prove concurrent claims serialize, duplicates are
+    rejected and TTL expiry reclaims, skipping cleanly without `BABELQUEUE_TEST_PG` /
+    `BABELQUEUE_TEST_REDIS`. The envelope is unchanged (`schema_version: 1`); these are
+    purely additive.
 - **machinery adapter** — new `…/machinery` module
   (`github.com/babelqueue/babelqueue-go/machinery`), a framework adapter over the Redis/AMQP-backed
   [machinery](https://github.com/RichardKnop/machinery) task queue (not a new broker binding — its
