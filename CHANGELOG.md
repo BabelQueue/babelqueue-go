@@ -9,6 +9,49 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.8.0] - 2026-06-21
+
+The new `gdpr` subpackage is the **runtime** half of GDPR sensitive-field governance
+([ADR-0030](https://babelqueue.com)) — the registry already declares/audits
+`x-gdpr-sensitive`; this enforces it on the wire. It lives in the **core** module
+(zero-dependency, stdlib only, like `idempotency`, `schema` and `outbox`), so it ships
+with every producer/consumer. The crypto is a caller-provided `Cipher` interface
+(KMS/Vault/HSM/tokenisation); only a stdlib `AESGCMCipher` reference ships — **the core
+pulls no crypto/KMS dependency (GR-7)**. The envelope stays **frozen**
+(`schema_version: 1`): only the *values* of marked fields change (a sensitive value →
+ciphertext string); `trace_id` is untouched and `data` stays pure JSON (GR-1/GR-3/GR-4).
+This is the Go **reference** other SDKs mirror.
+
+### Added
+- **GDPR field-encryption helper** — a new `gdpr` subpackage in the **core** module
+  (`github.com/babelqueue/babelqueue-go/gdpr`, zero-dependency) that encrypts the `data`
+  fields a registry marked `x-gdpr-sensitive`, so PII never sits in cleartext on the
+  broker ([ADR-0030](https://babelqueue.com)).
+  - `gdpr.Cipher` — the encryption seam the **caller** binds to a KMS/Vault/HSM or a
+    tokenisation service (`Encrypt(plaintext []byte) (string, error)` /
+    `Decrypt(ciphertext string) ([]byte, error)`). The core defines it and pulls in **no**
+    crypto dependency (GR-7).
+  - `gdpr.AESGCMCipher` — a reference `Cipher` built only on the Go standard library
+    (`crypto/aes` + `crypto/cipher` + `crypto/rand`): AES-256-GCM with a fresh random
+    nonce per call, prepended and base64-encoded so it drops straight into a JSON string.
+    The key is the caller's; a wrong-key/tampered `Decrypt` fails GCM authentication
+    rather than returning corrupt plaintext.
+  - `gdpr.Protect(data, schema, cipher)` / `gdpr.Unprotect(data, schema, cipher)` —
+    standalone, opt-in producer/consumer helpers that encrypt/decrypt each
+    `x-gdpr-sensitive` leaf **in place**. The sensitive paths come from the **same**
+    per-URN `schema.Schema` the validation path loads (`schema.Schema.SensitivePaths`),
+    covering nested objects (`profile.full_name`) and array items (`addresses[].line`);
+    an absent field is skipped, not an error. A wrong-key `Unprotect` returns
+    `gdpr.ErrDecrypt` so the message takes the retry / dead-letter path.
+  - `schema.Schema` now parses the `x-gdpr-sensitive` extension keyword (boolean `true`
+    or a string category) and exposes `SensitivePaths()` — additive and
+    **validation-neutral**: the keyword never makes a value valid or invalid, mirroring
+    `babelqueue-registry`'s model, so annotating a schema is never a breaking change (GR-1).
+
+    The envelope is unchanged (`schema_version: 1`); this is purely additive (GR-6). The
+    encrypted value is a JSON string, so `data` stays pure JSON (GR-3) and `trace_id` is
+    preserved (GR-4).
+
 The new `…/asynq` and `…/machinery` modules are published as the Go submodule tags
 `asynq/v1.0.0` and `machinery/v1.0.0`
 (`go get github.com/babelqueue/babelqueue-go/{asynq,machinery}`); the core and other

@@ -103,3 +103,76 @@ func TestParse_Invalid(t *testing.T) {
 		t.Fatal("invalid JSON should error")
 	}
 }
+
+func TestGDPRSensitive_ParseAndValidationNeutral(t *testing.T) {
+	s := parse(t, `{
+		"type":"object",
+		"properties":{
+			"email":{"type":"string","x-gdpr-sensitive":"email"},
+			"phone":{"type":"string","x-gdpr-sensitive":true},
+			"locale":{"type":"string"},
+			"opt_in":{"type":"boolean","x-gdpr-sensitive":false},
+			"empty":{"type":"string","x-gdpr-sensitive":""}
+		}
+	}`)
+	if !s.Properties["email"].GDPRSensitive || s.Properties["email"].GDPRCategory != "email" {
+		t.Fatal(`x-gdpr-sensitive:"email" must mark sensitive with category "email"`)
+	}
+	if !s.Properties["phone"].GDPRSensitive || s.Properties["phone"].GDPRCategory != "" {
+		t.Fatal("x-gdpr-sensitive:true must mark sensitive with no category")
+	}
+	if s.Properties["locale"].GDPRSensitive {
+		t.Fatal("unmarked property must not be sensitive")
+	}
+	if s.Properties["opt_in"].GDPRSensitive {
+		t.Fatal("x-gdpr-sensitive:false must not mark sensitive")
+	}
+	if s.Properties["empty"].GDPRSensitive {
+		t.Fatal(`x-gdpr-sensitive:"" must not mark sensitive`)
+	}
+	// The keyword must not change validation (GR-1): a valid value stays valid.
+	if errs := s.Validate(map[string]any{"email": "a@b.com", "phone": "123"}); len(errs) != 0 {
+		t.Fatalf("x-gdpr-sensitive must not change validation, got %v", errs)
+	}
+}
+
+func TestSensitivePaths_NestedAndArrays(t *testing.T) {
+	s := parse(t, `{
+		"type":"object",
+		"properties":{
+			"email":{"type":"string","x-gdpr-sensitive":"email"},
+			"profile":{"type":"object","properties":{
+				"full_name":{"type":"string","x-gdpr-sensitive":true}
+			}},
+			"addresses":{"type":"array","items":{"type":"object","properties":{
+				"line":{"type":"string","x-gdpr-sensitive":true},
+				"city":{"type":"string"}
+			}}}
+		}
+	}`)
+	got := s.SensitivePaths()
+	want := []SensitivePath{
+		{Path: "addresses[].line"},
+		{Path: "email", Category: "email"},
+		{Path: "profile.full_name"},
+	}
+	if len(got) != len(want) {
+		t.Fatalf("SensitivePaths() = %v, want %v", got, want)
+	}
+	for i := range want { // SensitivePaths is sorted
+		if got[i] != want[i] {
+			t.Fatalf("SensitivePaths() = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestSensitivePaths_RootAndNilSafe(t *testing.T) {
+	root := parse(t, `{"type":"string","x-gdpr-sensitive":true}`)
+	if paths := root.SensitivePaths(); len(paths) != 1 || paths[0].Path != "" {
+		t.Fatalf("root mark should be path %q, got %v", "", root.SensitivePaths())
+	}
+	var nilSchema *Schema
+	if paths := nilSchema.SensitivePaths(); len(paths) != 0 {
+		t.Fatalf("nil schema should yield no paths, got %v", paths)
+	}
+}

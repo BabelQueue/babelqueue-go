@@ -249,6 +249,66 @@ pending, so **one poison row never blocks the batch**. `outbox.InMemoryStore` is
 process-local reference for tests / single-process demos (no real transaction — use a
 DB-backed adapter in production).
 
+## GDPR field encryption (encrypt PII inside `data`)
+
+A registry can declare which `data` fields carry personal data with the
+`x-gdpr-sensitive` schema keyword, and `bqschema gdpr` audits/masks them
+([ADR-0030](https://babelqueue.com)) — but that is **governance**. The `gdpr`
+subpackage (in the **core**, zero-dep) is the **runtime** half: a producer
+encrypts each marked field before publish, a consumer decrypts it after decode,
+so PII never sits in cleartext on the broker.
+
+The envelope stays **frozen** (GR-1): `Protect` rewrites only the *values* inside
+`data` — a sensitive field's value becomes a ciphertext **string** — it never
+adds, renames or retypes an envelope field, `meta.schema_version` stays `1`, and
+`trace_id` is untouched (GR-4). `data` remains pure JSON (GR-3), so any SDK can
+carry the envelope even without the key (it just can't read the protected fields).
+
+The crypto is a **`Cipher` interface the caller provides** (KMS / Vault / HSM /
+tokenisation) — keeping the core dependency-free (GR-7). A stdlib-only
+`AESGCMCipher` (AES-256-GCM, random nonce, base64) ships as the reference:
+
+```go
+import (
+    babelqueue "github.com/babelqueue/babelqueue-go"
+    "github.com/babelqueue/babelqueue-go/gdpr"
+    "github.com/babelqueue/babelqueue-go/schema"
+)
+
+cipher, _ := gdpr.NewAESGCMCipher(key32) // your 32-byte key — or bind a KMS-backed Cipher
+provider, _ := schema.NewDirProvider("registry.json")
+
+// Producer — encrypt the marked fields after building data, before publishing.
+env, _ := babelqueue.Make("urn:babel:users:registered", data, babelqueue.WithQueue("users"))
+if sch, ok, _ := provider.Schema(env.URN()); ok {
+    _ = schema.Check(provider, env.URN(), env.Data) // validate CLEARTEXT first (see note)
+    _ = gdpr.Protect(env.Data, sch, cipher)         // email, profile.full_name, addresses[].line → ciphertext
+}
+body, _ := env.Encode()                             // ciphertext rides inside data; frame unchanged
+
+// Consumer — decrypt after Decode, before the handler reads data.
+in, _ := babelqueue.Decode(body)
+if sch, ok, _ := provider.Schema(in.URN()); ok {
+    _ = gdpr.Unprotect(in.Data, sch, cipher)        // restores the original values byte-for-byte
+}
+```
+
+`Protect`/`Unprotect` are **standalone helpers** — strictly opt-in, no behaviour
+change when unused. The sensitive paths come from the **same per-URN schema** the
+validation path already loads, including **nested objects** (`profile.full_name`)
+and **array items** (`addresses[].line`); an absent field is skipped, not an error.
+
+> **Validate cleartext, not ciphertext.** A schema that constrains a sensitive
+> field (`minLength`, `enum`, `type:"integer"`, …) would reject the ciphertext
+> string. Run `schema.Check` **before** `Protect` on the producer and **after**
+> `Unprotect` on the consumer — or register `schema.Wrap` so it runs after your
+> `Unprotect` step. A wrong-key `Unprotect` returns `gdpr.ErrDecrypt`, so the
+> message takes the retry / dead-letter path rather than being handled blind.
+
+This is the **reference implementation** the other SDKs mirror: the same
+`Cipher` seam, the same encrypt-values-in-place contract, the same frozen
+envelope.
+
 ## What this core is
 
 It enforces the **contract**: the envelope shape, URN identity, trace propagation,
