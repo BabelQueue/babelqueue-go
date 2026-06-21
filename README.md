@@ -193,6 +193,62 @@ RETURNING` on the primary key (DDL via `schema.sql` / `Store.Migrate`). A duplic
 delivery is detected as already-seen; an optional `WithTTL` expires ids so they may be
 re-processed once the window lapses. See each submodule's README for details.
 
+## Transactional outbox (atomic write + relayed publish)
+
+A plain producer makes a **dual write** — commit the business row **and** publish to the
+broker — two independent systems that disagree on a crash. The `outbox` subpackage (in
+the **core**, zero-dep) removes it ([ADR-0029](https://babelqueue.com)): the message is
+persisted into the **same database, in the same transaction**, as the business data, so
+it commits or rolls back atomically with it; a separate **relay** publishes the durable
+rows afterwards. It is the producer-side counterpart to consumer-side idempotency above.
+
+**The caller owns the transaction boundary** — `Outbox.Write` does not begin or commit
+anything; it just encodes the envelope (frozen codec, bytes unchanged) and hands it to a
+`Store` the caller has bound to their open transaction:
+
+```go
+import "github.com/babelqueue/babelqueue-go/outbox"
+
+ob := outbox.New(store) // store is YOUR DB-bound outbox.Store (tx-scoped)
+
+// inside the transaction you already opened around the business write:
+insertOrder(ctx, tx, order)                  // the business write
+env, _ := babelqueue.Make("urn:babel:orders:created", data, babelqueue.WithQueue("orders"))
+ob.Write(env)                                // same tx, via a tx-bound Store
+tx.Commit()                                  // both, or neither
+```
+
+The `outbox.Store` interface is the only thing you implement — the core pulls in **no**
+DB driver (GR-7). It stores the `Encode`d envelope **verbatim** and the relay publishes
+those exact bytes, so `trace_id` is preserved end-to-end (GR-4) and every SDK stays
+byte-compatible (GR-5):
+
+```go
+type Store interface {
+    Save(encoded []byte, queue string) (id string, err error)
+    FetchUnpublished(limit int) ([]outbox.Record, error) // SHOULD claim rows (FOR UPDATE SKIP LOCKED)
+    MarkPublished(ids []string) error
+    MarkFailed(id, reason string) error
+}
+```
+
+A separate **relay** drains the committed rows through the same `Transport` seam, on a
+worker loop or a cron:
+
+```go
+relay := outbox.NewRelay(transport, store, outbox.Options{}) // zero Options = sane defaults
+
+relay.Flush(ctx)      // publish one batch; mark each row published AFTER publish returns
+relay.Drain(ctx, 0)   // loop Flush until a pass makes no progress (safety ceiling)
+```
+
+A row is marked published **only after** the transport accepts it — a crash in between
+re-publishes it next pass (at-least-once; the consumer dedupes on `meta.id`). A publish
+error is caught, the row is marked failed (with a bounded linear backoff) and left
+pending, so **one poison row never blocks the batch**. `outbox.InMemoryStore` is a
+process-local reference for tests / single-process demos (no real transaction — use a
+DB-backed adapter in production).
+
 ## What this core is
 
 It enforces the **contract**: the envelope shape, URN identity, trace propagation,

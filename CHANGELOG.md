@@ -22,7 +22,41 @@ zero-dependency (GR-7)**; a database/Redis driver is pulled in only if you impor
 Both floor at **Go 1.21** (the core's floor): postgres on `database/sql` + pgx
 `v5.7.0`, redis on the same `go-redis/v9` the `…/redis` transport uses.
 
+The new `outbox` subpackage is the Go port of the PHP `BabelQueue\Outbox` helper
+([ADR-0029](https://babelqueue.com)) — a transactional outbox in the **core** module
+(zero-dependency, stdlib only, like `idempotency` and `schema`), so it ships with every
+producer. The `Store` is an interface the caller binds to their own DB; only an
+in-memory reference ships (**no DB driver in the core, GR-7**). The envelope is unchanged
+(`schema_version: 1`); this is purely additive.
+
 ### Added
+- **transactional outbox helper** — a new `outbox` subpackage in the **core** module
+  (`github.com/babelqueue/babelqueue-go/outbox`, zero-dependency) that removes the
+  producer dual write ([ADR-0029](https://babelqueue.com)): the message is persisted into
+  the same database, in the same transaction, as the business write — so it commits or
+  rolls back atomically with it — and a separate relay publishes the durable rows
+  afterwards. The Go mirror of the PHP `BabelQueue\Outbox` helper and the producer-side
+  counterpart to the consumer-side `idempotency` package.
+  - `outbox.Store` — the persistence contract the **caller** binds to their own DB
+    (`Save(encoded, queue) (id, err)`, `FetchUnpublished(limit)`, `MarkPublished(ids)`,
+    `MarkFailed(id, reason)`). The core defines it and pulls in **no** DB driver (GR-7);
+    `FetchUnpublished` SHOULD lock/claim rows (`FOR UPDATE SKIP LOCKED`) in a concurrent
+    adapter — documented as the adapter's job, not the in-memory reference's.
+  - `outbox.Outbox.Write(env)` — encodes via the **frozen** envelope codec (bytes stored
+    verbatim, GR-1), captures the target queue from `meta.queue` (else `"default"`), and
+    delegates to `Store.Save`. It does **not** begin/commit anything — **the caller owns
+    the transaction boundary**, which is the whole point.
+  - `outbox.Relay` — `Flush(ctx)` publishes one batch through the frozen `Transport`
+    seam, marking each row published only **after** publish returns, or failed (caught,
+    `MarkFailed`, left pending) with a bounded linear backoff (injectable sleeper); one
+    poison row never blocks the batch. `Drain(ctx, maxPasses)` loops `Flush` until a pass
+    makes no progress (a safety ceiling). It publishes the **stored bytes verbatim** —
+    never decoding/rebuilding the envelope — so `trace_id` is preserved end-to-end (GR-4)
+    and cross-SDK parity holds (GR-5).
+  - `outbox.InMemoryStore` — a process-local reference `Store` for tests / single-process
+    demos (no real transaction; use a DB-backed adapter in production).
+
+    The envelope is unchanged (`schema_version: 1`); this is purely additive (GR-6).
 - **persistent idempotency stores (Postgres + Redis)** — two new modules implementing
   the **unchanged** core `idempotency.Store` interface ([ADR-0022](https://babelqueue.com)),
   so a fleet of consumers shares one dedupe record keyed on the envelope's `meta.id`
