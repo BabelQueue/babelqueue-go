@@ -76,8 +76,8 @@ func TestHeadersFromTable(t *testing.T) {
 
 	got := headersFromTable(amqp091.Table{
 		"traceparent":      "00-trace-span-01",
-		"x-attempts":       3,             // ints stringify
-		"bq-replay-bypass": []byte("1"),   // byte slices stringify
+		"x-attempts":       3,           // ints stringify
+		"bq-replay-bypass": []byte("1"), // byte slices stringify
 		"x-source-lang":    "go",
 		"nil-value":        nil, // skipped
 	})
