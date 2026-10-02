@@ -26,7 +26,7 @@ typed `Args`), so the mapping is:
 go get github.com/babelqueue/babelqueue-go/machinery
 ```
 
-Requires Go 1.23+.
+Requires Go 1.24+.
 
 ## Produce
 

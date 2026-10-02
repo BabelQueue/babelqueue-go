@@ -1,0 +1,58 @@
+version: 2
+updates:
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "gomod"
+    directory: "/amqp"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "gomod"
+    directory: "/artemis"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "gomod"
+    directory: "/asynq"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "gomod"
+    directory: "/azureservicebus"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "gomod"
+    directory: "/idempotency-postgres"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "gomod"
+    directory: "/idempotency-redis"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "gomod"
+    directory: "/kafka"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "gomod"
+    directory: "/machinery"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "gomod"
+    directory: "/otel"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "gomod"
+    directory: "/pulsar"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "gomod"
+    directory: "/redis"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "gomod"
+    directory: "/sqs"
+    schedule:
+      interval: "weekly"
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"

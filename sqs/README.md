@@ -55,9 +55,40 @@ name must end in `.fifo`).
 | `meta.created_at` | `MessageAttributes.bq-created-at` (Number, ms) |
 | `attempts` | reconciled to `ApproximateReceiveCount − 1` on receive |
 | reserve / ack | visibility timeout → `DeleteMessage` |
+| release (handler failure, unknown-URN `release`) | `ChangeMessageVisibility(VisibilityTimeout = backoff s)` — never deleted or re-sent |
 | out-of-band headers (e.g. `traceparent`) | extra String `MessageAttributes` (see below) |
 
 The envelope is unchanged (`schema_version` stays `1`); SQS is purely additive.
+
+## Release and the poison-message risk
+
+When a handler fails (and attempts remain) or an unknown URN uses the `release`
+strategy, the App releases the message in place with `ChangeMessageVisibility`. The
+delay is `WithRetryBackoff` / `WithUnknownURNReleaseDelay` — **default `0` s**, i.e.
+the message becomes visible again immediately (clamped to SQS's 0–43200 s). If that
+call fails, the message is left reserved and SQS redelivers it when its visibility
+timeout lapses; it is never deleted or re-sent. The IAM principal needs
+`sqs:ChangeMessageVisibility`.
+
+A zero delay means a message that always fails is redelivered in a tight loop until
+the App's `WithMaxAttempts` is reached (counted from `ApproximateReceiveCount`, surfaced
+as `ReceivedMessage.DeliveryCount` — so the bound also holds for a body that does not
+decode — under the `release` strategy such a body bypasses `release` and takes the
+bounded `fail` path rather than being redelivered forever; `delete` acks it at once and
+`dead_letter` writes it to the DLQ at once). On that `fail` path, once `WithMaxAttempts`
+is reached the body is dead-lettered if `WithDeadLetter` is on — as an empty envelope,
+the raw body is not preserved — and otherwise **deleted with `DeleteMessage`**: it never
+reaches the queue's `RedrivePolicy`, and nothing is logged. To keep such bodies intact in
+the broker-side DLQ, set `WithMaxAttempts` above the queue's `maxReceiveCount` — note this is App-wide, so it
+also routes every handler failure to the broker DLQ (raw, without a `dead_letter` block)
+instead of the App's `WithDeadLetter` queue. A failed `ChangeMessageVisibility` (e.g. a missing IAM permission) is
+reported through `WithReleaseErrorHandler`; the retry then waits for the queue's
+visibility timeout rather than `WithRetryBackoff`. A failed
+`DeleteMessage` after a successful handler is an ack failure, not a handler failure: it
+is reported through `WithAckErrorHandler` and the message is not released. As a
+broker-side backstop — and for any consumer that stops before dead-lettering it —
+**configure a `RedrivePolicy` with a `maxReceiveCount` on every queue**, and set a
+non-zero `WithRetryBackoff` where a hot retry loop is undesirable.
 
 ## Out-of-band transport headers
 

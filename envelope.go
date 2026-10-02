@@ -20,6 +20,16 @@ type Envelope struct {
 	Meta       Meta           `json:"meta"`
 	Attempts   int            `json:"attempts"`              // top-level transport retry counter
 	DeadLetter *DeadLetter    `json:"dead_letter,omitempty"` // present only once dead-lettered
+
+	// extras / metaExtras hold top-level and meta keys this core does not know,
+	// captured verbatim by Decode and re-emitted by Encode after the known fields
+	// (message-envelope.md §4/§8: unknown keys are forward-compatible and must
+	// survive retry, dead-lettering, redrive and relay). The meta extras live here
+	// rather than on Meta so Meta stays a comparable value type. Forbidden keys
+	// (§10) are never captured — see Warnings.
+	extras     map[string]json.RawMessage
+	metaExtras map[string]json.RawMessage
+	warnings   []string
 }
 
 // Meta is the immutable per-message metadata block.
@@ -87,7 +97,8 @@ func Make(urn string, data map[string]any, opts ...Option) (Envelope, error) {
 // Encode renders the envelope as compact UTF-8 JSON with HTML escaping disabled
 // (unescaped slashes and unicode) — the canonical wire form shared by every SDK.
 // The envelope frame is identical across languages; key order within the Data map
-// follows encoding/json (sorted), which is semantically the same JSON.
+// follows encoding/json (sorted), which is semantically the same JSON. Unknown keys
+// captured by [Decode] are written after the known fields of their object.
 func (e Envelope) Encode() ([]byte, error) {
 	var buf bytes.Buffer
 	enc := json.NewEncoder(&buf)
@@ -100,8 +111,11 @@ func (e Envelope) Encode() ([]byte, error) {
 }
 
 // Decode parses a raw JSON body into an Envelope. It accepts "urn" as an inbound
-// alias for "job" (resolving it into Job). It does not validate the contents —
-// use Accepts for consumer-side validation.
+// alias for "job" (resolving it into Job). Unknown top-level and meta keys are
+// kept and re-emitted by Encode; forbidden keys (message-envelope.md §10) are
+// dropped with a warning (see [Envelope.Warnings]). It does not validate the
+// contents — use Accepts for consumer-side validation. A non-object data block
+// (e.g. a JSON array) is rejected with an error.
 func Decode(raw []byte) (Envelope, error) {
 	var e Envelope
 	if err := json.Unmarshal(raw, &e); err != nil {
@@ -116,6 +130,22 @@ func Decode(raw []byte) (Envelope, error) {
 		}
 	}
 	return e, nil
+}
+
+// Warnings returns the non-fatal problems [Decode] found, such as a forbidden
+// non-canonical key (message-envelope.md §10) that was dropped. Each warning names
+// the offending key as a JSON pointer (e.g. "/meta/max_retries"). It is empty for a
+// clean envelope and for envelopes built with [Make].
+//
+// Warnings only reflect the body as the consumer received it: a transport that
+// reconciles attempts by re-encoding the body on redelivery (SQS, Kafka, Pulsar,
+// Artemis, Azure Service Bus) has already dropped any forbidden key there, so a
+// redelivered message may carry no warning even though its first delivery did.
+func (e Envelope) Warnings() []string {
+	if len(e.warnings) == 0 {
+		return nil
+	}
+	return append([]string(nil), e.warnings...)
 }
 
 // URN returns the message URN — the canonical job, with the urn alias already

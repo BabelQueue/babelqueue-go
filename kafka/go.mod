@@ -1,6 +1,6 @@
 module github.com/babelqueue/babelqueue-go/kafka
 
-go 1.23.0
+go 1.24
 
 require (
 	github.com/babelqueue/babelqueue-go v1.0.0

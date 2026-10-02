@@ -15,6 +15,7 @@ import (
 	"math"
 	"reflect"
 	"sort"
+	"unicode/utf8"
 )
 
 // Schema is a parsed (subset) JSON Schema node.
@@ -27,7 +28,7 @@ type Schema struct {
 	Enum                 []any              // allowed values (nil = any)
 	Const                any                // fixed value when HasConst
 	HasConst             bool
-	MinLength            *int     // string
+	MinLength            *int     // string (counted in Unicode code points)
 	Minimum              *float64 // integer|number
 
 	// GDPRSensitive marks a property as carrying personal/sensitive data
@@ -180,7 +181,8 @@ func (s *Schema) validate(path string, value any, errs *[]string) {
 			*errs = append(*errs, at("must be a string"))
 			return
 		}
-		if s.MinLength != nil && len(str) < *s.MinLength {
+		// minLength counts Unicode code points (not UTF-8 bytes) — the cross-SDK rule.
+		if s.MinLength != nil && utf8.RuneCountInString(str) < *s.MinLength {
 			*errs = append(*errs, at(fmt.Sprintf("must be at least %d characters", *s.MinLength)))
 		}
 	case "integer":

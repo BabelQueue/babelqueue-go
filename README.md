@@ -19,7 +19,7 @@ standard is documented at **[babelqueue.com](https://babelqueue.com)**.
 go get github.com/babelqueue/babelqueue-go
 ```
 
-Requires Go `>=1.21`.
+Requires Go `>=1.24`.
 
 ## Usage
 

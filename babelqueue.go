@@ -49,4 +49,11 @@ var (
 
 	// ErrUnknownURN signals that no handler is mapped for a message URN.
 	ErrUnknownURN = errors.New("babelqueue: no handler is mapped for the message URN")
+
+	// ErrReleaseUnsupported is returned (or wrapped) by a [Releaser] that cannot
+	// release this particular message in place — e.g. a client lacking the broker's
+	// release call, or a message without a reservation handle. Only this error makes
+	// the [App] fall back to re-publish + ack; any other Release error leaves the
+	// message reserved so the broker redelivers it (it is never deleted).
+	ErrReleaseUnsupported = errors.New("babelqueue: in-place release is unsupported for this message")
 )

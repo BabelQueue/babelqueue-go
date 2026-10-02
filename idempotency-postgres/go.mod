@@ -1,6 +1,6 @@
 module github.com/babelqueue/babelqueue-go/idempotency-postgres
 
-go 1.21
+go 1.24
 
 require (
 	github.com/DATA-DOG/go-sqlmock v1.5.2

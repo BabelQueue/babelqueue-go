@@ -25,6 +25,7 @@ package sqs
 
 import (
 	"context"
+	"fmt"
 	"sort"
 	"strconv"
 	"strings"
@@ -47,6 +48,24 @@ type API interface {
 	DeleteMessage(ctx context.Context, in *awssqs.DeleteMessageInput, optFns ...func(*awssqs.Options)) (*awssqs.DeleteMessageOutput, error)
 	GetQueueUrl(ctx context.Context, in *awssqs.GetQueueUrlInput, optFns ...func(*awssqs.Options)) (*awssqs.GetQueueUrlOutput, error)
 }
+
+// VisibilityAPI is the optional client capability used by [Transport.Release]:
+// ChangeMessageVisibility on a receipt handle (contract §3 release/nack). The
+// concrete *github.com/aws/aws-sdk-go-v2/service/sqs.Client satisfies it. It is kept
+// separate from [API] so existing API implementations stay valid; a client without
+// it makes Release return [ErrReleaseUnsupported] and the runtime falls back to
+// re-publish + delete.
+type VisibilityAPI interface {
+	ChangeMessageVisibility(ctx context.Context, in *awssqs.ChangeMessageVisibilityInput, optFns ...func(*awssqs.Options)) (*awssqs.ChangeMessageVisibilityOutput, error)
+}
+
+// ErrReleaseUnsupported is returned by [Transport.Release] when the injected client
+// does not implement [VisibilityAPI], or the message has no receipt handle.
+// It wraps [babelqueue.ErrReleaseUnsupported], which is what makes the App fall back.
+var ErrReleaseUnsupported = fmt.Errorf("babelqueue/sqs: release needs ChangeMessageVisibility and a receipt handle: %w", babelqueue.ErrReleaseUnsupported)
+
+// MaxVisibilityTimeoutSeconds is SQS's ceiling for a visibility timeout (12 h).
+const MaxVisibilityTimeoutSeconds = 43200
 
 // Transport implements [babelqueue.Transport] over Amazon SQS. It is safe for
 // concurrent use; the queue-URL cache is guarded by a mutex.
@@ -237,15 +256,61 @@ func (t *Transport) Pop(ctx context.Context, queue string, timeout time.Duration
 	}
 	m := out.Messages[0]
 	body := aws.ToString(m.Body)
+	deliveries := 0
 	if rc, ok := m.Attributes[string(types.MessageSystemAttributeNameApproximateReceiveCount)]; ok {
 		body = reconcileAttempts(body, rc)
+		if n, err := strconv.Atoi(rc); err == nil && n > 0 {
+			deliveries = n
+		}
 	}
 	return &babelqueue.ReceivedMessage{
-		Body:    body,
-		Queue:   queue,
-		Handle:  aws.ToString(m.ReceiptHandle),
-		Headers: headersFromAttributes(m.MessageAttributes),
+		Body:          body,
+		Queue:         queue,
+		Handle:        aws.ToString(m.ReceiptHandle),
+		Headers:       headersFromAttributes(m.MessageAttributes),
+		DeliveryCount: deliveries,
 	}, nil
+}
+
+// Release implements [babelqueue.Releaser] per contract §3: the reserved message is
+// neither deleted nor re-sent; its visibility timeout is set to delay (whole seconds,
+// clamped to 0–43200) via ChangeMessageVisibility, so SQS redelivers the same message
+// after the backoff (0 = redeliver now). The broker's ApproximateReceiveCount stays
+// the authoritative attempt counter — it is reconciled onto attempts on the next Pop
+// and surfaced as [babelqueue.ReceivedMessage.DeliveryCount], which bounds retries
+// even for a body that does not decode.
+func (t *Transport) Release(ctx context.Context, msg *babelqueue.ReceivedMessage, delay time.Duration) error {
+	handle, _ := msg.Handle.(string)
+	vis, ok := t.client.(VisibilityAPI)
+	if !ok || handle == "" {
+		return ErrReleaseUnsupported
+	}
+	url, err := t.resolveURL(ctx, msg.Queue)
+	if err != nil {
+		return err
+	}
+	_, err = vis.ChangeMessageVisibility(ctx, &awssqs.ChangeMessageVisibilityInput{
+		QueueUrl:          aws.String(url),
+		ReceiptHandle:     aws.String(handle),
+		VisibilityTimeout: visibilitySeconds(delay),
+	})
+	return err
+}
+
+// visibilitySeconds converts a backoff to SQS visibility seconds, rounding up any
+// fractional second and clamping to [0, MaxVisibilityTimeoutSeconds].
+func visibilitySeconds(delay time.Duration) int32 {
+	if delay <= 0 {
+		return 0
+	}
+	if delay >= MaxVisibilityTimeoutSeconds*time.Second {
+		return MaxVisibilityTimeoutSeconds // also guards the round-up below against overflow
+	}
+	secs := (delay + time.Second - 1) / time.Second
+	if secs > MaxVisibilityTimeoutSeconds {
+		return MaxVisibilityTimeoutSeconds
+	}
+	return int32(secs)
 }
 
 // Ack deletes the reserved message (DeleteMessage on its receipt handle).
@@ -411,4 +476,6 @@ func reconcileAttempts(body, receiveCount string) string {
 var (
 	_ babelqueue.Transport       = (*Transport)(nil)
 	_ babelqueue.HeaderPublisher = (*Transport)(nil)
+	_ babelqueue.Releaser        = (*Transport)(nil)
+	_ VisibilityAPI              = (*awssqs.Client)(nil)
 )

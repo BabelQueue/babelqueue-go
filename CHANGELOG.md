@@ -9,6 +9,90 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.9.0] - 
+
+Forward-compatible re-emit, Unicode-correct `minLength`, the SQS §3 in-place release,
+and a Go 1.24 floor. The envelope stays **frozen** (`schema_version: 1`) and golden
+fixtures encode byte-for-byte as before.
+
+### Added
+
+- **Unknown-key round-trip** (message-envelope.md §4/§8, GR-5): `Decode` keeps unknown
+  top-level and `meta` keys and `Encode` re-emits them verbatim after the known fields
+  (sorted), so retry (`attempts++`), dead-lettering, redrive, outbox relay and SQS attempt
+  reconciliation no longer drop a newer producer's keys. An envelope without unknown keys
+  encodes exactly as before.
+- **Forbidden-key warnings** (message-envelope.md §10, K-15): `timestamp`,
+  `meta.max_retries`, `meta.attempts`, `meta.source` and `meta.ts` are dropped on decode
+  (never re-emitted) and reported via the new `Envelope.Warnings()`; decode still succeeds.
+- **`Releaser`** optional transport capability plus the `WithRetryBackoff` and
+  `WithUnknownURNReleaseDelay` App options: a transport that implements it redelivers a
+  retried / unknown-URN-released message in place after the backoff instead of
+  re-publishing a copy.
+- **sqs:** `Transport.Release` — contract §3 release/nack via
+  `ChangeMessageVisibility(ReceiptHandle, VisibilityTimeout = backoff seconds)`, clamped to
+  0–43200; the message is neither deleted nor re-sent and `ApproximateReceiveCount` stays
+  the attempt counter. Uses the new optional `VisibilityAPI` client interface (the AWS
+  client satisfies it; `API` is unchanged). Requires `sqs:ChangeMessageVisibility`.
+  Every handler failure with attempts left, and every unknown-URN `release`, now goes
+  through it; the default delay is **0 s** for both. If the call fails the message stays
+  reserved (redelivered at visibility expiry) — the App never re-publishes a copy. Only a
+  client without `ChangeMessageVisibility` (`ErrReleaseUnsupported`, which wraps the new
+  core `babelqueue.ErrReleaseUnsupported`) keeps the old re-publish + delete path.
+  **Poison-loop risk:** with the 0 s default a message that always fails is redelivered
+  immediately until `WithMaxAttempts`; configure a `RedrivePolicy` (`maxReceiveCount`) on
+  every SQS queue as a broker-side backstop and consider a non-zero `WithRetryBackoff`.
+- **`ReceivedMessage.DeliveryCount`** (broker-native delivery count, 0 when unknown): the
+  App floors `attempts` at `DeliveryCount − 1`, so the `WithMaxAttempts` bound and
+  dead-lettering hold for an in-place release even when the body cannot carry the counter
+  (e.g. it does not decode — such a message is dead-lettered after `WithMaxAttempts`
+  deliveries instead of looping at 0 s). The SQS transport sets it from
+  `ApproximateReceiveCount`.
+- **`WithAckErrorHandler`** App option: reports a failed acknowledgement (e.g. an SQS
+  `DeleteMessage` error after a successful handler) distinctly. An ack failure is never
+  treated as a handler failure — the message is not retried, released or dead-lettered.
+- **`WithReleaseErrorHandler`** App option: reports a failed in-place release (e.g. an
+  SQS `ChangeMessageVisibility` `AccessDenied` when the IAM policy lacks
+  `sqs:ChangeMessageVisibility`). The message still stays reserved and is redelivered at
+  the queue's visibility timeout instead of `WithRetryBackoff`; the hook makes that
+  timing change observable. `ErrReleaseUnsupported` is not reported (it selects the
+  re-publish + ack fallback).
+- **sqs:** the `sqs` module now requires core `v1.9.0` (it uses `Releaser`,
+  `ErrReleaseUnsupported` and `DeliveryCount`); tag the core `v1.9.0` before `sqs/v1.9.0`.
+- Conformance runners for the `roundtrip`, `data_shape`, `forbidden_keys` and
+  `payload_schema_unicode` manifest sections.
+- `.github/dependabot.yml` (weekly `gomod` per module + `github-actions`).
+
+### Changed
+
+- **Go 1.24 floor** (was 1.21) for the core, `sqs`, `amqp`, `redis`, `otel`,
+  `idempotency-redis` and `idempotency-postgres`, and (was 1.23) for `azureservicebus`,
+  `pulsar`, `kafka` and `machinery` — a module cannot declare a lower `go` directive than
+  the core it requires. `artemis` stays at 1.25. CI matrix is now Go 1.24 / 1.25.
+- A body that does not decode, or names no URN, is no longer released under the
+  unknown-URN `StrategyRelease` (no handler can ever claim it, so the release looped
+  forever): it takes the bounded `StrategyFail` path — retried up to `WithMaxAttempts`
+  (floored by `DeliveryCount`), then dead-lettered (`reason: unknown_urn`) or dropped. The
+  other strategies (`fail`, `delete`, `dead_letter`) are unchanged for such bodies.
+  **Behaviour change for `StrategyRelease` users:** with `WithDeadLetter` off, "dropped"
+  means the body is acked — on SQS permanently deleted (`DeleteMessage`) — once
+  `WithMaxAttempts` is reached, so it no longer reaches the queue's broker-side
+  `RedrivePolicy`/DLQ and nothing is logged. With `WithDeadLetter` on, the dead-lettered
+  envelope is empty (no `job`) and the raw body is not preserved. If you relied on the
+  broker DLQ keeping such bodies intact, set `WithMaxAttempts` above the queue's
+  `maxReceiveCount` — this is App-wide, so it also routes every handler failure to the
+  broker DLQ (raw, without a `dead_letter` block) instead of the App's `WithDeadLetter` queue.
+
+### Fixed
+
+- Decode no longer captures a key that differs from a known envelope key only in case
+  (`"JOB"`, `"Attempts"`) as an unknown key — `encoding/json` already decoded it into the
+  field, so it was re-emitted twice. Case variants of forbidden keys are warned and dropped.
+- **sqs:** `visibilitySeconds` clamps before rounding, so an extreme backoff can no longer
+  overflow to a negative `VisibilityTimeout`.
+- **schema:** `minLength` counts Unicode code points (`utf8.RuneCountInString`), not
+  bytes — a non-ASCII string no longer satisfies a minimum it is too short for.
+
 ## [1.8.0] - 2026-06-21
 
 The new `gdpr` subpackage is the **runtime** half of GDPR sensitive-field governance

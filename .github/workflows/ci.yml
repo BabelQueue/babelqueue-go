@@ -14,7 +14,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        go: [ "1.21", "1.22", "1.23", "1.24" ]
+        go: [ "1.24", "1.25" ]
     steps:
       - uses: actions/checkout@v5
 
@@ -48,7 +48,7 @@ jobs:
           # The optional OpenTelemetry module (ADR-0025) — its tests use an in-memory
           # span recorder, so they are network-free and run across the Go matrix.
           (cd otel && go build ./... && go vet ./... && go test -race -count=1 ./...)
-          # Persistent idempotency stores (ADR-0022). Both floor at Go 1.21 (the core's
+          # Persistent idempotency stores (ADR-0022). Both floor at Go 1.24 (the core's
           # floor) and their unit tests are DB/broker-free (postgres via go-sqlmock,
           # redis via a fake client seam), so they run across the whole Go matrix; the
           # live DB/Redis paths skip unless BABELQUEUE_TEST_PG / BABELQUEUE_TEST_REDIS is set.
@@ -56,47 +56,41 @@ jobs:
           (cd idempotency-redis && go build ./... && go vet ./... && go test -race -count=1 ./...)
 
       - name: Build & vet the Azure Service Bus module
-        # azure-messaging-servicebus requires Go 1.23+, so build/test this module only
-        # on the matrix entries that satisfy that floor (its unit + conformance tests are
-        # network-free — a fake client).
-        if: ${{ matrix.go == '1.23' || matrix.go == '1.24' }}
+        # This module floors at Go 1.24 (the core's floor) — every matrix entry satisfies it
+        # (its unit + conformance tests are network-free — a fake client).
         run: |
           (cd azureservicebus && go build ./... && go vet ./... && go test -race -count=1 ./...)
 
       - name: Build & vet the Apache Pulsar module
         # The pure-Go pulsar-client-go (no CGo, no libpulsar) sits behind this module's Go
-        # 1.23 floor, so build/test it only on matrix entries that satisfy it (its unit tests
-        # are network-free — a fake client).
-        if: ${{ matrix.go == '1.23' || matrix.go == '1.24' }}
+        # 1.24 floor, which every matrix entry satisfies (its unit tests are network-free —
+        # a fake client).
         run: |
           (cd pulsar && go build ./... && go vet ./... && go test -race -count=1 ./...)
 
       - name: Build & vet the Apache Kafka module
         # The pure-Go segmentio/kafka-go (no CGo, no librdkafka) sits behind this module's Go
-        # 1.23 floor; its unit tests are network-free (fake Writer/Reader).
-        if: ${{ matrix.go == '1.23' || matrix.go == '1.24' }}
+        # 1.24 floor; its unit tests are network-free (fake Writer/Reader).
         run: |
           (cd kafka && go build ./... && go vet ./... && go test -race -count=1 ./...)
 
       - name: Build & vet the Apache ActiveMQ Artemis module
-        # The pure-Go Azure/go-amqp (AMQP 1.0, no CGo) sits behind this module's Go 1.23 floor;
-        # its unit tests are network-free (fake Sender/Receiver/Client seam).
-        if: ${{ matrix.go == '1.23' || matrix.go == '1.24' }}
+        # The pure-Go Azure/go-amqp (AMQP 1.0, no CGo); this module floors at Go 1.25, so it
+        # builds/tests only on matrix entries that satisfy that floor. Its unit tests are
+        # network-free (fake Sender/Receiver/Client seam).
+        if: ${{ matrix.go == '1.25' }}
         run: |
           (cd artemis && go build ./... && go vet ./... && go test -race -count=1 ./...)
 
       - name: Build & vet the asynq adapter module
-        # hibiken/asynq requires Go 1.24+, so build/test this module only on the matrix
-        # entries that satisfy that floor; its unit + conformance tests are network-free
-        # (a fake Enqueuer seam — no Redis).
-        if: ${{ matrix.go == '1.24' }}
+        # hibiken/asynq requires Go 1.24+ — every matrix entry satisfies it; its unit +
+        # conformance tests are network-free (a fake Enqueuer seam — no Redis).
         run: |
           (cd asynq && go build ./... && go vet ./... && go test -race -count=1 ./...)
 
       - name: Build & vet the machinery adapter module
-        # RichardKnop/machinery v2 needs Go 1.22+; this module floors at 1.23. Its unit +
+        # RichardKnop/machinery v2 needs Go 1.22+; this module floors at 1.24. Its unit +
         # conformance tests are network-free (fake Sender/Registrar seams — no broker).
-        if: ${{ matrix.go == '1.23' || matrix.go == '1.24' }}
         run: |
           (cd machinery && go build ./... && go vet ./... && go test -race -count=1 ./...)
 

@@ -16,6 +16,12 @@ type ReceivedMessage struct {
 	// message (e.g. the bq-replay-bypass marker). Nil for transports that don't surface
 	// them; reads are nil-safe.
 	Headers map[string]string
+	// DeliveryCount is the broker's native delivery count for this reservation
+	// (1 on the first delivery), or 0 when the transport does not track one. The
+	// [App] treats DeliveryCount−1 as a floor for the envelope's attempts, so the
+	// WithMaxAttempts bound and dead-lettering still hold when a message is released
+	// in place and its body cannot carry the counter (e.g. it does not decode).
+	DeliveryCount int
 }
 
 // Transport is the minimal broker contract the [App] runtime talks to: publish a
@@ -39,6 +45,18 @@ type Transport interface {
 // headers — callers fall back to plain Publish (ADR-0027).
 type HeaderPublisher interface {
 	PublishWithHeaders(ctx context.Context, queue, body string, headers map[string]string) error
+}
+
+// Releaser is an optional [Transport] capability: return a reserved message to its
+// queue in place, to be redelivered after delay, instead of re-publishing a copy and
+// acknowledging the original. Brokers whose contract binding mandates an in-place
+// release (e.g. SQS §3: ChangeMessageVisibility on the receipt handle, with the
+// broker's receive count as the authoritative attempt counter) implement it. When
+// Release returns [ErrReleaseUnsupported] the [App] falls back to re-publish + ack;
+// any other error leaves the message reserved (not acked), so the broker redelivers
+// it once its reservation lapses.
+type Releaser interface {
+	Release(ctx context.Context, msg *ReceivedMessage, delay time.Duration) error
 }
 
 // InMemoryTransport is an in-process [Transport] for tests and broker-free local

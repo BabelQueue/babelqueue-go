@@ -2,6 +2,7 @@ package outbox
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -291,5 +292,41 @@ func TestRelay_EmptyOutboxIsNoOp(t *testing.T) {
 	}
 	if res != (Result{}) {
 		t.Errorf("flush of an empty outbox = %+v, want zero", res)
+	}
+}
+
+// TestRelay_PreservesUnknownKeys proves the outbox re-emit path (Write -> Relay) carries
+// unknown envelope/meta keys captured on decode, and never re-emits a forbidden key.
+func TestRelay_PreservesUnknownKeys(t *testing.T) {
+	const in = `{"job":"urn:babel:orders:created","trace_id":"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",` +
+		`"data":{"order_id":1042},"meta":{"id":"f1e2d3c4-b5a6-4789-90ab-cdef01234567","queue":"orders",` +
+		`"lang":"php","schema_version":1,"created_at":1749132727000,"vendor_flag":true,"source":"legacy"},` +
+		`"attempts":0,"extra_top":1}`
+	env, err := babelqueue.Decode([]byte(in))
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewInMemoryStore()
+	tr := babelqueue.NewInMemoryTransport()
+	if _, err := New(store).Write(env); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewRelay(tr, store, Options{Sleeper: noSleep}).Flush(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	msg, err := tr.Pop(context.Background(), "orders", 0)
+	if err != nil || msg == nil {
+		t.Fatalf("no relayed message: %v", err)
+	}
+	var doc map[string]any
+	if err := json.Unmarshal([]byte(msg.Body), &doc); err != nil {
+		t.Fatal(err)
+	}
+	meta := doc["meta"].(map[string]any)
+	if doc["extra_top"] != float64(1) || meta["vendor_flag"] != true {
+		t.Errorf("unknown keys lost on relay: %s", msg.Body)
+	}
+	if _, ok := meta["source"]; ok {
+		t.Errorf("forbidden meta.source re-emitted: %s", msg.Body)
 	}
 }
