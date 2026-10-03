@@ -9,7 +9,7 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
-## [1.9.0] - 
+## [1.9.0] - 2026-10-03
 
 Forward-compatible re-emit, Unicode-correct `minLength`, the SQS §3 in-place release,
 and a Go 1.24 floor. The envelope stays **frozen** (`schema_version: 1`) and golden
