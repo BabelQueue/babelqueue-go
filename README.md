@@ -19,7 +19,8 @@ standard is documented at **[babelqueue.com](https://babelqueue.com)**.
 go get github.com/babelqueue/babelqueue-go
 ```
 
-Requires Go `>=1.24`.
+Requires Go `>=1.24`. The `otel`, `idempotency-postgres`, `azureservicebus`, `pulsar` and
+`artemis` modules floor at Go `>=1.25` (their dependencies require it).
 
 ## Usage
 

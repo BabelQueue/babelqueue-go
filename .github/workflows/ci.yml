@@ -45,26 +45,36 @@ jobs:
           # client), so they run here across the Go matrix; the live ElasticMQ
           # round-trip is `-tags=integration` in the integration job below.
           (cd sqs && go build ./... && go vet ./... && go test -race -count=1 ./...)
-          # The optional OpenTelemetry module (ADR-0025) — its tests use an in-memory
-          # span recorder, so they are network-free and run across the Go matrix.
-          (cd otel && go build ./... && go vet ./... && go test -race -count=1 ./...)
-          # Persistent idempotency stores (ADR-0022). Both floor at Go 1.24 (the core's
-          # floor) and their unit tests are DB/broker-free (postgres via go-sqlmock,
-          # redis via a fake client seam), so they run across the whole Go matrix; the
-          # live DB/Redis paths skip unless BABELQUEUE_TEST_PG / BABELQUEUE_TEST_REDIS is set.
-          (cd idempotency-postgres && go build ./... && go vet ./... && go test -race -count=1 ./...)
+          # The Redis idempotency store (ADR-0022) floors at Go 1.24 (the core's floor);
+          # its unit tests are broker-free (a fake client seam), so it runs across the whole
+          # Go matrix; the live Redis path skips unless BABELQUEUE_TEST_REDIS is set.
           (cd idempotency-redis && go build ./... && go vet ./... && go test -race -count=1 ./...)
 
+      - name: Build & vet the Go 1.25 modules (otel, idempotency-postgres)
+        # Both floor at Go 1.25 (their security-fixed dependencies — otel/sdk, pgx and
+        # x/crypto — require it), so they build/test only on matrix entries that satisfy
+        # that floor. The OpenTelemetry module (ADR-0025) uses an in-memory span recorder;
+        # the Postgres idempotency store (ADR-0022) uses go-sqlmock, and its live DB path
+        # skips unless BABELQUEUE_TEST_PG is set.
+        if: ${{ matrix.go == '1.25' }}
+        run: |
+          (cd otel && go build ./... && go vet ./... && go test -race -count=1 ./...)
+          (cd idempotency-postgres && go build ./... && go vet ./... && go test -race -count=1 ./...)
+
       - name: Build & vet the Azure Service Bus module
-        # This module floors at Go 1.24 (the core's floor) — every matrix entry satisfies it
-        # (its unit + conformance tests are network-free — a fake client).
+        # This module floors at Go 1.25 (its security-fixed golang.org/x/net requires it), so
+        # it builds/tests only on matrix entries that satisfy that floor (its unit +
+        # conformance tests are network-free — a fake client).
+        if: ${{ matrix.go == '1.25' }}
         run: |
           (cd azureservicebus && go build ./... && go vet ./... && go test -race -count=1 ./...)
 
       - name: Build & vet the Apache Pulsar module
         # The pure-Go pulsar-client-go (no CGo, no libpulsar) sits behind this module's Go
-        # 1.24 floor, which every matrix entry satisfies (its unit tests are network-free —
+        # 1.25 floor (pulsar-client-go and golang.org/x/net require it), so it builds/tests
+        # only on matrix entries that satisfy that floor (its unit tests are network-free —
         # a fake client).
+        if: ${{ matrix.go == '1.25' }}
         run: |
           (cd pulsar && go build ./... && go vet ./... && go test -race -count=1 ./...)
 
