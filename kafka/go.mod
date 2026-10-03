@@ -4,7 +4,7 @@ go 1.24
 
 require (
 	github.com/babelqueue/babelqueue-go v1.0.0
-	github.com/segmentio/kafka-go v0.4.47
+	github.com/segmentio/kafka-go v0.4.51
 )
 
 require (
