@@ -2,6 +2,7 @@ package pulsar
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -14,10 +15,14 @@ import (
 const urn = "urn:babel:orders:created"
 
 type fakeProducer struct {
-	sent []*pulsarsdk.ProducerMessage
+	sent    []*pulsarsdk.ProducerMessage
+	sendErr error // when set, Send fails without recording the message
 }
 
 func (f *fakeProducer) Send(_ context.Context, m *pulsarsdk.ProducerMessage) (pulsarsdk.MessageID, error) {
+	if f.sendErr != nil {
+		return nil, f.sendErr
+	}
 	f.sent = append(f.sent, m)
 	return nil, nil
 }
@@ -753,8 +758,8 @@ func TestAppQuarantinesUnsupportedSchemaVersion(t *testing.T) {
 	}
 }
 
-// The sentinel route is an in-process marker: whatever the App re-publishes for a gated message
-// (retry copy or dead-letter record) keeps the delivery's original bq-job and bq-schema-version
+// The sentinel route is an in-process marker: the dead-letter record the App writes for a gated
+// message (it never retries one) keeps the delivery's original bq-job and bq-schema-version
 // and never carries the reserved URN, so a redrive is gated the same way.
 func TestGatedRepublishKeepsOriginalRoutingProperties(t *testing.T) {
 	body := bodyWith(t, urn, 0)
@@ -769,15 +774,25 @@ func TestGatedRepublishKeepsOriginalRoutingProperties(t *testing.T) {
 	}
 	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
-			for _, deadLetter := range []bool{false, true} {
+			// Dead-lettering off: the App drops (acks) the gated message, publishing nothing.
+			{
 				producer := &fakeProducer{}
 				consumer := &fakeConsumer{messages: []pulsarsdk.Message{fakeMessage{payload: []byte(body), properties: tc.props}}}
 				tr, _ := New(WithClient(&fakeClient{producer: producer, consumer: consumer}))
-				opts := []babelqueue.AppOption{babelqueue.WithMaxAttempts(1), babelqueue.WithDeadLetter(deadLetter)}
-				if !deadLetter {
-					opts = []babelqueue.AppOption{babelqueue.WithMaxAttempts(5)}
+				app := babelqueue.NewApp(tr, babelqueue.WithMaxAttempts(5))
+				if _, err := app.Drain(context.Background(), "orders", 1); err != nil {
+					t.Fatalf("Drain: %v", err)
 				}
-				app := babelqueue.NewApp(tr, opts...)
+				if len(producer.sent) != 0 || len(consumer.acked) != 1 {
+					t.Fatalf("dead-letter off: published %d, acked %d; want 0 and 1 (no retry copy)", len(producer.sent), len(consumer.acked))
+				}
+			}
+			// Dead-lettering on: exactly one dead-letter record, with no retry copy before it.
+			for _, deadLetter := range []bool{true} {
+				producer := &fakeProducer{}
+				consumer := &fakeConsumer{messages: []pulsarsdk.Message{fakeMessage{payload: []byte(body), properties: tc.props}}}
+				tr, _ := New(WithClient(&fakeClient{producer: producer, consumer: consumer}))
+				app := babelqueue.NewApp(tr, babelqueue.WithMaxAttempts(5), babelqueue.WithDeadLetter(deadLetter))
 				if _, err := app.Drain(context.Background(), "orders", 1); err != nil {
 					t.Fatalf("Drain: %v", err)
 				}
@@ -802,14 +817,14 @@ func TestGatedRepublishKeepsOriginalRoutingProperties(t *testing.T) {
 	}
 }
 
-// A re-published gated message is gated again when it is consumed (the redrive meets the same gate).
+// A dead-lettered gated message is gated again when it is consumed (the redrive meets the same gate).
 func TestGatedRepublishIsGatedAgain(t *testing.T) {
 	producer := &fakeProducer{}
 	first := &fakeConsumer{messages: []pulsarsdk.Message{
 		fakeMessage{payload: []byte(bodyWith(t, urn, 0)), properties: map[string]string{"bq-schema-version": "2", "bq-job": urn}},
 	}}
 	tr, _ := New(WithClient(&fakeClient{producer: producer, consumer: first}))
-	app := babelqueue.NewApp(tr, babelqueue.WithMaxAttempts(5))
+	app := babelqueue.NewApp(tr, babelqueue.WithMaxAttempts(5), babelqueue.WithDeadLetter(true))
 	if _, err := app.Drain(context.Background(), "orders", 1); err != nil || len(producer.sent) != 1 {
 		t.Fatalf("Drain: %v, sent %d", err, len(producer.sent))
 	}
@@ -873,43 +888,95 @@ func TestRejectedHookIsNotCalledForSupportedVersionAndPanicIsIgnored(t *testing.
 	popMessageWithOptions(map[string]string{"bq-schema-version": "2"}, func(string, string) { panic("boom") })
 }
 
-// A gated message is quarantined through the bounded StrategyFail path even when the App is
-// configured with StrategyRelease: releasing it unchanged would loop forever (a redrive meets
-// the same gate), so the re-published copy carries attempts+1 and the original properties, and
-// a feedback loop of redeliveries ends in the dead-letter write after WithMaxAttempts.
-func TestGatedMessageIsBoundedUnderStrategyRelease(t *testing.T) {
+// A gated message goes straight to the dead-letter queue, with no retry, even when the App is
+// configured with StrategyRelease and several attempts: neither a release nor a retry can make a
+// future-version message handleable, so the handler is never reached and exactly one record (the
+// dead-letter copy, with the original properties) is written, after which the original is acked.
+func TestGatedMessageIsDeadLetteredDirectlyUnderStrategyRelease(t *testing.T) {
 	body := bodyWith(t, urn, 0)
 	props := map[string]string{"bq-schema-version": "2", "bq-job": urn}
 	producer := &fakeProducer{}
-	next := fakeMessage{payload: []byte(body), properties: props}
+	consumer := &fakeConsumer{messages: []pulsarsdk.Message{fakeMessage{payload: []byte(body), properties: props}}}
+	tr, _ := New(WithClient(&fakeClient{producer: producer, consumer: consumer}))
+	app := babelqueue.NewApp(tr, babelqueue.WithMaxAttempts(3), babelqueue.WithDeadLetter(true),
+		babelqueue.WithUnknownURNStrategy(babelqueue.StrategyRelease))
 	handled := 0
-	const maxAttempts = 3
-	for delivery := 1; delivery <= maxAttempts; delivery++ {
-		consumer := &fakeConsumer{messages: []pulsarsdk.Message{next}}
-		tr, _ := New(WithClient(&fakeClient{producer: producer, consumer: consumer}))
-		app := babelqueue.NewApp(tr, babelqueue.WithMaxAttempts(maxAttempts), babelqueue.WithDeadLetter(true),
-			babelqueue.WithUnknownURNStrategy(babelqueue.StrategyRelease))
-		app.Handle(urn, func(context.Context, babelqueue.Envelope) error { handled++; return nil })
-		if n, err := app.Drain(context.Background(), "orders", 1); err != nil || n != 1 {
-			t.Fatalf("delivery %d: Drain = (%d, %v)", delivery, n, err)
-		}
-		if len(producer.sent) != delivery {
-			t.Fatalf("delivery %d: %d messages published, want %d", delivery, len(producer.sent), delivery)
-		}
-		sent := producer.sent[delivery-1]
-		if sent.Properties["bq-schema-version"] != "2" || sent.Properties["bq-job"] != urn {
-			t.Errorf("delivery %d: re-published properties = %v, want the originals", delivery, sent.Properties)
-		}
-		if string(sent.Payload) == body {
-			t.Fatalf("delivery %d: body re-published unchanged (the endless release loop)", delivery)
-		}
-		next = fakeMessage{payload: sent.Payload, properties: sent.Properties}
+	app.Handle(urn, func(context.Context, babelqueue.Envelope) error { handled++; return nil })
+	if n, err := app.Drain(context.Background(), "orders", 1); err != nil || n != 1 {
+		t.Fatalf("Drain = (%d, %v)", n, err)
 	}
 	if handled != 0 {
 		t.Fatalf("handler ran %d times for a version-gated message", handled)
 	}
-	last := producer.sent[len(producer.sent)-1]
-	if !strings.Contains(string(last.Payload), "unknown_urn") {
-		t.Errorf("last write is not the dead-letter record: %s", last.Payload)
+	if len(producer.sent) != 1 || len(consumer.acked) != 1 {
+		t.Fatalf("published %d, acked %d; want exactly one dead-letter record and one ack (no retry)", len(producer.sent), len(consumer.acked))
+	}
+	sent := producer.sent[0]
+	if sent.Properties["bq-schema-version"] != "2" || sent.Properties["bq-job"] != urn {
+		t.Errorf("dead-letter properties = %v, want the originals", sent.Properties)
+	}
+	dead, err := babelqueue.Decode(sent.Payload)
+	if err != nil {
+		t.Fatalf("dead-letter record does not decode: %v", err)
+	}
+	if dead.Attempts != 0 {
+		t.Errorf("dead-letter attempts = %d, want 0 (no retry happened)", dead.Attempts)
+	}
+	if !strings.Contains(string(sent.Payload), "unknown_urn") {
+		t.Errorf("the record is not the dead-letter record: %s", sent.Payload)
+	}
+}
+
+// When the dead-letter write for a version-gated message fails, the App must not ack it: the
+// transport hands it back with Nack so the broker redelivers it, and the handler never runs.
+func TestGatedMessageIsNackedNotAckedWhenDeadLetterWriteFails(t *testing.T) {
+	body := bodyWith(t, urn, 0)
+	props := map[string]string{"bq-schema-version": "2", "bq-job": urn}
+	producer := &fakeProducer{sendErr: errors.New("broker down")}
+	consumer := &fakeConsumer{messages: []pulsarsdk.Message{fakeMessage{payload: []byte(body), properties: props}}}
+	tr, _ := New(WithClient(&fakeClient{producer: producer, consumer: consumer}))
+	var hookErr error
+	app := babelqueue.NewApp(tr, babelqueue.WithMaxAttempts(3), babelqueue.WithDeadLetter(true),
+		babelqueue.WithRewindPause(0),
+		babelqueue.WithDeadLetterErrorHandler(func(_ context.Context, _ *babelqueue.ReceivedMessage, err error) { hookErr = err }))
+	handled := 0
+	app.Handle(urn, func(context.Context, babelqueue.Envelope) error { handled++; return nil })
+	if _, err := app.Drain(context.Background(), "orders", 1); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if handled != 0 {
+		t.Fatalf("handler ran %d times for a version-gated message", handled)
+	}
+	if len(consumer.acked) != 0 {
+		t.Fatalf("acked %d messages; a message whose dead-letter write failed must not be acked", len(consumer.acked))
+	}
+	if len(consumer.nacked) != 1 {
+		t.Fatalf("nacked %d messages, want 1", len(consumer.nacked))
+	}
+	if len(producer.sent) != 0 {
+		t.Fatalf("published %d messages, want none (the write failed)", len(producer.sent))
+	}
+	if hookErr == nil {
+		t.Error("the dead-letter error handler was not called")
+	}
+}
+
+func TestRewindNacksThePulsarMessageAndIgnoresForeignHandles(t *testing.T) {
+	consumer := &fakeConsumer{}
+	tr, _ := New(WithClient(&fakeClient{producer: &fakeProducer{}, consumer: consumer}))
+	var _ babelqueue.Rewinder = tr
+
+	msg := fakeMessage{payload: []byte("{}")}
+	if err := tr.Rewind(context.Background(), &babelqueue.ReceivedMessage{Queue: "orders", Handle: msg}); err != nil {
+		t.Fatalf("Rewind: %v", err)
+	}
+	if len(consumer.nacked) != 1 || len(consumer.acked) != 0 {
+		t.Fatalf("nacked %d, acked %d; want 1 and 0", len(consumer.nacked), len(consumer.acked))
+	}
+	if err := tr.Rewind(context.Background(), &babelqueue.ReceivedMessage{Queue: "orders", Handle: "not-a-message"}); err != nil {
+		t.Fatalf("Rewind on a foreign handle: %v", err)
+	}
+	if len(consumer.nacked) != 1 {
+		t.Fatalf("a foreign handle was nacked; nacked = %d", len(consumer.nacked))
 	}
 }

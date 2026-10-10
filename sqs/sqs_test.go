@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	neturl "net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -786,5 +787,173 @@ func TestReconcileAttemptsPreservesUnknownKeys(t *testing.T) {
 	}
 	if !strings.Contains(out, `"extra_top":"x"`) || !strings.Contains(out, `"vendor_flag":true`) {
 		t.Errorf("unknown keys lost on reconcile: %s", out)
+	}
+}
+
+// seedWithVersion seeds a message carrying a bq-schema-version String attribute (or none when
+// version is nil) and the given ApproximateReceiveCount.
+func (f *fakeSQS) seedWithVersion(url, body string, version *string, receiveCount int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.nextID++
+	m := types.Message{
+		Body:          aws.String(body),
+		ReceiptHandle: aws.String("seed-" + strconv.Itoa(f.nextID)),
+		Attributes:    map[string]string{"ApproximateReceiveCount": strconv.Itoa(receiveCount)},
+	}
+	if version != nil {
+		m.MessageAttributes = map[string]types.MessageAttributeValue{
+			"bq-schema-version": {DataType: aws.String("String"), StringValue: version},
+		}
+	}
+	f.visible[url] = append(f.visible[url], m)
+}
+
+func gateBody(t *testing.T) string {
+	t.Helper()
+	env, err := babelqueue.Make("urn:babel:orders:created", map[string]any{"x": 1}, babelqueue.WithQueue("orders"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := env.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(b)
+}
+
+func TestPopSchemaGateDecodesWhenMissingBlankOrSupported(t *testing.T) {
+	blank, supported := " \t", "1"
+	for name, version := range map[string]*string{"missing": nil, "blank": &blank, "supported": &supported} {
+		t.Run(name, func(t *testing.T) {
+			fake := newFakeSQS()
+			called := false
+			tr := NewWithClient(fake, WithQueueURLPrefix("http://fake"),
+				WithOnSchemaVersionRejected(func(string, string) { called = true }))
+			fake.seedWithVersion("http://fake/orders", gateBody(t), version, 2)
+
+			msg, err := tr.Pop(context.Background(), "orders", 0)
+			if err != nil || msg == nil {
+				t.Fatalf("Pop: msg=%v err=%v", msg, err)
+			}
+			if msg.RouteURN != "" {
+				t.Errorf("RouteURN = %q, want empty", msg.RouteURN)
+			}
+			if called {
+				t.Error("hook called for an accepted message")
+			}
+			got, err := babelqueue.Decode([]byte(msg.Body))
+			if err != nil {
+				t.Fatalf("Decode: %v", err)
+			}
+			if got.Attempts != 1 {
+				t.Errorf("attempts = %d, want 1 (reconciled from ApproximateReceiveCount 2)", got.Attempts)
+			}
+		})
+	}
+}
+
+func TestPopSchemaGateRejectsUnsupportedWithoutDecoding(t *testing.T) {
+	for _, version := range []string{"2", "x", " 1", "\u00a0"} {
+		t.Run(version, func(t *testing.T) {
+			fake := newFakeSQS()
+			var gotVersion, gotQueue string
+			tr := NewWithClient(fake, WithQueueURLPrefix("http://fake"),
+				WithOnSchemaVersionRejected(func(v, q string) { gotVersion, gotQueue = v, q }))
+			// A body that is not JSON proves the gate runs before any decode / reconcile.
+			fake.seedWithVersion("http://fake/orders", "not json", &version, 2)
+
+			msg, err := tr.Pop(context.Background(), "orders", 0)
+			if err != nil || msg == nil {
+				t.Fatalf("Pop: msg=%v err=%v", msg, err)
+			}
+			if want := unsupportedSchemaRoutePrefix + neturl.QueryEscape(version); msg.RouteURN != want {
+				t.Errorf("RouteURN = %q, want %q", msg.RouteURN, want)
+			}
+			if msg.Body != "not json" {
+				t.Errorf("Body = %q, want it handed over untouched", msg.Body)
+			}
+			if msg.DeliveryCount != 2 {
+				t.Errorf("DeliveryCount = %d, want 2", msg.DeliveryCount)
+			}
+			if gotVersion != version || gotQueue != "orders" {
+				t.Errorf("hook got (%q,%q), want (%q,%q)", gotVersion, gotQueue, version, "orders")
+			}
+		})
+	}
+}
+
+func TestPopSchemaGateHookPanicIsIgnored(t *testing.T) {
+	fake := newFakeSQS()
+	tr := NewWithClient(fake, WithQueueURLPrefix("http://fake"),
+		WithOnSchemaVersionRejected(func(string, string) { panic("boom") }))
+	v := "2"
+	fake.seedWithVersion("http://fake/orders", gateBody(t), &v, 2)
+	msg, err := tr.Pop(context.Background(), "orders", 0)
+	if err != nil || msg == nil || msg.RouteURN == "" {
+		t.Fatalf("Pop: msg=%v err=%v", msg, err)
+	}
+}
+
+// A version-gated message is dead-lettered directly, with no retry: even with WithMaxAttempts(3)
+// (and the default Release strategy) the handler is never reached and the first delivery already
+// writes the one dead-letter record and deletes the original.
+func TestAppQuarantinesVersionGatedMessage(t *testing.T) {
+	fake := newFakeSQS()
+	tr := NewWithClient(fake, WithQueueURLPrefix("http://fake"))
+	handled := false
+	app := babelqueue.NewApp(tr,
+		babelqueue.WithDefaultQueue("orders"),
+		babelqueue.WithMaxAttempts(3),
+		babelqueue.WithDeadLetter(true),
+	)
+	app.Handle("urn:babel:orders:created", func(context.Context, babelqueue.Envelope) error {
+		handled = true
+		return nil
+	})
+	v := "2"
+	fake.seedWithVersion("http://fake/orders", gateBody(t), &v, 1)
+
+	n, err := app.Drain(context.Background(), "orders", 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if handled {
+		t.Fatal("handler ran for a version-gated message")
+	}
+	if n != 1 {
+		t.Errorf("processed %d deliveries, want 1 (dead-lettered directly, no retry)", n)
+	}
+	if len(fake.sent) != 1 || aws.ToString(fake.sent[0].QueueUrl) != "http://fake/orders.dlq" {
+		t.Fatalf("sends = %d, want exactly one to orders.dlq", len(fake.sent))
+	}
+}
+
+// A hostile bq-schema-version is bounded to 64 characters plus "..." in the hook value and the
+// route URN; exactly 64 characters is left alone.
+func TestPopSchemaGateTruncatesLongDeclaredVersion(t *testing.T) {
+	pop := func(version string, opts ...Option) *babelqueue.ReceivedMessage {
+		fake := newFakeSQS()
+		tr := NewWithClient(fake, append([]Option{WithQueueURLPrefix("http://fake")}, opts...)...)
+		fake.seedWithVersion("http://fake/orders", "not json", &version, 1)
+		msg, err := tr.Pop(context.Background(), "orders", 0)
+		if err != nil || msg == nil {
+			t.Fatalf("Pop: msg=%v err=%v", msg, err)
+		}
+		return msg
+	}
+	long := strings.Repeat("9", 5000)
+	var hooked string
+	msg := pop(long, WithOnSchemaVersionRejected(func(v, _ string) { hooked = v }))
+	want := strings.Repeat("9", 64) + "..."
+	if hooked != want {
+		t.Errorf("hook value length = %d, want %d", len(hooked), len(want))
+	}
+	if route := unsupportedSchemaRoutePrefix + neturl.QueryEscape(want); msg.RouteURN != route {
+		t.Errorf("RouteURN length = %d, want %d", len(msg.RouteURN), len(route))
+	}
+	exact := strings.Repeat("9", 64)
+	if msg := pop(exact); msg.RouteURN != unsupportedSchemaRoutePrefix+exact {
+		t.Errorf("a 64-character value must not be truncated, got %q", msg.RouteURN)
 	}
 }

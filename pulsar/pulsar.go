@@ -11,7 +11,7 @@
 // is absent or not a plain non-negative decimal integer). Before any of that, a bq-schema-version
 // property that is present but not the core's supported version is version-gated (§5.7 step 3):
 // the body is not decoded and the message is routed to a reserved unsupported-version URN no
-// handler owns, so the App quarantines it through its bounded retry / dead-letter path (also under StrategyRelease, which would otherwise loop; the
+// handler owns, so the App dead-letters it directly with no retry (also under StrategyRelease, which would otherwise loop; the
 // optional [OnSchemaVersionRejected] hook names the rejected version). That route is an in-process
 // marker only: it carries the delivery's original bq-job and bq-schema-version, and a retry or
 // dead-letter re-publish writes those back verbatim, so the sentinel never reaches the wire and a
@@ -276,6 +276,24 @@ func (t *Transport) Pop(ctx context.Context, queue string, timeout time.Duration
 	}
 	body, routeURN := reconcile(string(msg.Payload()), msg.Properties(), msg.RedeliveryCount(), t.onMismatch)
 	return &babelqueue.ReceivedMessage{Body: body, Queue: queue, Handle: msg, RouteURN: routeURN}, nil
+}
+
+// Rewind hands a reserved message back to the broker with a negative acknowledgement, so it is
+// redelivered after the client's negative-ack delay instead of being lost. The App calls it (the
+// transport implements [babelqueue.Rewinder]) when it could not write the dead-letter record for
+// a version-gated message and therefore must not ack. It never acks. A handle that is not a
+// Pulsar message is ignored.
+func (t *Transport) Rewind(_ context.Context, msg *babelqueue.ReceivedMessage) error {
+	m, ok := msg.Handle.(pulsarsdk.Message)
+	if !ok || m == nil {
+		return nil
+	}
+	c, err := t.consumer(msg.Queue)
+	if err != nil {
+		return err
+	}
+	c.Nack(m)
+	return nil
 }
 
 // Ack acknowledges the reserved message.

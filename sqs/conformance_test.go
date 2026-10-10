@@ -1,9 +1,11 @@
 package sqs
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -23,7 +25,20 @@ type sqsManifest struct {
 		AttemptsReconciliation struct {
 			Cases []reconcileCase `json:"cases"`
 		} `json:"attempts_reconciliation"`
+		SchemaVersionGate gateTable `json:"schema_version_gate"`
 	} `json:"sqs"`
+}
+
+// gateTable is the manifest's schema_version_gate table (§3.7): each case supplies the
+// bq-schema-version attribute value (or marks it absent) and the expected verdict.
+type gateTable struct {
+	Property string `json:"property"`
+	Fixture  string `json:"fixture"`
+	Cases    []struct {
+		Value  *string `json:"value"`
+		Absent bool    `json:"absent"`
+		Expect string  `json:"expect"`
+	} `json:"cases"`
 }
 
 type goldenAttribute struct {
@@ -87,4 +102,40 @@ func TestSqsConformance(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("schema_version_gate", func(t *testing.T) {
+		gate := m.SQS.SchemaVersionGate
+		if len(gate.Cases) == 0 {
+			t.Fatal("manifest has no sqs.schema_version_gate cases")
+		}
+		body, err := os.ReadFile(filepath.Join(conformanceDir, gate.Fixture))
+		if err != nil {
+			t.Fatalf("fixture: %v", err)
+		}
+		for i, c := range gate.Cases {
+			fake := newFakeSQS()
+			tr := NewWithClient(fake, WithQueueURLPrefix("http://fake"))
+			fake.seedWithVersion("http://fake/orders", string(body), c.Value, 1)
+			if c.Absent {
+				fake.visible["http://fake/orders"][0].MessageAttributes = nil
+			}
+			label := "absent"
+			if !c.Absent && c.Value != nil {
+				label = strconv.Quote(*c.Value)
+			}
+			msg, err := tr.Pop(context.Background(), "orders", 0)
+			if err != nil || msg == nil {
+				t.Fatalf("case %d (%s): Pop: msg=%v err=%v", i, label, msg, err)
+			}
+			rejected := msg.RouteURN != ""
+			if rejected != (c.Expect == "reject") {
+				t.Errorf("case %d (%s): rejected=%v, want expect=%s", i, label, rejected, c.Expect)
+			}
+			if !rejected {
+				if _, err := babelqueue.Decode([]byte(msg.Body)); err != nil {
+					t.Errorf("case %d (%s): decode: %v", i, label, err)
+				}
+			}
+		}
+	})
 }

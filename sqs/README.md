@@ -90,6 +90,40 @@ broker-side backstop — and for any consumer that stops before dead-lettering i
 **configure a `RedrivePolicy` with a `maxReceiveCount` on every queue**, and set a
 non-zero `WithRetryBackoff` where a hot retry loop is undesirable.
 
+## Schema-version gate (§3.7)
+
+`Pop` reads the `bq-schema-version` message attribute **before** it decodes the body. A
+missing or blank attribute (empty, or only ASCII whitespace) takes the normal path.
+Anything else is compared as-is — never trimmed — with the version the core supports
+(`1`); on a mismatch (`"2"`, `"x"`, `"01"`, `" 1"`, a non-ASCII space, ...) the body is
+**not decoded** and is handed to the `App` untouched with the reserved route
+`babelqueue:unsupported-schema-version:<v>`. No handler owns that route, so the `App`
+dead-letters the message **directly, with no retry** — whatever `WithMaxAttempts` is (the
+handler is never reached): with `WithDeadLetter(true)` it lands on the dead-letter queue with
+the `unknown_urn` reason and the rejected version in the recorded cause, and without
+dead-lettering it is acknowledged (deleted) and dropped. `StrategyDelete` is the one
+exception: it drops the message (acknowledged, no dead-letter record), as in the Python SDK.
+If the dead-letter write itself fails the message is **not** deleted: it stays in the queue
+and becomes visible again after the visibility timeout, and the failure is logged and
+reported to `WithDeadLetterErrorHandler`. A retry could not change the outcome, so none is
+attempted. This needs a core release with the direct dead-letter path (see the root
+`CHANGELOG.md`).
+
+The rejected version in the hook, the route and the dead-letter record is bounded to its
+first 64 characters plus `...`, so a hostile attribute cannot bloat them.
+
+An optional hook reports each gated message — useful to alert on a producer that is
+ahead of this consumer. It runs before the body is touched, so it also fires for a body
+that is not valid JSON, and a panic in it is recovered and ignored:
+
+```go
+tr, _ := sqs.New(ctx, sqs.WithOnSchemaVersionRejected(func(version, queue string) {
+    log.Printf("quarantined schema_version=%q from %s", version, queue)
+}))
+```
+
+Without the hook the gate still works; the `App`'s error names the rejected version.
+
 ## Out-of-band transport headers
 
 This transport implements the optional `babelqueue.HeaderPublisher` capability:

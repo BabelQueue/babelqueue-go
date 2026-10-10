@@ -17,6 +17,13 @@
 //	tr, _ := artemis.New(ctx, artemis.WithURL("amqp://localhost:5672"))
 //	app := babelqueue.NewApp(tr, babelqueue.WithDefaultQueue("orders"))
 //
+// A message whose bq_schema_version application property is present, not blank and not the core's
+// supported version is version-gated (§7.7): the body is not decoded and the message is routed to a
+// reserved unsupported-version URN no handler owns, so the App
+// dead-letters it directly, with no retry (whatever the unknown-URN strategy, StrategyRelease
+// included), or drops it when dead-lettering is off. The optional [OnSchemaVersionRejected] hook
+// names the rejected version.
+//
 // This binding implements §7 of the BabelQueue broker-bindings contract. The envelope is
 // unchanged (schema_version stays 1); Apache ActiveMQ Artemis is purely additive.
 //
@@ -26,6 +33,8 @@ package artemis
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/url"
 	"strconv"
 	"sync"
 	"time"
@@ -75,6 +84,8 @@ type Transport struct {
 	url     string
 	maxWait time.Duration
 
+	onRejected OnSchemaVersionRejected
+
 	mu        sync.Mutex
 	senders   map[string]Sender
 	receivers map[string]Receiver
@@ -91,6 +102,20 @@ func WithClient(c Client) Option { return func(t *Transport) { t.client = c } }
 
 // WithMaxWaitTime caps how long a single Pop blocks waiting for a message.
 func WithMaxWaitTime(d time.Duration) Option { return func(t *Transport) { t.maxWait = d } }
+
+// OnSchemaVersionRejected is called when the version gate (§7.7) quarantines a message whose
+// bq_schema_version application property is present but not the core's supported version.
+// version is the property value rendered as text and queue the queue it was received from. The
+// gate runs before the body is decoded; the App's quarantine error names the reserved route, and
+// this hook additionally hands an operator the rejected version and queue directly (including for
+// a body that is not valid JSON). It is a diagnostic hook: a panic in it is recovered and ignored,
+// and it never changes how the message is delivered, accepted or retried.
+type OnSchemaVersionRejected func(version, queue string)
+
+// WithOnSchemaVersionRejected registers an optional [OnSchemaVersionRejected] hook (default: none).
+func WithOnSchemaVersionRejected(fn OnSchemaVersionRejected) Option {
+	return func(t *Transport) { t.onRejected = fn }
+}
 
 // New builds a transport. Provide an AMQP URL ([WithURL]) or an injected [Client] ([WithClient]).
 // With a URL it dials the broker and opens a session, both closed by [Transport.Close].
@@ -180,6 +205,22 @@ func (t *Transport) Pop(ctx context.Context, queue string, timeout time.Duration
 		}
 		return nil, err
 	}
+	// §7.7 version gate: runs on the application property alone, before anything decodes the body
+	// (the attempts reconcile below does), so a future-version message is never parsed here.
+	if v, rejected := unsupportedSchemaVersion(msg.ApplicationProperties); rejected {
+		v = babelqueue.TruncateDeclaredVersion(v) // bound what the hook, the route and the DLQ record carry
+		notifyRejected(t.onRejected, v, queue)
+		return &babelqueue.ReceivedMessage{
+			Body:   messageBody(msg),
+			Queue:  queue,
+			Handle: msg,
+			// The AMQP delivery-count is 0-based while ReceivedMessage.DeliveryCount is 1-based, so
+			// the App's floor (DeliveryCount - 1) equals the broker's own redelivery count and
+			// is informational here: the App dead-letters a gated message directly, without retrying it.
+			DeliveryCount: int(deliveryCount(msg)) + 1,
+			RouteURN:      unsupportedSchemaRoutePrefix + url.QueryEscape(v),
+		}, nil
+	}
 	body := reconcileAttempts(messageBody(msg), deliveryCount(msg))
 	return &babelqueue.ReceivedMessage{Body: body, Queue: queue, Handle: msg}, nil
 }
@@ -195,6 +236,27 @@ func (t *Transport) Ack(ctx context.Context, msg *babelqueue.ReceivedMessage) er
 		return err
 	}
 	return r.AcceptMessage(ctx, m)
+}
+
+// Rewind implements [babelqueue.Rewinder]: it releases the reserved message back to the broker
+// (AMQP 1.0 "released" disposition) instead of leaving it unsettled on the link, so it is
+// redelivered. Nothing is accepted or deleted. A receiver without ReleaseMessage (a test fake)
+// leaves the message reserved, and the broker redelivers it when the link closes.
+func (t *Transport) Rewind(ctx context.Context, msg *babelqueue.ReceivedMessage) error {
+	m, ok := msg.Handle.(*amqp.Message)
+	if !ok {
+		return nil
+	}
+	r, err := t.receiver(ctx, msg.Queue)
+	if err != nil {
+		return err
+	}
+	if rel, ok := r.(interface {
+		ReleaseMessage(ctx context.Context, msg *amqp.Message) error
+	}); ok {
+		return rel.ReleaseMessage(ctx, m)
+	}
+	return nil
 }
 
 // Close releases the dialed connection (a no-op when a Client was injected).
@@ -259,6 +321,56 @@ func messageBody(msg *amqp.Message) string {
 		return string(data)
 	}
 	return ""
+}
+
+// unsupportedSchemaRoutePrefix is the reserved [babelqueue.ReceivedMessage.RouteURN] prefix of a
+// version-gated delivery (the same string the core App recognises). It is not a "urn:babel:"
+// URN, so no handler owns it; the App reports it as an unknown URN, which names the rejected
+// bq_schema_version in the logged error. It is an in-process marker only and never reaches the wire.
+const unsupportedSchemaRoutePrefix = "babelqueue:unsupported-schema-version:"
+
+// unsupportedSchemaVersion implements the §7.7 gate on the bq_schema_version application property
+// (underscored, ADR-0017). A missing property is not gated, and neither is a blank string (the
+// usual decode path runs); blank means the empty string or only ASCII whitespace (space, \t, \n,
+// \v, \f, \r) — the same set in every SDK (GR-5). The property is string-valued on the wire, so
+// the value is compared as-is, never trimmed ("01", " 1", "1 ", NBSP, U+0085, U+FEFF and U+3000
+// are all rejected), against the core's supported version; a value of any other AMQP type is not
+// the supported version either and is rejected. It returns the offending value as text.
+func unsupportedSchemaVersion(props map[string]any) (string, bool) {
+	raw, ok := props["bq_schema_version"]
+	if !ok {
+		return "", false
+	}
+	v, isString := raw.(string)
+	if !isString {
+		return fmt.Sprintf("%v", raw), true
+	}
+	if isBlankASCII(v) || v == strconv.Itoa(babelqueue.SchemaVersion) {
+		return "", false
+	}
+	return v, true
+}
+
+// isBlankASCII reports whether s is empty or made only of ASCII whitespace (space, \t, \n, \v,
+// \f, \r). It is deliberately not unicode-aware: a Unicode trim would diverge from the other SDKs.
+func isBlankASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case ' ', '\t', '\n', '\v', '\f', '\r':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// notifyRejected calls the optional hook, containing any panic it raises.
+func notifyRejected(fn OnSchemaVersionRejected, version, queue string) {
+	if fn == nil {
+		return
+	}
+	defer func() { _ = recover() }()
+	fn(version, queue)
 }
 
 // deliveryCount reads the broker's AMQP delivery-count header (0-based; 0 when absent).

@@ -13,6 +13,13 @@
 //	tr, _ := kafka.New(kafka.WithBrokers("localhost:9092"), kafka.WithGroupID("orders-workers"))
 //	app := babelqueue.NewApp(tr, babelqueue.WithDefaultQueue("orders"))
 //
+// A record whose bq-schema-version header is present, not blank and not the core's supported
+// version is version-gated (§6.3 / §6.7): the body is not decoded and the record is routed to a
+// reserved unsupported-version URN no handler owns, so the App
+// dead-letters it directly, with no retry (whatever the unknown-URN strategy, StrategyRelease
+// included), or drops it when dead-lettering is off. The optional [OnSchemaVersionRejected] hook
+// names the rejected version.
+//
 // This binding implements §6 of the BabelQueue broker-bindings contract. The envelope is
 // unchanged (schema_version stays 1); Apache Kafka is purely additive.
 //
@@ -22,6 +29,8 @@ package kafka
 import (
 	"context"
 	"errors"
+	"io"
+	"net/url"
 	"strconv"
 	"sync"
 	"time"
@@ -49,6 +58,8 @@ type Transport struct {
 	newReader func(queue string) Reader
 	maxWait   time.Duration
 
+	onRejected OnSchemaVersionRejected
+
 	mu      sync.Mutex
 	readers map[string]Reader
 }
@@ -62,6 +73,8 @@ type config struct {
 	writer    Writer
 	newReader func(queue string) Reader
 	maxWait   time.Duration
+
+	onRejected OnSchemaVersionRejected
 }
 
 // WithBrokers sets the bootstrap broker list (host:port).
@@ -81,6 +94,20 @@ func WithReaderFactory(f func(queue string) Reader) Option {
 // WithMaxWaitTime caps how long a single Pop blocks waiting for a record.
 func WithMaxWaitTime(d time.Duration) Option { return func(c *config) { c.maxWait = d } }
 
+// OnSchemaVersionRejected is called when the version gate (§6.7) quarantines a record whose
+// bq-schema-version header is present but not the core's supported version. version is the
+// header value as text and queue the topic it was fetched from. The gate runs before the body is
+// decoded; the App's quarantine error names the reserved route, and this hook additionally hands
+// an operator the rejected version and queue directly (including for a body that is not valid
+// JSON). It is a diagnostic hook: a panic in it is recovered and ignored, and it never changes
+// how the record is delivered, committed or retried.
+type OnSchemaVersionRejected func(version, queue string)
+
+// WithOnSchemaVersionRejected registers an optional [OnSchemaVersionRejected] hook (default: none).
+func WithOnSchemaVersionRejected(fn OnSchemaVersionRejected) Option {
+	return func(c *config) { c.onRejected = fn }
+}
+
 // New builds a transport. Provide brokers + a group id ([WithBrokers] / [WithGroupID]), or
 // inject a [Writer] and a reader factory ([WithWriter] / [WithReaderFactory]) for tests.
 func New(opts ...Option) (*Transport, error) {
@@ -89,7 +116,7 @@ func New(opts ...Option) (*Transport, error) {
 		o(c)
 	}
 
-	t := &Transport{writer: c.writer, newReader: c.newReader, maxWait: c.maxWait, readers: make(map[string]Reader)}
+	t := &Transport{writer: c.writer, newReader: c.newReader, maxWait: c.maxWait, onRejected: c.onRejected, readers: make(map[string]Reader)}
 	if t.writer != nil && t.newReader != nil {
 		return t, nil
 	}
@@ -148,6 +175,22 @@ func (t *Transport) Pop(ctx context.Context, queue string, timeout time.Duration
 		}
 		return nil, err
 	}
+	// §6.7 version gate: runs on the header alone, before anything decodes the body (the
+	// attempts reconcile below does), so a future-version record is never parsed here.
+	if v, rejected := unsupportedSchemaVersion(msg.Headers); rejected {
+		v = babelqueue.TruncateDeclaredVersion(v) // bound what the hook, the route and the DLQ record carry
+		notifyRejected(t.onRejected, v, queue)
+		return &babelqueue.ReceivedMessage{
+			Body:   string(msg.Value),
+			Queue:  queue,
+			Handle: msg,
+			// Kafka has no native delivery count; the authoritative bq-attempts header (read
+			// without decoding the body) keeps the rejected record's delivery count in line with its earlier
+			// retries (informational: the App dead-letters a gated record directly, with no retry).
+			DeliveryCount: headerAttempts(msg.Headers) + 1,
+			RouteURN:      unsupportedSchemaRoutePrefix + url.QueryEscape(v),
+		}, nil
+	}
 	body := reconcileAttempts(string(msg.Value), msg.Headers)
 	return &babelqueue.ReceivedMessage{Body: body, Queue: queue, Handle: msg}, nil
 }
@@ -159,6 +202,26 @@ func (t *Transport) Ack(ctx context.Context, msg *babelqueue.ReceivedMessage) er
 		return nil
 	}
 	return t.reader(msg.Queue).CommitMessages(ctx, km)
+}
+
+// Rewind implements [babelqueue.Rewinder]: it puts the consumer back at the reserved record's
+// offset without committing anything. A Kafka commit is cumulative, so merely not acknowledging
+// this record is not enough: committing any later record would move the group past it and lose
+// it. A kafka-go group reader cannot seek (SetOffset is rejected when a GroupID is set), so the
+// reader is closed and dropped; the next Pop builds a new one, which rejoins the group and resumes
+// from the last committed offset, i.e. this record. The commit therefore never passes it.
+func (t *Transport) Rewind(_ context.Context, msg *babelqueue.ReceivedMessage) error {
+	t.mu.Lock()
+	r, ok := t.readers[msg.Queue]
+	delete(t.readers, msg.Queue)
+	t.mu.Unlock()
+	if !ok {
+		return nil
+	}
+	if c, ok := r.(io.Closer); ok {
+		return c.Close()
+	}
+	return nil
 }
 
 // message builds a Kafka record from an encoded envelope: value = body, headers = the bq-
@@ -220,6 +283,68 @@ func reconcileAttempts(body string, hdrs []kafkago.Header) string {
 		return string(b)
 	}
 	return body
+}
+
+// headerAttempts returns the non-negative integer in the first bq-attempts header, or 0 when
+// the header is absent or unparseable. It never touches the record body.
+func headerAttempts(hdrs []kafkago.Header) int {
+	for _, h := range hdrs {
+		if h.Key == "bq-attempts" {
+			if n, err := strconv.Atoi(string(h.Value)); err == nil && n > 0 {
+				return n
+			}
+			return 0
+		}
+	}
+	return 0
+}
+
+// unsupportedSchemaRoutePrefix is the reserved [babelqueue.ReceivedMessage.RouteURN] prefix of a
+// version-gated delivery (the same string the core App recognises). It is not a "urn:babel:"
+// URN, so no handler owns it; the App reports it as an unknown URN, which names the rejected
+// bq-schema-version in the logged error. It is an in-process marker only and never reaches the wire.
+const unsupportedSchemaRoutePrefix = "babelqueue:unsupported-schema-version:"
+
+// unsupportedSchemaVersion implements the §6.7 gate on the bq-schema-version record header. A
+// missing header is not gated, and neither is a blank value (the usual decode path runs); blank
+// means the empty string or only ASCII whitespace (space, \t, \n, \v, \f, \r) — the same set in
+// every SDK (GR-5). Otherwise the value is compared as-is, never trimmed ("01", " 1", "1 ", NBSP,
+// U+0085, U+FEFF and U+3000 are all rejected), against the core's supported version. The first
+// header with that key wins, as for bq-attempts. It returns the offending value as text.
+func unsupportedSchemaVersion(hdrs []kafkago.Header) (string, bool) {
+	for _, h := range hdrs {
+		if h.Key != "bq-schema-version" {
+			continue
+		}
+		v := string(h.Value)
+		if isBlankASCII(v) || v == strconv.Itoa(babelqueue.SchemaVersion) {
+			return "", false
+		}
+		return v, true
+	}
+	return "", false
+}
+
+// isBlankASCII reports whether s is empty or made only of ASCII whitespace (space, \t, \n, \v,
+// \f, \r). It is deliberately not unicode-aware: a Unicode trim would diverge from the other SDKs.
+func isBlankASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case ' ', '\t', '\n', '\v', '\f', '\r':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// notifyRejected calls the optional hook, containing any panic it raises.
+func notifyRejected(fn OnSchemaVersionRejected, version, queue string) {
+	if fn == nil {
+		return
+	}
+	defer func() { _ = recover() }()
+	fn(version, queue)
 }
 
 var _ babelqueue.Transport = (*Transport)(nil)

@@ -3,6 +3,8 @@ package artemis
 import (
 	"context"
 	"errors"
+	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -22,6 +24,7 @@ func (f *fakeSender) Send(_ context.Context, m *amqp.Message, _ *amqp.SendOption
 type fakeReceiver struct {
 	messages []*amqp.Message
 	accepted []*amqp.Message
+	released []*amqp.Message
 	err      error
 }
 
@@ -40,6 +43,11 @@ func (f *fakeReceiver) Receive(ctx context.Context, _ *amqp.ReceiveOptions) (*am
 
 func (f *fakeReceiver) AcceptMessage(_ context.Context, m *amqp.Message) error {
 	f.accepted = append(f.accepted, m)
+	return nil
+}
+
+func (f *fakeReceiver) ReleaseMessage(_ context.Context, m *amqp.Message) error {
+	f.released = append(f.released, m)
 	return nil
 }
 
@@ -239,3 +247,138 @@ func TestMessageOfNonConformantBodyStillCarriesTheBody(t *testing.T) {
 }
 
 var _ babelqueue.Transport = (*Transport)(nil)
+
+// popGated receives one message carrying the given bq_schema_version application property
+// (none when set is false) with the given AMQP delivery-count.
+func popGated(t *testing.T, body string, version any, set bool, count uint32, opts ...Option) (*babelqueue.ReceivedMessage, *fakeReceiver) {
+	t.Helper()
+	m := incoming(body, "", count)
+	if set {
+		m.ApplicationProperties = map[string]any{"bq_schema_version": version}
+	}
+	receiver := &fakeReceiver{messages: []*amqp.Message{m}}
+	opts = append([]Option{WithClient(&fakeClient{sender: &fakeSender{}, receiver: receiver})}, opts...)
+	tr, err := New(context.Background(), opts...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, err := tr.Pop(context.Background(), "orders", 0)
+	if err != nil || msg == nil {
+		t.Fatalf("Pop: msg=%v err=%v", msg, err)
+	}
+	return msg, receiver
+}
+
+func TestPopSchemaGateDecodesWhenMissingBlankOrSupported(t *testing.T) {
+	cases := map[string]struct {
+		version string
+		set     bool
+	}{
+		"missing":   {"", false},
+		"empty":     {"", true},
+		"blank":     {" \t\n\v\f\r", true},
+		"supported": {"1", true},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			called := false
+			msg, _ := popGated(t, sampleBody(t, 0), c.version, c.set, 2,
+				WithOnSchemaVersionRejected(func(string, string) { called = true }))
+			if msg.RouteURN != "" || called {
+				t.Errorf("RouteURN = %q, hook called = %v; want neither", msg.RouteURN, called)
+			}
+			env, err := babelqueue.Decode([]byte(msg.Body))
+			if err != nil {
+				t.Fatalf("Decode: %v", err)
+			}
+			if env.Attempts != 2 {
+				t.Errorf("attempts = %d, want 2 (reconciled from delivery-count)", env.Attempts)
+			}
+		})
+	}
+}
+
+func TestPopSchemaGateRejectsUnsupportedWithoutDecoding(t *testing.T) {
+	cases := map[string]struct {
+		version any
+		want    string
+	}{
+		"2":      {"2", "2"},
+		"x":      {"x", "x"},
+		"01":     {"01", "01"},
+		"padded": {" 1", " 1"},
+		"nbsp":   {"\u00a0", "\u00a0"},
+		"bom":    {"\ufeff", "\ufeff"},
+		"int 1":  {1, "1"},
+		"bool":   {true, "true"},
+		"nil":    {nil, "<nil>"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			var gotVersion, gotQueue string
+			// A body that is not JSON proves the gate runs before any decode / reconcile.
+			msg, _ := popGated(t, "not json", c.version, true, 2,
+				WithOnSchemaVersionRejected(func(v, q string) { gotVersion, gotQueue = v, q }))
+			if want := unsupportedSchemaRoutePrefix + url.QueryEscape(c.want); msg.RouteURN != want {
+				t.Errorf("RouteURN = %q, want %q", msg.RouteURN, want)
+			}
+			if msg.Body != "not json" {
+				t.Errorf("Body = %q, want it handed over untouched", msg.Body)
+			}
+			if msg.DeliveryCount != 3 {
+				t.Errorf("DeliveryCount = %d, want 3 (0-based delivery-count 2, plus one)", msg.DeliveryCount)
+			}
+			if gotVersion != c.want || gotQueue != "orders" {
+				t.Errorf("hook got (%q,%q), want (%q,%q)", gotVersion, gotQueue, c.want, "orders")
+			}
+		})
+	}
+}
+
+func TestPopSchemaGateHookPanicIsIgnoredAndAckStillWorks(t *testing.T) {
+	msg, receiver := popGated(t, sampleBody(t, 0), "2", true, 0,
+		WithOnSchemaVersionRejected(func(string, string) { panic("boom") }))
+	if msg.RouteURN == "" {
+		t.Fatal("message was not gated")
+	}
+	tr := newTestTransport(t, &fakeClient{sender: &fakeSender{}, receiver: receiver})
+	if err := tr.Ack(context.Background(), msg); err != nil || len(receiver.accepted) != 1 {
+		t.Errorf("Ack: err=%v accepted=%d, want the gated message accepted once", err, len(receiver.accepted))
+	}
+}
+
+// A hostile bq_schema_version is bounded to 64 characters plus "..." in the hook value and the
+// route URN; exactly 64 characters is left alone.
+func TestPopSchemaGateTruncatesLongDeclaredVersion(t *testing.T) {
+	long := strings.Repeat("9", 5000)
+	var hooked string
+	msg, _ := popGated(t, "not json", long, true, 0,
+		WithOnSchemaVersionRejected(func(v, _ string) { hooked = v }))
+	want := strings.Repeat("9", 64) + "..."
+	if hooked != want {
+		t.Errorf("hook value length = %d, want %d", len(hooked), len(want))
+	}
+	if route := unsupportedSchemaRoutePrefix + url.QueryEscape(want); msg.RouteURN != route {
+		t.Errorf("RouteURN length = %d, want %d", len(msg.RouteURN), len(route))
+	}
+	exact := strings.Repeat("9", 64)
+	msg, _ = popGated(t, "not json", exact, true, 0)
+	if msg.RouteURN != unsupportedSchemaRoutePrefix+exact {
+		t.Errorf("a 64-character value must not be truncated, got %q", msg.RouteURN)
+	}
+}
+
+// Rewind hands the delivery back to the broker (AMQP released) instead of settling it.
+func TestRewindReleasesTheDelivery(t *testing.T) {
+	msg, receiver := popGated(t, "not json", "2", true, 0)
+	tr, err := New(context.Background(), WithClient(&fakeClient{sender: &fakeSender{}, receiver: receiver}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tr.Rewind(context.Background(), msg); err != nil {
+		t.Fatalf("Rewind: %v", err)
+	}
+	if len(receiver.released) != 1 || len(receiver.accepted) != 0 {
+		t.Fatalf("released = %d, accepted = %d; want 1 and 0", len(receiver.released), len(receiver.accepted))
+	}
+}

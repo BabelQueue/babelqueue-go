@@ -1,11 +1,14 @@
 package artemis
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
+	"github.com/Azure/go-amqp"
 	babelqueue "github.com/babelqueue/babelqueue-go"
 )
 
@@ -25,6 +28,15 @@ type artemisManifest struct {
 		AttemptsReconciliation struct {
 			Cases []artemisReconcileCase `json:"cases"`
 		} `json:"attempts_reconciliation"`
+		SchemaVersionGate struct {
+			Property string `json:"property"`
+			Fixture  string `json:"fixture"`
+			Cases    []struct {
+				Value  *string `json:"value"`
+				Absent bool    `json:"absent"`
+				Expect string  `json:"expect"`
+			} `json:"cases"`
+		} `json:"schema_version_gate"`
 	} `json:"artemis"`
 }
 
@@ -85,4 +97,41 @@ func TestArtemisConformance(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("schema_version_gate", func(t *testing.T) {
+		gate := m.Artemis.SchemaVersionGate
+		if len(gate.Cases) == 0 {
+			t.Fatal("manifest has no artemis.schema_version_gate cases")
+		}
+		body, err := os.ReadFile(filepath.Join(conformanceDir, gate.Fixture))
+		if err != nil {
+			t.Fatalf("fixture: %v", err)
+		}
+		for i, c := range gate.Cases {
+			msg := incoming(string(body), "", 0)
+			label := "absent"
+			if !c.Absent && c.Value != nil {
+				msg.ApplicationProperties = map[string]any{gate.Property: *c.Value}
+				label = strconv.Quote(*c.Value)
+			}
+			receiver := &fakeReceiver{messages: []*amqp.Message{msg}}
+			tr, err := New(context.Background(), WithClient(&fakeClient{sender: &fakeSender{}, receiver: receiver}))
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := tr.Pop(context.Background(), "orders", 0)
+			if err != nil || got == nil {
+				t.Fatalf("case %d (%s): Pop: msg=%v err=%v", i, label, got, err)
+			}
+			rejected := got.RouteURN != ""
+			if rejected != (c.Expect == "reject") {
+				t.Errorf("case %d (%s): rejected=%v, want expect=%s", i, label, rejected, c.Expect)
+			}
+			if !rejected {
+				if _, err := babelqueue.Decode([]byte(got.Body)); err != nil {
+					t.Errorf("case %d (%s): decode: %v", i, label, err)
+				}
+			}
+		}
+	})
 }

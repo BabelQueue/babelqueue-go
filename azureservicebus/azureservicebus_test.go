@@ -2,6 +2,8 @@ package azureservicebus
 
 import (
 	"context"
+	"net/url"
+	"strings"
 	"testing"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus"
@@ -20,6 +22,7 @@ func (f *fakeSender) SendMessage(_ context.Context, m *azservicebus.Message, _ *
 type fakeReceiver struct {
 	messages  []*azservicebus.ReceivedMessage
 	completed []*azservicebus.ReceivedMessage
+	abandoned []*azservicebus.ReceivedMessage
 }
 
 func (f *fakeReceiver) ReceiveMessages(_ context.Context, max int, _ *azservicebus.ReceiveMessagesOptions) ([]*azservicebus.ReceivedMessage, error) {
@@ -37,6 +40,11 @@ func (f *fakeReceiver) ReceiveMessages(_ context.Context, max int, _ *azserviceb
 
 func (f *fakeReceiver) CompleteMessage(_ context.Context, m *azservicebus.ReceivedMessage, _ *azservicebus.CompleteMessageOptions) error {
 	f.completed = append(f.completed, m)
+	return nil
+}
+
+func (f *fakeReceiver) AbandonMessage(_ context.Context, m *azservicebus.ReceivedMessage, _ *azservicebus.AbandonMessageOptions) error {
+	f.abandoned = append(f.abandoned, m)
 	return nil
 }
 
@@ -178,5 +186,154 @@ func TestAckNoopWithoutHandle(t *testing.T) {
 func TestNewRequiresClientOrConnString(t *testing.T) {
 	if _, err := New(); err == nil {
 		t.Error("New() with no client/connection-string should error")
+	}
+}
+
+// gatedMessage builds a received message carrying the given bq-schema-version application
+// property (no property at all when set is false).
+func gatedMessage(body string, version any, set bool) *azservicebus.ReceivedMessage {
+	rm := &azservicebus.ReceivedMessage{Body: []byte(body), DeliveryCount: 2}
+	if set {
+		rm.ApplicationProperties = map[string]any{"bq-schema-version": version}
+	}
+	return rm
+}
+
+func popGated(t *testing.T, body string, version any, set bool, opts ...Option) *babelqueue.ReceivedMessage {
+	t.Helper()
+	receiver := &fakeReceiver{messages: []*azservicebus.ReceivedMessage{gatedMessage(body, version, set)}}
+	opts = append([]Option{WithClient(&fakeClient{sender: &fakeSender{}, receiver: receiver})}, opts...)
+	tr, err := New(opts...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, err := tr.Pop(context.Background(), "orders", 0)
+	if err != nil || msg == nil {
+		t.Fatalf("Pop: msg=%v err=%v", msg, err)
+	}
+	return msg
+}
+
+func TestPopSchemaGateDecodesWhenMissingBlankOrSupported(t *testing.T) {
+	cases := map[string]struct {
+		version any
+		set     bool
+	}{
+		"missing":      {nil, false},
+		"blank":        {" \t", true},
+		"string 1":     {"1", true},
+		"int 1":        {1, true},
+		"int32 1":      {int32(1), true},
+		"int64 1":      {int64(1), true},
+		"uint8 1":      {uint8(1), true},
+		"empty string": {"", true},
+		"null value":   {nil, true},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			called := false
+			msg := popGated(t, sampleBody(t), c.version, c.set,
+				WithOnSchemaVersionRejected(func(string, string) { called = true }))
+			if msg.RouteURN != "" {
+				t.Errorf("RouteURN = %q, want empty", msg.RouteURN)
+			}
+			if called {
+				t.Error("hook called for an accepted message")
+			}
+			env, err := babelqueue.Decode([]byte(msg.Body))
+			if err != nil {
+				t.Fatalf("Decode: %v", err)
+			}
+			if env.Attempts != 1 {
+				t.Errorf("attempts = %d, want 1 (DeliveryCount 2 - 1)", env.Attempts)
+			}
+		})
+	}
+}
+
+func TestPopSchemaGateRejectsUnsupportedWithoutDecoding(t *testing.T) {
+	cases := map[string]struct {
+		version any
+		want    string
+	}{
+		"string 2":    {"2", "2"},
+		"string x":    {"x", "x"},
+		"padded":      {" 1", " 1"},
+		"nbsp":        {"\u00a0", "\u00a0"},
+		"int 2":       {2, "2"},
+		"int32 2":     {int32(2), "2"},
+		"int64 0":     {int64(0), "0"},
+		"float 1.5":   {1.5, "1.5"},
+		"float64 1.0": {float64(1), "1"},
+		"float32 1.0": {float32(1), "1"},
+		"bool":        {true, "true"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			var gotVersion, gotQueue string
+			// A body that is not JSON proves the gate runs before any decode / reconcile.
+			msg := popGated(t, "not json", c.version, true,
+				WithOnSchemaVersionRejected(func(v, q string) { gotVersion, gotQueue = v, q }))
+			if want := unsupportedSchemaRoutePrefix + url.QueryEscape(c.want); msg.RouteURN != want {
+				t.Errorf("RouteURN = %q, want %q", msg.RouteURN, want)
+			}
+			if msg.Body != "not json" {
+				t.Errorf("Body = %q, want it handed over untouched", msg.Body)
+			}
+			if msg.DeliveryCount != 2 {
+				t.Errorf("DeliveryCount = %d, want 2", msg.DeliveryCount)
+			}
+			if gotVersion != c.want || gotQueue != "orders" {
+				t.Errorf("hook got (%q,%q), want (%q,%q)", gotVersion, gotQueue, c.want, "orders")
+			}
+		})
+	}
+}
+
+func TestPopSchemaGateHookPanicIsIgnored(t *testing.T) {
+	msg := popGated(t, sampleBody(t), "2", true,
+		WithOnSchemaVersionRejected(func(string, string) { panic("boom") }))
+	if msg.RouteURN == "" {
+		t.Error("message was not gated")
+	}
+}
+
+// A hostile bq-schema-version is bounded to 64 characters plus "..." in the hook value and the
+// route URN; exactly 64 characters is left alone.
+func TestPopSchemaGateTruncatesLongDeclaredVersion(t *testing.T) {
+	long := strings.Repeat("9", 5000)
+	var hooked string
+	msg := popGated(t, "not json", long, true,
+		WithOnSchemaVersionRejected(func(v, _ string) { hooked = v }))
+	want := strings.Repeat("9", 64) + "..."
+	if hooked != want {
+		t.Errorf("hook value length = %d, want %d", len(hooked), len(want))
+	}
+	if route := unsupportedSchemaRoutePrefix + url.QueryEscape(want); msg.RouteURN != route {
+		t.Errorf("RouteURN length = %d, want %d", len(msg.RouteURN), len(route))
+	}
+	exact := strings.Repeat("9", 64)
+	msg = popGated(t, "not json", exact, true)
+	if msg.RouteURN != unsupportedSchemaRoutePrefix+exact {
+		t.Errorf("a 64-character value must not be truncated, got %q", msg.RouteURN)
+	}
+}
+
+// Rewind abandons the lock (the message becomes available again) instead of completing it.
+func TestRewindAbandonsTheMessage(t *testing.T) {
+	receiver := &fakeReceiver{messages: []*azservicebus.ReceivedMessage{gatedMessage("not json", "2", true)}}
+	tr, err := New(WithClient(&fakeClient{sender: &fakeSender{}, receiver: receiver}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, err := tr.Pop(context.Background(), "orders", 0)
+	if err != nil || msg == nil {
+		t.Fatalf("Pop: msg=%v err=%v", msg, err)
+	}
+	if err := tr.Rewind(context.Background(), msg); err != nil {
+		t.Fatalf("Rewind: %v", err)
+	}
+	if len(receiver.abandoned) != 1 || len(receiver.completed) != 0 {
+		t.Fatalf("abandoned = %d, completed = %d; want 1 and 0", len(receiver.abandoned), len(receiver.completed))
 	}
 }

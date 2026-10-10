@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	babelqueue "github.com/babelqueue/babelqueue-go"
@@ -22,6 +23,14 @@ type pulsarManifest struct {
 		AttemptsReconciliation struct {
 			Cases []pulsarReconcileCase `json:"cases"`
 		} `json:"attempts_reconciliation"`
+		SchemaVersionGate struct {
+			Property string `json:"property"`
+			Cases    []struct {
+				Value  *string `json:"value"`
+				Absent bool    `json:"absent"`
+				Expect string  `json:"expect"`
+			} `json:"cases"`
+		} `json:"schema_version_gate"`
 	} `json:"pulsar"`
 }
 
@@ -72,4 +81,24 @@ func TestPulsarConformance(t *testing.T) {
 			}
 		})
 	}
+
+	// The gate itself lives in pulsar.go; this reader pins its verdicts to the shared table.
+	t.Run("schema_version_gate", func(t *testing.T) {
+		gate := m.Pulsar.SchemaVersionGate
+		if len(gate.Cases) == 0 {
+			t.Fatal("manifest has no pulsar.schema_version_gate cases")
+		}
+		for i, c := range gate.Cases {
+			props := map[string]string{}
+			label := "absent"
+			if !c.Absent && c.Value != nil {
+				props[gate.Property] = *c.Value
+				label = strconv.Quote(*c.Value)
+			}
+			_, rejected := unsupportedSchemaVersion(props)
+			if rejected != (c.Expect == "reject") {
+				t.Errorf("case %d (%s): rejected=%v, want expect=%s", i, label, rejected, c.Expect)
+			}
+		}
+	})
 }

@@ -1,12 +1,14 @@
 package azureservicebus
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus"
 	babelqueue "github.com/babelqueue/babelqueue-go"
 )
 
@@ -29,6 +31,14 @@ type asbManifest struct {
 		AttemptsReconciliation struct {
 			Cases []asbReconcileCase `json:"cases"`
 		} `json:"attempts_reconciliation"`
+		SchemaVersionGate struct {
+			Fixture string `json:"fixture"`
+			Cases   []struct {
+				Value  any    `json:"value"`
+				Absent bool   `json:"absent"`
+				Expect string `json:"expect"`
+			} `json:"cases"`
+		} `json:"schema_version_gate"`
 	} `json:"asb"`
 }
 
@@ -98,6 +108,45 @@ func TestAsbConformance(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("schema_version_gate", func(t *testing.T) {
+		gate := m.ASB.SchemaVersionGate
+		if len(gate.Cases) == 0 {
+			t.Fatal("manifest has no asb.schema_version_gate cases")
+		}
+		body, err := os.ReadFile(filepath.Join(conformanceDir, gate.Fixture))
+		if err != nil {
+			t.Fatalf("fixture: %v", err)
+		}
+		for i, c := range gate.Cases {
+			// A JSON number carries no width, so a native AMQP integer is exercised at every
+			// width the SDK can hand over; a string or an absent property has exactly one form.
+			values := []any{c.Value}
+			if f, ok := c.Value.(float64); ok && f == float64(int64(f)) {
+				values = []any{int(f), int32(f), int64(f), uint8(f), uint32(f), uint64(f)}
+			}
+			for _, v := range values {
+				receiver := &fakeReceiver{messages: []*azservicebus.ReceivedMessage{gatedMessage(string(body), v, !c.Absent)}}
+				tr, err := New(WithClient(&fakeClient{sender: &fakeSender{}, receiver: receiver}))
+				if err != nil {
+					t.Fatal(err)
+				}
+				msg, err := tr.Pop(context.Background(), "orders", 0)
+				if err != nil || msg == nil {
+					t.Fatalf("case %d (%#v): Pop: msg=%v err=%v", i, v, msg, err)
+				}
+				rejected := msg.RouteURN != ""
+				if rejected != (c.Expect == "reject") {
+					t.Errorf("case %d (%#v): rejected=%v, want expect=%s", i, v, rejected, c.Expect)
+				}
+				if !rejected {
+					if _, err := babelqueue.Decode([]byte(msg.Body)); err != nil {
+						t.Errorf("case %d (%#v): decode: %v", i, v, err)
+					}
+				}
+			}
+		}
+	})
 }
 
 // sameValue compares a projected property (int/int64/string) to its golden counterpart

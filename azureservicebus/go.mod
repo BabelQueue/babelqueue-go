@@ -4,7 +4,7 @@ go 1.25.0
 
 require (
 	github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus v1.10.0
-	github.com/babelqueue/babelqueue-go v1.0.0
+	github.com/babelqueue/babelqueue-go v1.10.0
 )
 
 require (
