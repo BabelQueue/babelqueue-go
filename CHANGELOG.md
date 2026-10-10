@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.10.0] - 2026-10-10
+
 ### Added
 
 - **`ReceivedMessage.RouteURN` routing seam** (core, MINOR). An optional field a transport can
@@ -61,9 +63,10 @@ The envelope wire format is versioned separately by `meta.schema_version`
   unchanged and the error still names the rejected version. A genuinely unknown URN under
   `StrategyRelease` is still released verbatim. No public API or wire change.
 - **Release note for the `pulsar` module:** it now depends on the core's
-  `ReceivedMessage.RouteURN`, so the next `pulsar/v*` tag must `require` the core version that
-  ships this seam and the version-gate `StrategyRelease` fix above (the module currently resolves
-  the core through `replace ../` locally).
+  `ReceivedMessage.RouteURN`, so `pulsar/v1.1.0` (MINOR: new `WithOnRoutingMismatch` /
+  `WithOnSchemaVersionRejected` options and `PublishRouted`) must `require` core `v1.10.0`, which
+  ships this seam and the version-gate `StrategyRelease` fix above (the module resolves the core
+  through `replace ../` locally).
 
 ## [1.9.0] - 2026-10-03
 
