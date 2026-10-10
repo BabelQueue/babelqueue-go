@@ -330,15 +330,17 @@ func messageBody(msg *amqp.Message) string {
 const unsupportedSchemaRoutePrefix = "babelqueue:unsupported-schema-version:"
 
 // unsupportedSchemaVersion implements the §7.7 gate on the bq_schema_version application property
-// (underscored, ADR-0017). A missing property is not gated, and neither is a blank string (the
-// usual decode path runs); blank means the empty string or only ASCII whitespace (space, \t, \n,
-// \v, \f, \r) — the same set in every SDK (GR-5). The property is string-valued on the wire, so
-// the value is compared as-is, never trimmed ("01", " 1", "1 ", NBSP, U+0085, U+FEFF and U+3000
-// are all rejected), against the core's supported version; a value of any other AMQP type is not
-// the supported version either and is rejected. It returns the offending value as text.
+// (underscored, ADR-0017). A missing property is not gated, nor is one present with a null value
+// (null = absent), and neither is a blank string (the usual decode path runs). Blank means the
+// empty string or only ASCII whitespace (space, \t, \n, \v, \f, \r) — the same set in every SDK
+// (GR-5). The property is string-valued on the wire, so the value is compared as-is, never trimmed
+// ("01", " 1", "1 ", NBSP, U+0085, U+FEFF and U+3000 are all rejected), against the core's
+// supported version; a value of any other AMQP type is not the supported version either and is
+// rejected. It returns the offending value as text.
 func unsupportedSchemaVersion(props map[string]any) (string, bool) {
 	raw, ok := props["bq_schema_version"]
-	if !ok {
+	if !ok || raw == nil {
+		// A property that is present with a null value carries no version: treated as absent.
 		return "", false
 	}
 	v, isString := raw.(string)

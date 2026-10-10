@@ -110,9 +110,15 @@ func TestArtemisConformance(t *testing.T) {
 		for i, c := range gate.Cases {
 			msg := incoming(string(body), "", 0)
 			label := "absent"
-			if !c.Absent && c.Value != nil {
-				msg.ApplicationProperties = map[string]any{gate.Property: *c.Value}
-				label = strconv.Quote(*c.Value)
+			if !c.Absent {
+				if c.Value != nil {
+					msg.ApplicationProperties = map[string]any{gate.Property: *c.Value}
+					label = strconv.Quote(*c.Value)
+				} else {
+					// JSON null: the key is present with a null value; it must be treated as absent.
+					msg.ApplicationProperties = map[string]any{gate.Property: nil}
+					label = "null"
+				}
 			}
 			receiver := &fakeReceiver{messages: []*amqp.Message{msg}}
 			tr, err := New(context.Background(), WithClient(&fakeClient{sender: &fakeSender{}, receiver: receiver}))

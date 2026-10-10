@@ -106,9 +106,15 @@ func TestKafkaConformance(t *testing.T) {
 		for i, c := range gate.Cases {
 			var hdrs []kafkago.Header
 			label := "absent"
-			if !c.Absent && c.Value != nil {
-				hdrs = []kafkago.Header{{Key: gate.Property, Value: []byte(*c.Value)}}
-				label = strconv.Quote(*c.Value)
+			if !c.Absent {
+				if c.Value != nil {
+					hdrs = []kafkago.Header{{Key: gate.Property, Value: []byte(*c.Value)}}
+					label = strconv.Quote(*c.Value)
+				} else {
+					// JSON null: the header key is present with a null (nil) value; it must be treated as absent.
+					hdrs = []kafkago.Header{{Key: gate.Property, Value: nil}}
+					label = "null"
+				}
 			}
 			fr := &fakeReader{messages: []kafkago.Message{{Topic: "orders", Value: body, Headers: hdrs}}}
 			tr, err := New(WithWriter(&fakeWriter{}), WithReaderFactory(func(string) Reader { return fr }))

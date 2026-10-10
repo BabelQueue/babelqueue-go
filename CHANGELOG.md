@@ -30,6 +30,11 @@ The envelope wire format is versioned separately by `meta.schema_version`
   same way as a version-gated delivery. Note that on redelivery the handler runs again until the
   DLQ write succeeds (with a `Rewinder` transport, paced by `WithRewindPause`, 1s by default), so
   a handler with side effects should be idempotent (see the idempotency helper, ADR-0022).
+- **`artemis`: a `bq_schema_version` application property that is present with a null value is
+  treated as absent.** Previously the §7.7 gate rejected a null value as an unsupported version
+  (dead-letter path); it now falls through to the normal decode path, like a missing property and
+  like Azure Service Bus (`null` = no version). Locked by a new `null` case in the shared
+  conformance `artemis.schema_version_gate`. No wire change.
 
 ## [1.11.0] - 2026-10-10
 

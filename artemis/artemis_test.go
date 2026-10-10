@@ -298,6 +298,24 @@ func TestPopSchemaGateDecodesWhenMissingBlankOrSupported(t *testing.T) {
 	}
 }
 
+// A bq_schema_version property that is present with a null value carries no version: it is treated
+// exactly like an absent one and falls through to the normal decode path (broker-bindings.md §7.7).
+func TestPopSchemaGateTreatsNullPropertyAsAbsent(t *testing.T) {
+	called := false
+	msg, _ := popGated(t, sampleBody(t, 0), nil, true, 2,
+		WithOnSchemaVersionRejected(func(string, string) { called = true }))
+	if msg.RouteURN != "" || called {
+		t.Errorf("RouteURN = %q, hook called = %v; want neither", msg.RouteURN, called)
+	}
+	env, err := babelqueue.Decode([]byte(msg.Body))
+	if err != nil {
+		t.Fatalf("Decode: %v", err)
+	}
+	if env.Attempts != 2 {
+		t.Errorf("attempts = %d, want 2 (reconciled from delivery-count)", env.Attempts)
+	}
+}
+
 func TestPopSchemaGateRejectsUnsupportedWithoutDecoding(t *testing.T) {
 	cases := map[string]struct {
 		version any
@@ -311,7 +329,6 @@ func TestPopSchemaGateRejectsUnsupportedWithoutDecoding(t *testing.T) {
 		"bom":    {"\ufeff", "\ufeff"},
 		"int 1":  {1, "1"},
 		"bool":   {true, "true"},
-		"nil":    {nil, "<nil>"},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
