@@ -3,6 +3,7 @@ package babelqueue_test
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -352,5 +353,102 @@ func TestAppUndecodableBodyWithRouteURNIsPoison(t *testing.T) {
 	}
 	if calls != 0 {
 		t.Errorf("handler ran %d times for an undecodable body", calls)
+	}
+}
+
+// A transport-version-gated delivery (reserved unsupported-schema-version RouteURN, e.g. the
+// pulsar bq-schema-version gate) can never be handled, so StrategyRelease must not requeue it
+// unchanged forever: like an empty-URN message it takes the bounded StrategyFail path
+// (attempts+1 re-publish, then dead-letter).
+func TestAppVersionGatedRouteIsBoundedUnderStrategyRelease(t *testing.T) {
+	const bodyURN = "urn:babel:orders:created"
+	const gateRoute = "babelqueue:unsupported-schema-version:2?bq-job=urn%3Ababel%3Aorders%3Acreated"
+	env, err := babelqueue.Make(bodyURN, map[string]any{"order_id": 1}, babelqueue.WithQueue("orders"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := env.Encode()
+
+	t.Run("retry re-publish carries attempts+1 and the route", func(t *testing.T) {
+		tr := &routedPublishTransport{routeTransport: routeTransport{
+			InMemoryTransport: babelqueue.NewInMemoryTransport(),
+			next:              &babelqueue.ReceivedMessage{Body: string(raw), Queue: "orders", RouteURN: gateRoute},
+		}}
+		app := babelqueue.NewApp(tr, babelqueue.WithMaxAttempts(3), babelqueue.WithUnknownURNStrategy(babelqueue.StrategyRelease))
+		calls := 0
+		app.Handle(bodyURN, func(context.Context, babelqueue.Envelope) error { calls++; return nil })
+		if _, err := app.Drain(context.Background(), "orders", 1); err != nil {
+			t.Fatal(err)
+		}
+		if calls != 0 {
+			t.Fatalf("handler ran %d times for a version-gated delivery", calls)
+		}
+		if len(tr.published) != 1 || len(tr.routes) != 1 || tr.routes[0] != gateRoute {
+			t.Fatalf("published = %d routes = %v; want one re-publish keeping %s", len(tr.published), tr.routes, gateRoute)
+		}
+		if tr.published[0] == string(raw) {
+			t.Fatal("body re-published unchanged (the endless release loop); want attempts incremented")
+		}
+		retried, _ := babelqueue.Decode([]byte(tr.published[0]))
+		if retried.Attempts != 1 {
+			t.Errorf("re-published attempts = %d, want 1", retried.Attempts)
+		}
+	})
+
+	t.Run("exhausted attempts dead-letter with the unknown_urn reason", func(t *testing.T) {
+		tr := &routedPublishTransport{routeTransport: routeTransport{
+			InMemoryTransport: babelqueue.NewInMemoryTransport(),
+			next:              &babelqueue.ReceivedMessage{Body: string(raw), Queue: "orders", RouteURN: gateRoute},
+		}}
+		app := babelqueue.NewApp(tr, babelqueue.WithMaxAttempts(1), babelqueue.WithDeadLetter(true),
+			babelqueue.WithUnknownURNStrategy(babelqueue.StrategyRelease))
+		app.Handle(bodyURN, func(context.Context, babelqueue.Envelope) error { return nil })
+		if _, err := app.Drain(context.Background(), "orders", 1); err != nil {
+			t.Fatal(err)
+		}
+		if len(tr.published) != 1 || tr.queues[0] != "orders.dlq" || tr.routes[0] != gateRoute {
+			t.Fatalf("dead-letter queues = %v routes = %v; want one orders.dlq record on %s", tr.queues, tr.routes, gateRoute)
+		}
+		if !strings.Contains(tr.published[0], "unknown_urn") {
+			t.Errorf("dead-letter record lacks the unknown_urn reason: %s", tr.published[0])
+		}
+	})
+
+	t.Run("an undecodable gated body takes the same bounded path", func(t *testing.T) {
+		tr := &routedPublishTransport{routeTransport: routeTransport{
+			InMemoryTransport: babelqueue.NewInMemoryTransport(),
+			next:              &babelqueue.ReceivedMessage{Body: "not-json", Queue: "orders", RouteURN: gateRoute},
+		}}
+		app := babelqueue.NewApp(tr, babelqueue.WithMaxAttempts(1), babelqueue.WithDeadLetter(true),
+			babelqueue.WithUnknownURNStrategy(babelqueue.StrategyRelease))
+		if _, err := app.Drain(context.Background(), "orders", 1); err != nil {
+			t.Fatal(err)
+		}
+		if len(tr.published) != 1 || tr.queues[0] != "orders.dlq" {
+			t.Fatalf("dead-letter queues = %v; want one orders.dlq record", tr.queues)
+		}
+	})
+}
+
+// The genuine unknown-URN StrategyRelease behaviour is unchanged: a RouteURN no handler owns
+// (but that is not a version-gate route) is re-published verbatim, attempts untouched.
+func TestAppUnknownRouteURNStillReleasesVerbatim(t *testing.T) {
+	const bodyURN, routeURN = "urn:babel:orders:created", "urn:babel:orders:unregistered"
+	env, err := babelqueue.Make(bodyURN, map[string]any{"order_id": 1}, babelqueue.WithQueue("orders"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := env.Encode()
+	tr := &routedPublishTransport{routeTransport: routeTransport{
+		InMemoryTransport: babelqueue.NewInMemoryTransport(),
+		next:              &babelqueue.ReceivedMessage{Body: string(raw), Queue: "orders", RouteURN: routeURN},
+	}}
+	app := babelqueue.NewApp(tr, babelqueue.WithMaxAttempts(3), babelqueue.WithUnknownURNStrategy(babelqueue.StrategyRelease))
+	app.Handle(bodyURN, func(context.Context, babelqueue.Envelope) error { return nil })
+	if _, err := app.Drain(context.Background(), "orders", 1); err != nil {
+		t.Fatal(err)
+	}
+	if len(tr.published) != 1 || tr.published[0] != string(raw) || tr.routes[0] != routeURN {
+		t.Fatalf("published = %v routes = %v; want the original body re-published verbatim on %s", tr.published, tr.routes, routeURN)
 	}
 }

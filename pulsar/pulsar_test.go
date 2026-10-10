@@ -2,6 +2,8 @@ package pulsar
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -645,5 +647,269 @@ func TestProducerAndConsumerAreCached(t *testing.T) {
 	_, _ = tr.Pop(ctx, "orders", 0)
 	if len(tr.consumers) != 1 {
 		t.Errorf("consumers cached = %d, want 1", len(tr.consumers))
+	}
+}
+
+// --- bq-schema-version gate (§5.7 step 3) ---
+
+func TestPopSchemaVersionMissingOrBlankDecodesNormally(t *testing.T) {
+	for name, props := range map[string]map[string]string{
+		"missing": {},
+		"nil":     nil,
+		"blank":   {"bq-schema-version": "  "},
+		"empty":   {"bq-schema-version": ""},
+		// blank = empty or only ASCII whitespace (space, \t, \n, \v, \f, \r), identical in every SDK (GR-5)
+		"vertical tab": {"bq-schema-version": "\u000B"},
+		"form feed":    {"bq-schema-version": "\f"},
+		"all ASCII ws": {"bq-schema-version": " \t\n\v\f\r"},
+	} {
+		t.Run(name, func(t *testing.T) {
+			env, got := popMessage(t, bodyWith(t, urn, 0), props, 0)
+			if env.URN() != urn || got.RouteURN != "" {
+				t.Errorf("job = %q route = %q; want a normal decode with no route override", env.URN(), got.RouteURN)
+			}
+		})
+	}
+}
+
+func TestPopSchemaVersionSupportedIsDelivered(t *testing.T) {
+	env, got := popMessage(t, bodyWith(t, urn, 0), map[string]string{"bq-schema-version": "1", "bq-attempts": "3"}, 0)
+	if got.RouteURN != "" || env.URN() != urn || env.Attempts != 3 {
+		t.Errorf("version 1 must follow the normal path: route = %q job = %q attempts = %d", got.RouteURN, env.URN(), env.Attempts)
+	}
+}
+
+// An unsupported version is rejected before the body is decoded: a body that is not JSON at all
+// still yields the version-gate route (a decode error would leave RouteURN empty), and the
+// payload reaches the App untouched.
+func TestPopUnsupportedSchemaVersionGatesBeforeDecode(t *testing.T) {
+	const garbage = "{not json"
+	for _, v := range []string{"2", "x", "01", " 1", "1.0", "-1", "\u001C", "\u0085", "\uFEFF", "\u00A0", "\u3000"} {
+		t.Run(fmt.Sprintf("%q", v), func(t *testing.T) {
+			msg := fakeMessage{payload: []byte(garbage), properties: map[string]string{"bq-schema-version": v, "bq-job": urn}}
+			consumer := &fakeConsumer{messages: []pulsarsdk.Message{msg}}
+			tr, _ := New(WithClient(&fakeClient{producer: &fakeProducer{}, consumer: consumer}))
+			got, err := tr.Pop(context.Background(), "orders", 0)
+			if err != nil || got == nil {
+				t.Fatalf("Pop = (%v, %v)", got, err)
+			}
+			if want := gateRoute(v, map[string]string{"bq-job": urn}); got.RouteURN != want {
+				t.Errorf("RouteURN = %q, want %q", got.RouteURN, want)
+			}
+			if got.Body != garbage {
+				t.Errorf("body must be handed over untouched, got %q", got.Body)
+			}
+		})
+	}
+}
+
+func TestRoutingMismatchHookNotCalledForGatedMessage(t *testing.T) {
+	called := false
+	hook := func(string, string, *babelqueue.Envelope) { called = true }
+	msg := fakeMessage{payload: []byte(bodyWith(t, urn, 0)), properties: map[string]string{
+		"bq-schema-version": "2", "bq-job": "urn:babel:orders:refunded",
+	}}
+	consumer := &fakeConsumer{messages: []pulsarsdk.Message{msg}}
+	tr, _ := New(WithClient(&fakeClient{producer: &fakeProducer{}, consumer: consumer}), WithOnRoutingMismatch(hook))
+	if got, err := tr.Pop(context.Background(), "orders", 0); err != nil || got == nil {
+		t.Fatalf("Pop = (%v, %v)", got, err)
+	}
+	if called {
+		t.Error("the mismatch hook must not run for a version-gated message")
+	}
+}
+
+// End to end: a gated message never reaches a handler (neither the body URN's nor the bq-job's)
+// and is quarantined through the App's unknown-URN dead-letter path with the original body.
+func TestAppQuarantinesUnsupportedSchemaVersion(t *testing.T) {
+	body := bodyWith(t, urn, 0)
+	for _, v := range []string{"2", "x"} {
+		t.Run(v, func(t *testing.T) {
+			producer := &fakeProducer{}
+			consumer := &fakeConsumer{messages: []pulsarsdk.Message{
+				fakeMessage{payload: []byte(body), properties: map[string]string{"bq-schema-version": v, "bq-job": urn}},
+			}}
+			tr, _ := New(WithClient(&fakeClient{producer: producer, consumer: consumer}))
+			app := babelqueue.NewApp(tr, babelqueue.WithMaxAttempts(1), babelqueue.WithDeadLetter(true))
+			handled := 0
+			app.Handle(urn, func(context.Context, babelqueue.Envelope) error { handled++; return nil })
+			if n, err := app.Drain(context.Background(), "orders", 1); err != nil || n != 1 {
+				t.Fatalf("Drain = (%d, %v)", n, err)
+			}
+			if handled != 0 {
+				t.Fatalf("handler ran %d times for a version-gated message", handled)
+			}
+			if len(consumer.acked) != 1 || len(producer.sent) != 1 {
+				t.Fatalf("acked %d, dead-lettered %d; want 1 and 1", len(consumer.acked), len(producer.sent))
+			}
+			dead, _ := babelqueue.Decode(producer.sent[0].Payload)
+			if dead.Job != urn {
+				t.Errorf("dead-letter body job = %q, want the producer's %q", dead.Job, urn)
+			}
+			if !strings.Contains(string(producer.sent[0].Payload), "unknown_urn") {
+				t.Errorf("dead-letter record does not carry the unknown_urn reason: %s", producer.sent[0].Payload)
+			}
+		})
+	}
+}
+
+// The sentinel route is an in-process marker: whatever the App re-publishes for a gated message
+// (retry copy or dead-letter record) keeps the delivery's original bq-job and bq-schema-version
+// and never carries the reserved URN, so a redrive is gated the same way.
+func TestGatedRepublishKeepsOriginalRoutingProperties(t *testing.T) {
+	body := bodyWith(t, urn, 0)
+	cases := map[string]struct {
+		props   map[string]string
+		wantJob string
+		hasJob  bool
+	}{
+		"with bq-job":    {map[string]string{"bq-schema-version": "2", "bq-job": "urn:babel:orders:legacy"}, "urn:babel:orders:legacy", true},
+		"without bq-job": {map[string]string{"bq-schema-version": "x"}, urn, true}, // derived from the body, never the sentinel,
+		"escaped chars":  {map[string]string{"bq-schema-version": "2&x=?bq-job=%", "bq-job": "a?bq-job=b&c d"}, "a?bq-job=b&c d", true},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			for _, deadLetter := range []bool{false, true} {
+				producer := &fakeProducer{}
+				consumer := &fakeConsumer{messages: []pulsarsdk.Message{fakeMessage{payload: []byte(body), properties: tc.props}}}
+				tr, _ := New(WithClient(&fakeClient{producer: producer, consumer: consumer}))
+				opts := []babelqueue.AppOption{babelqueue.WithMaxAttempts(1), babelqueue.WithDeadLetter(deadLetter)}
+				if !deadLetter {
+					opts = []babelqueue.AppOption{babelqueue.WithMaxAttempts(5)}
+				}
+				app := babelqueue.NewApp(tr, opts...)
+				if _, err := app.Drain(context.Background(), "orders", 1); err != nil {
+					t.Fatalf("Drain: %v", err)
+				}
+				if len(producer.sent) != 1 {
+					t.Fatalf("deadLetter=%v: published %d messages, want 1", deadLetter, len(producer.sent))
+				}
+				got := producer.sent[0].Properties
+				if strings.Contains(got["bq-job"], "babelqueue:unsupported-schema-version") {
+					t.Errorf("deadLetter=%v: the sentinel leaked into bq-job: %q", deadLetter, got["bq-job"])
+				}
+				if job, ok := got["bq-job"]; ok != tc.hasJob || job != tc.wantJob {
+					t.Errorf("deadLetter=%v: bq-job = (%q, %v), want (%q, %v)", deadLetter, job, ok, tc.wantJob, tc.hasJob)
+				}
+				if got["bq-schema-version"] != tc.props["bq-schema-version"] {
+					t.Errorf("deadLetter=%v: bq-schema-version = %q, want the original %q", deadLetter, got["bq-schema-version"], tc.props["bq-schema-version"])
+				}
+				if !strings.Contains(string(producer.sent[0].Payload), `"job":"`+urn+`"`) {
+					t.Errorf("deadLetter=%v: body job was rewritten: %s", deadLetter, producer.sent[0].Payload)
+				}
+			}
+		})
+	}
+}
+
+// A re-published gated message is gated again when it is consumed (the redrive meets the same gate).
+func TestGatedRepublishIsGatedAgain(t *testing.T) {
+	producer := &fakeProducer{}
+	first := &fakeConsumer{messages: []pulsarsdk.Message{
+		fakeMessage{payload: []byte(bodyWith(t, urn, 0)), properties: map[string]string{"bq-schema-version": "2", "bq-job": urn}},
+	}}
+	tr, _ := New(WithClient(&fakeClient{producer: producer, consumer: first}))
+	app := babelqueue.NewApp(tr, babelqueue.WithMaxAttempts(5))
+	if _, err := app.Drain(context.Background(), "orders", 1); err != nil || len(producer.sent) != 1 {
+		t.Fatalf("Drain: %v, sent %d", err, len(producer.sent))
+	}
+	sent := producer.sent[0]
+	second := &fakeConsumer{messages: []pulsarsdk.Message{fakeMessage{payload: sent.Payload, properties: sent.Properties}}}
+	tr2, _ := New(WithClient(&fakeClient{producer: &fakeProducer{}, consumer: second}))
+	got, err := tr2.Pop(context.Background(), "orders", 0)
+	if err != nil || got == nil {
+		t.Fatalf("Pop = (%v, %v)", got, err)
+	}
+	if !strings.HasPrefix(got.RouteURN, unsupportedSchemaRoutePrefix) {
+		t.Errorf("the re-published message must be gated again, RouteURN = %q", got.RouteURN)
+	}
+}
+
+// A body that is not JSON plus an unsupported version: the transport names the real reason through
+// the OnSchemaVersionRejected hook (the App cannot, it only applies the route to a decoded body),
+// and the message is still quarantined with its original payload, never handed to a handler.
+func TestRejectedHookNamesVersionForInvalidBody(t *testing.T) {
+	const garbage = "{not json"
+	var gotVersion, gotQueue string
+	hook := func(version, queue string) { gotVersion, gotQueue = version, queue }
+	producer := &fakeProducer{}
+	consumer := &fakeConsumer{messages: []pulsarsdk.Message{
+		fakeMessage{payload: []byte(garbage), properties: map[string]string{"bq-schema-version": "2"}},
+	}}
+	tr, _ := New(WithClient(&fakeClient{producer: producer, consumer: consumer}), WithOnSchemaVersionRejected(hook))
+	app := babelqueue.NewApp(tr, babelqueue.WithMaxAttempts(1), babelqueue.WithDeadLetter(true))
+	handled := 0
+	app.Handle(urn, func(context.Context, babelqueue.Envelope) error { handled++; return nil })
+	if _, err := app.Drain(context.Background(), "orders", 1); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if gotVersion != "2" || gotQueue != "orders" {
+		t.Errorf("hook = (%q, %q), want (\"2\", \"orders\")", gotVersion, gotQueue)
+	}
+	if handled != 0 {
+		t.Errorf("handler ran %d times", handled)
+	}
+	for _, m := range producer.sent {
+		if strings.Contains(m.Properties["bq-job"], "babelqueue:unsupported-schema-version") {
+			t.Errorf("the sentinel leaked into bq-job: %q", m.Properties["bq-job"])
+		}
+	}
+}
+
+func TestRejectedHookIsNotCalledForSupportedVersionAndPanicIsIgnored(t *testing.T) {
+	called := false
+	popMessageWithOptions := func(props map[string]string, fn OnSchemaVersionRejected) {
+		consumer := &fakeConsumer{messages: []pulsarsdk.Message{fakeMessage{payload: []byte(bodyWith(t, urn, 0)), properties: props}}}
+		tr, _ := New(WithClient(&fakeClient{producer: &fakeProducer{}, consumer: consumer}), WithOnSchemaVersionRejected(fn))
+		if got, err := tr.Pop(context.Background(), "orders", 0); err != nil || got == nil {
+			t.Fatalf("Pop = (%v, %v)", got, err)
+		}
+	}
+	popMessageWithOptions(map[string]string{"bq-schema-version": "1"}, func(string, string) { called = true })
+	popMessageWithOptions(map[string]string{}, func(string, string) { called = true })
+	if called {
+		t.Error("the hook must not run for a supported or missing version")
+	}
+	popMessageWithOptions(map[string]string{"bq-schema-version": "2"}, func(string, string) { panic("boom") })
+}
+
+// A gated message is quarantined through the bounded StrategyFail path even when the App is
+// configured with StrategyRelease: releasing it unchanged would loop forever (a redrive meets
+// the same gate), so the re-published copy carries attempts+1 and the original properties, and
+// a feedback loop of redeliveries ends in the dead-letter write after WithMaxAttempts.
+func TestGatedMessageIsBoundedUnderStrategyRelease(t *testing.T) {
+	body := bodyWith(t, urn, 0)
+	props := map[string]string{"bq-schema-version": "2", "bq-job": urn}
+	producer := &fakeProducer{}
+	next := fakeMessage{payload: []byte(body), properties: props}
+	handled := 0
+	const maxAttempts = 3
+	for delivery := 1; delivery <= maxAttempts; delivery++ {
+		consumer := &fakeConsumer{messages: []pulsarsdk.Message{next}}
+		tr, _ := New(WithClient(&fakeClient{producer: producer, consumer: consumer}))
+		app := babelqueue.NewApp(tr, babelqueue.WithMaxAttempts(maxAttempts), babelqueue.WithDeadLetter(true),
+			babelqueue.WithUnknownURNStrategy(babelqueue.StrategyRelease))
+		app.Handle(urn, func(context.Context, babelqueue.Envelope) error { handled++; return nil })
+		if n, err := app.Drain(context.Background(), "orders", 1); err != nil || n != 1 {
+			t.Fatalf("delivery %d: Drain = (%d, %v)", delivery, n, err)
+		}
+		if len(producer.sent) != delivery {
+			t.Fatalf("delivery %d: %d messages published, want %d", delivery, len(producer.sent), delivery)
+		}
+		sent := producer.sent[delivery-1]
+		if sent.Properties["bq-schema-version"] != "2" || sent.Properties["bq-job"] != urn {
+			t.Errorf("delivery %d: re-published properties = %v, want the originals", delivery, sent.Properties)
+		}
+		if string(sent.Payload) == body {
+			t.Fatalf("delivery %d: body re-published unchanged (the endless release loop)", delivery)
+		}
+		next = fakeMessage{payload: sent.Payload, properties: sent.Properties}
+	}
+	if handled != 0 {
+		t.Fatalf("handler ran %d times for a version-gated message", handled)
+	}
+	last := producer.sent[len(producer.sent)-1]
+	if !strings.Contains(string(last.Payload), "unknown_urn") {
+		t.Errorf("last write is not the dead-letter record: %s", last.Payload)
 	}
 }

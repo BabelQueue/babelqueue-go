@@ -26,6 +26,20 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ### Fixed
 
+- **Pulsar consumer version-gates on `bq-schema-version`** (`pulsar` module, broker-bindings §5.7
+  step 3). A message whose `bq-schema-version` property is present but not the core's supported
+  version (`"2"`, `"x"`, `"01"`, ...) is now rejected **before its body is decoded**: `Pop` hands
+  it to the `App` unchanged under a reserved route (`babelqueue:unsupported-schema-version:<value>`)
+  that no handler owns, so it is quarantined through the existing unknown-URN retry /
+  dead-letter path (the error names the rejected version). A missing or blank property, and `"1"`,
+  behave exactly as before. "Blank" is the same set in every SDK: the empty string or only ASCII whitespace (space, `\t`, `\n`, `\v`, `\f`, `\r`); anything else (NBSP, U+001C-U+001F, U+0085, U+FEFF, U+3000, ...) is not blank and is rejected unless it is exactly the supported version. (Go `strings.TrimSpace` is not used: it also trims Unicode spaces.) No wire change. (A post-decode `Envelope.Accepts()` check in the
+  `App` dispatch path is out of scope.) The reserved route is an in-process marker only: it
+  also carries the delivery's original `bq-job`, and the retry / dead-letter re-publish writes
+  that original `bq-job` (or, when the delivery had none, the body's job) plus the original raw
+  `bq-schema-version` back, never the sentinel, so a redrive meets the same gate. The new
+  optional `WithOnSchemaVersionRejected(func(version, queue string))` hook (additive) names the
+  rejected version, including for a body that is not valid JSON, which the `App` quarantines
+  as a poison message whose error names the reserved route.
 - **Pulsar consumer follows broker-bindings §5.2 / §5.7** (`pulsar` module). `Pop` now routes
   on the `bq-job` property (the body's `job` is used only when the property is absent or
   blank) and takes `attempts` from the authoritative `bq-attempts` property (the body's value
@@ -38,9 +52,18 @@ The envelope wire format is versioned separately by `meta.schema_version`
   `pulsar.WithOnRoutingMismatch(func(propertyURN, bodyURN string, env *babelqueue.Envelope))`
   option reports a mismatch for an accepted envelope, after attempts are reconciled (a panic in
   it is recovered; delivery and ack are unaffected). No wire change.
+- **`StrategyRelease` no longer loops on a transport version-gated delivery** (core `App`). A
+  delivery whose `RouteURN` starts with the reserved `babelqueue:unsupported-schema-version:`
+  prefix (the `pulsar` module's `bq-schema-version` gate, broker-bindings §5.7 step 3) can never
+  be handled, yet `StrategyRelease` re-published it unchanged on every delivery, forever. It now
+  takes the same bounded path as an empty-URN message: `StrategyRelease` is treated as
+  `StrategyFail` (attempts + 1 re-publish, then dead-letter or drop); the other strategies are
+  unchanged and the error still names the rejected version. A genuinely unknown URN under
+  `StrategyRelease` is still released verbatim. No public API or wire change.
 - **Release note for the `pulsar` module:** it now depends on the core's
   `ReceivedMessage.RouteURN`, so the next `pulsar/v*` tag must `require` the core version that
-  ships this seam (the module currently resolves the core through `replace ../` locally).
+  ships this seam and the version-gate `StrategyRelease` fix above (the module currently resolves
+  the core through `replace ../` locally).
 
 ## [1.9.0] - 2026-10-03
 

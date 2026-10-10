@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -253,8 +254,16 @@ func (a *App) dispatch(ctx context.Context, msg *ReceivedMessage) {
 		urn = msg.RouteURN // transport-supplied routing override; the body is not rewritten
 	}
 
-	if decodeErr != nil || urn == "" {
-		a.routePoison(ctx, msg, env, decodeErr)
+	// A version-gated delivery (a transport's reserved unsupported-schema-version route, see
+	// [unsupportedSchemaRoutePrefix]) can never be handled by any registered handler, so it takes
+	// the poison path whether or not its body decodes; the route URN stays in the error so the
+	// log names the rejected version.
+	gated := ""
+	if strings.HasPrefix(msg.RouteURN, unsupportedSchemaRoutePrefix) {
+		gated = msg.RouteURN
+	}
+	if gated != "" || decodeErr != nil || urn == "" {
+		a.routePoison(ctx, msg, env, decodeErr, gated)
 		return
 	}
 	handler, ok := a.handlers[urn]
@@ -277,19 +286,29 @@ func (a *App) ack(ctx context.Context, msg *ReceivedMessage) {
 	}
 }
 
-// routePoison handles a body that does not decode or names no URN. No handler can
+// unsupportedSchemaRoutePrefix is the reserved [ReceivedMessage.RouteURN] prefix a transport
+// uses to hand over a delivery it version-gated (broker-bindings §5.7 step 3, e.g. the pulsar
+// module's bq-schema-version check). It is not a "urn:babel:" URN, so no handler owns it. The
+// string is the contract between the transport and this package; it never reaches the wire.
+const unsupportedSchemaRoutePrefix = "babelqueue:unsupported-schema-version:"
+
+// routePoison handles a body that does not decode, names no URN, or was version-gated by its
+// transport (gatedRoute is then the transport's reserved route URN, otherwise ""). No handler can
 // ever be registered for it, so the unknown-URN strategy applies except [StrategyRelease]:
 // releasing would redeliver it forever, so it takes the bounded [StrategyFail] path
 // instead (retries up to WithMaxAttempts, floored by the broker's delivery count,
 // then dead-letter or drop).
-func (a *App) routePoison(ctx context.Context, msg *ReceivedMessage, env Envelope, decodeErr error) {
+func (a *App) routePoison(ctx context.Context, msg *ReceivedMessage, env Envelope, decodeErr error, gatedRoute string) {
 	if a.onUnknownURN != StrategyRelease {
-		a.routeUnknown(ctx, "", msg, env)
+		a.routeUnknown(ctx, gatedRoute, msg, env)
 		return
 	}
-	cause := fmt.Errorf("%w: %q", ErrUnknownURN, "")
+	cause := fmt.Errorf("%w: %q", ErrUnknownURN, gatedRoute)
 	if decodeErr != nil {
 		cause = fmt.Errorf("%w: undecodable body: %v", ErrUnknownURN, decodeErr)
+		if gatedRoute != "" {
+			cause = fmt.Errorf("%w: %q: undecodable body: %v", ErrUnknownURN, gatedRoute, decodeErr)
+		}
 	}
 	a.retryOrDeadLetter(ctx, msg, env, cause)
 }

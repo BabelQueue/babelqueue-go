@@ -8,7 +8,14 @@
 // bq-job property is the routing key (the body's job is used only when bq-job is absent or
 // blank; a differing body URN is reported to the optional [OnRoutingMismatch] hook) and
 // bq-attempts is the authoritative counter (the body's attempts is used only when the property
-// is absent or not a plain non-negative decimal integer). The result is then
+// is absent or not a plain non-negative decimal integer). Before any of that, a bq-schema-version
+// property that is present but not the core's supported version is version-gated (§5.7 step 3):
+// the body is not decoded and the message is routed to a reserved unsupported-version URN no
+// handler owns, so the App quarantines it through its bounded retry / dead-letter path (also under StrategyRelease, which would otherwise loop; the
+// optional [OnSchemaVersionRejected] hook names the rejected version). That route is an in-process
+// marker only: it carries the delivery's original bq-job and bq-schema-version, and a retry or
+// dead-letter re-publish writes those back verbatim, so the sentinel never reaches the wire and a
+// redrive meets the same gate. The result is then
 // raised to the broker's native RedeliveryCount (no −1, because Pulsar's redelivery count is
 // 0-based): attempts = max(bq-attempts, RedeliveryCount), so a redelivered message reflects
 // its true count without lowering the runtime's own counter.
@@ -25,6 +32,7 @@ package pulsar
 import (
 	"context"
 	"errors"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -87,6 +95,7 @@ type Transport struct {
 	topicPrefix  string
 	maxWait      time.Duration
 	onMismatch   OnRoutingMismatch
+	onRejected   OnSchemaVersionRejected
 
 	mu        sync.Mutex
 	producers map[string]Producer
@@ -133,6 +142,20 @@ type OnRoutingMismatch func(propertyURN, bodyURN string, env *babelqueue.Envelop
 // WithOnRoutingMismatch registers an optional [OnRoutingMismatch] hook (default: none).
 func WithOnRoutingMismatch(fn OnRoutingMismatch) Option {
 	return func(t *Transport) { t.onMismatch = fn }
+}
+
+// OnSchemaVersionRejected is called when the version gate (§5.7 step 3) quarantines a message
+// whose bq-schema-version property is present but not the core's supported version. version is
+// the raw property value and queue the queue it was received from. The gate runs before the body
+// is decoded; the App's quarantine error names the reserved route, and this hook additionally hands
+// an operator the rejected version and queue directly (including for a body that is not valid
+// JSON). It is a diagnostic hook: a panic in it is recovered and ignored, and it never changes how
+// the message is delivered, acked or retried.
+type OnSchemaVersionRejected func(version, queue string)
+
+// WithOnSchemaVersionRejected registers an optional [OnSchemaVersionRejected] hook (default: none).
+func WithOnSchemaVersionRejected(fn OnSchemaVersionRejected) Option {
+	return func(t *Transport) { t.onRejected = fn }
 }
 
 // New builds a transport. Provide a service URL ([WithURL]), a preconfigured Pulsar client
@@ -245,6 +268,12 @@ func (t *Transport) Pop(ctx context.Context, queue string, timeout time.Duration
 		}
 		return nil, err
 	}
+	if v, rejected := unsupportedSchemaVersion(msg.Properties()); rejected {
+		// Version gate (§5.7 step 3): quarantine before decoding. The body is handed over
+		// untouched; the reserved route keeps the App from dispatching it to any handler.
+		notifyRejected(t.onRejected, v, queue)
+		return &babelqueue.ReceivedMessage{Body: string(msg.Payload()), Queue: queue, Handle: msg, RouteURN: gateRoute(v, msg.Properties())}, nil
+	}
 	body, routeURN := reconcile(string(msg.Payload()), msg.Properties(), msg.RedeliveryCount(), t.onMismatch)
 	return &babelqueue.ReceivedMessage{Body: body, Queue: queue, Handle: msg, RouteURN: routeURN}, nil
 }
@@ -265,13 +294,30 @@ func (t *Transport) Ack(_ context.Context, msg *babelqueue.ReceivedMessage) erro
 // message projects the envelope's contract fields onto a native Pulsar producer message.
 // The properties are a routable view of the body; on the consume side bq-job and bq-attempts
 // are authoritative (§5.7).
+//
+// A routeURN that is a version-gate route (see [gateRoute]) is never written to bq-job: the
+// republished message instead carries the original delivery's bq-job (when it had one) and its
+// original bq-schema-version, so a retry copy or dead-letter record routes (and is gated) exactly
+// as the first delivery was and can be redriven once the version is supported.
 func message(body, routeURN string) *pulsarsdk.ProducerMessage {
 	m := &pulsarsdk.ProducerMessage{Payload: []byte(body)}
+	version, job, hasJob, gated := parseGateRoute(routeURN)
 	env, err := babelqueue.Decode([]byte(body))
-	if err != nil {
+	switch {
+	case err == nil:
+		m.Properties = properties(env)
+	case gated:
+		m.Properties = map[string]string{}
+	default:
 		return m
 	}
-	m.Properties = properties(env)
+	if gated {
+		m.Properties["bq-schema-version"] = version
+		if hasJob {
+			m.Properties["bq-job"] = job
+		}
+		return m
+	}
 	if routeURN != "" {
 		m.Properties["bq-job"] = routeURN
 	}
@@ -298,6 +344,78 @@ func properties(env babelqueue.Envelope) map[string]string {
 	}
 	props["bq-attempts"] = strconv.Itoa(env.Attempts)
 	return props
+}
+
+// unsupportedSchemaRoutePrefix prefixes the reserved route URN a version-gated message is
+// delivered under. It is not a "urn:babel:" URN, so no handler can legitimately own it; the App
+// reports it as an unknown URN, which names the rejected bq-schema-version in the logged error.
+// It is an in-process marker only: [message] never writes it to the wire.
+const unsupportedSchemaRoutePrefix = "babelqueue:unsupported-schema-version:"
+
+// gateJobParam separates the rejected version from the original delivery's bq-job property in a
+// gate route (see [gateRoute]).
+const gateJobParam = "?bq-job="
+
+// gateRoute builds the route URN of a version-gated delivery: the reserved prefix, the rejected
+// bq-schema-version (query-escaped) and, when the delivery carried one, its original bq-job
+// property. The App hands the route back through [Transport.PublishRouted] on every retry,
+// release and dead-letter re-publish, which is how the original properties survive.
+func gateRoute(version string, props map[string]string) string {
+	route := unsupportedSchemaRoutePrefix + url.QueryEscape(version)
+	if job, ok := props["bq-job"]; ok {
+		route += gateJobParam + url.QueryEscape(job)
+	}
+	return route
+}
+
+// parseGateRoute is the inverse of [gateRoute]; gated is false for any other route URN.
+func parseGateRoute(route string) (version, job string, hasJob, gated bool) {
+	rest, ok := strings.CutPrefix(route, unsupportedSchemaRoutePrefix)
+	if !ok {
+		return "", "", false, false
+	}
+	rawVersion, rawJob, hasJob := strings.Cut(rest, gateJobParam)
+	version, err := url.QueryUnescape(rawVersion)
+	if err != nil {
+		version = rawVersion
+	}
+	if hasJob {
+		if job, err = url.QueryUnescape(rawJob); err != nil {
+			job = rawJob
+		}
+	}
+	return version, job, hasJob, true
+}
+
+// unsupportedSchemaVersion implements the §5.7 step-3 gate on the bq-schema-version property.
+// A missing or blank property is not gated (the usual decode path runs); blank means the empty
+// string or only ASCII whitespace (space, \t, \n, \v, \f, \r) — the same set in every SDK (GR-5).
+// A present property is accepted only when it is exactly the core's supported version
+// (babelqueue.SchemaVersion) as a plain decimal ("2", "x", "01" and " 1" are all rejected, and so
+// is any other whitespace such as NBSP, U+0085, U+FEFF or U+3000). It returns the offending raw value.
+func unsupportedSchemaVersion(props map[string]string) (string, bool) {
+	raw, ok := props["bq-schema-version"]
+	if !ok || isBlankASCII(raw) {
+		return "", false
+	}
+	if raw == strconv.Itoa(babelqueue.SchemaVersion) {
+		return "", false
+	}
+	return raw, true
+}
+
+// isBlankASCII reports whether s is empty or made only of ASCII whitespace (space, \t, \n, \v,
+// \f, \r). Unlike strings.TrimSpace it does not treat Unicode spaces (U+0085, U+00A0, U+2028,
+// U+3000, ...) as blank, so every SDK agrees on what a blank bq-schema-version is (GR-5).
+func isBlankASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case ' ', '\t', '\n', '\v', '\f', '\r':
+		default:
+			return false
+		}
+	}
+	return true
 }
 
 // maxAttempts bounds an accepted bq-attempts value to a signed 32-bit integer, matching the
@@ -370,6 +488,14 @@ func reconcile(body string, props map[string]string, redeliveryCount uint32, onM
 
 // notifyMismatch calls the hook, swallowing any panic so a faulty diagnostic can never
 // disturb consumption.
+func notifyRejected(fn OnSchemaVersionRejected, version, queue string) {
+	if fn == nil {
+		return
+	}
+	defer func() { _ = recover() }()
+	fn(version, queue)
+}
+
 func notifyMismatch(fn OnRoutingMismatch, propertyURN string, env babelqueue.Envelope) {
 	if fn == nil {
 		return
