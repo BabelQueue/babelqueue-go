@@ -356,11 +356,38 @@ func TestAppUndecodableBodyWithRouteURNIsPoison(t *testing.T) {
 	}
 }
 
+// queueRecordingTransport hands the App one message and records every (queue, body) it
+// re-publishes, so a test can tell a retry (original queue) from a dead-letter (the DLQ).
+type queueRecordingTransport struct {
+	*babelqueue.InMemoryTransport
+	next   *babelqueue.ReceivedMessage
+	queues []string
+	bodies []string
+	acks   int
+}
+
+func (q *queueRecordingTransport) Pop(_ context.Context, _ string, _ time.Duration) (*babelqueue.ReceivedMessage, error) {
+	m := q.next
+	q.next = nil
+	return m, nil
+}
+
+func (q *queueRecordingTransport) Publish(_ context.Context, queue, body string) error {
+	q.queues = append(q.queues, queue)
+	q.bodies = append(q.bodies, body)
+	return nil
+}
+
+func (q *queueRecordingTransport) Ack(context.Context, *babelqueue.ReceivedMessage) error {
+	q.acks++
+	return nil
+}
+
 // A transport-version-gated delivery (reserved unsupported-schema-version RouteURN, e.g. the
-// pulsar bq-schema-version gate) can never be handled, so StrategyRelease must not requeue it
-// unchanged forever: like an empty-URN message it takes the bounded StrategyFail path
-// (attempts+1 re-publish, then dead-letter).
-func TestAppVersionGatedRouteIsBoundedUnderStrategyRelease(t *testing.T) {
+// bq-schema-version gate of the SQS/Kafka/Artemis/ASB/Pulsar transports) can never be handled
+// and a retry cannot change that: it goes straight to the dead-letter queue, with no retry,
+// whatever the unknown-URN strategy and however many attempts are allowed (Python parity).
+func TestAppVersionGatedRouteIsDeadLetteredWithoutRetry(t *testing.T) {
 	const bodyURN = "urn:babel:orders:created"
 	const gateRoute = "babelqueue:unsupported-schema-version:2?bq-job=urn%3Ababel%3Aorders%3Acreated"
 	env, err := babelqueue.Make(bodyURN, map[string]any{"order_id": 1}, babelqueue.WithQueue("orders"))
@@ -369,63 +396,90 @@ func TestAppVersionGatedRouteIsBoundedUnderStrategyRelease(t *testing.T) {
 	}
 	raw, _ := env.Encode()
 
-	t.Run("retry re-publish carries attempts+1 and the route", func(t *testing.T) {
-		tr := &routedPublishTransport{routeTransport: routeTransport{
-			InMemoryTransport: babelqueue.NewInMemoryTransport(),
-			next:              &babelqueue.ReceivedMessage{Body: string(raw), Queue: "orders", RouteURN: gateRoute},
-		}}
-		app := babelqueue.NewApp(tr, babelqueue.WithMaxAttempts(3), babelqueue.WithUnknownURNStrategy(babelqueue.StrategyRelease))
-		calls := 0
-		app.Handle(bodyURN, func(context.Context, babelqueue.Envelope) error { calls++; return nil })
-		if _, err := app.Drain(context.Background(), "orders", 1); err != nil {
-			t.Fatal(err)
-		}
-		if calls != 0 {
-			t.Fatalf("handler ran %d times for a version-gated delivery", calls)
-		}
-		if len(tr.published) != 1 || len(tr.routes) != 1 || tr.routes[0] != gateRoute {
-			t.Fatalf("published = %d routes = %v; want one re-publish keeping %s", len(tr.published), tr.routes, gateRoute)
-		}
-		if tr.published[0] == string(raw) {
-			t.Fatal("body re-published unchanged (the endless release loop); want attempts incremented")
-		}
-		retried, _ := babelqueue.Decode([]byte(tr.published[0]))
-		if retried.Attempts != 1 {
-			t.Errorf("re-published attempts = %d, want 1", retried.Attempts)
-		}
-	})
+	strategies := map[string]string{
+		"release":     babelqueue.StrategyRelease,
+		"fail":        babelqueue.StrategyFail,
+		"dead-letter": babelqueue.StrategyDeadLetter,
+	}
+	for name, strategy := range strategies {
+		t.Run("maxAttempts 5 and "+name+" strategy: handler never runs, one DLQ record, no retry", func(t *testing.T) {
+			tr := &queueRecordingTransport{
+				InMemoryTransport: babelqueue.NewInMemoryTransport(),
+				next:              &babelqueue.ReceivedMessage{Body: string(raw), Queue: "orders", RouteURN: gateRoute},
+			}
+			app := babelqueue.NewApp(tr, babelqueue.WithMaxAttempts(5), babelqueue.WithDeadLetter(true),
+				babelqueue.WithUnknownURNStrategy(strategy))
+			calls := 0
+			app.Handle(bodyURN, func(context.Context, babelqueue.Envelope) error { calls++; return nil })
+			if _, err := app.Drain(context.Background(), "orders", 1); err != nil {
+				t.Fatal(err)
+			}
+			if calls != 0 {
+				t.Fatalf("handler ran %d times for a version-gated delivery", calls)
+			}
+			if len(tr.queues) != 1 || tr.queues[0] != "orders.dlq" {
+				t.Fatalf("re-published to %v; want exactly one record on orders.dlq (no retry on orders)", tr.queues)
+			}
+			if tr.acks != 1 {
+				t.Errorf("acks = %d, want 1", tr.acks)
+			}
+			dead, err := babelqueue.Decode([]byte(tr.bodies[0]))
+			if err != nil {
+				t.Fatalf("dead-letter record does not decode: %v", err)
+			}
+			if dead.Attempts != 0 {
+				t.Errorf("dead-letter attempts = %d, want 0 (no retry happened)", dead.Attempts)
+			}
+			if !strings.Contains(tr.bodies[0], "unknown_urn") || !strings.Contains(tr.bodies[0], "unsupported-schema-version:2") {
+				t.Errorf("dead-letter record lacks the unknown_urn reason or the rejected version: %s", tr.bodies[0])
+			}
+		})
+	}
 
-	t.Run("exhausted attempts dead-letter with the unknown_urn reason", func(t *testing.T) {
+	t.Run("routed publisher keeps the gate route on the DLQ record", func(t *testing.T) {
 		tr := &routedPublishTransport{routeTransport: routeTransport{
 			InMemoryTransport: babelqueue.NewInMemoryTransport(),
 			next:              &babelqueue.ReceivedMessage{Body: string(raw), Queue: "orders", RouteURN: gateRoute},
 		}}
-		app := babelqueue.NewApp(tr, babelqueue.WithMaxAttempts(1), babelqueue.WithDeadLetter(true),
+		app := babelqueue.NewApp(tr, babelqueue.WithMaxAttempts(5), babelqueue.WithDeadLetter(true),
 			babelqueue.WithUnknownURNStrategy(babelqueue.StrategyRelease))
 		app.Handle(bodyURN, func(context.Context, babelqueue.Envelope) error { return nil })
 		if _, err := app.Drain(context.Background(), "orders", 1); err != nil {
 			t.Fatal(err)
 		}
 		if len(tr.published) != 1 || tr.queues[0] != "orders.dlq" || tr.routes[0] != gateRoute {
-			t.Fatalf("dead-letter queues = %v routes = %v; want one orders.dlq record on %s", tr.queues, tr.routes, gateRoute)
-		}
-		if !strings.Contains(tr.published[0], "unknown_urn") {
-			t.Errorf("dead-letter record lacks the unknown_urn reason: %s", tr.published[0])
+			t.Fatalf("queues = %v routes = %v; want one orders.dlq record on %s", tr.queues, tr.routes, gateRoute)
 		}
 	})
 
-	t.Run("an undecodable gated body takes the same bounded path", func(t *testing.T) {
-		tr := &routedPublishTransport{routeTransport: routeTransport{
+	t.Run("an undecodable gated body is dead-lettered too", func(t *testing.T) {
+		tr := &queueRecordingTransport{
 			InMemoryTransport: babelqueue.NewInMemoryTransport(),
 			next:              &babelqueue.ReceivedMessage{Body: "not-json", Queue: "orders", RouteURN: gateRoute},
-		}}
-		app := babelqueue.NewApp(tr, babelqueue.WithMaxAttempts(1), babelqueue.WithDeadLetter(true),
+		}
+		app := babelqueue.NewApp(tr, babelqueue.WithMaxAttempts(5), babelqueue.WithDeadLetter(true),
 			babelqueue.WithUnknownURNStrategy(babelqueue.StrategyRelease))
 		if _, err := app.Drain(context.Background(), "orders", 1); err != nil {
 			t.Fatal(err)
 		}
-		if len(tr.published) != 1 || tr.queues[0] != "orders.dlq" {
-			t.Fatalf("dead-letter queues = %v; want one orders.dlq record", tr.queues)
+		if len(tr.queues) != 1 || tr.queues[0] != "orders.dlq" {
+			t.Fatalf("re-published to %v; want one orders.dlq record", tr.queues)
+		}
+	})
+
+	t.Run("dead-lettering off: dropped with an ack, nothing re-published", func(t *testing.T) {
+		tr := &queueRecordingTransport{
+			InMemoryTransport: babelqueue.NewInMemoryTransport(),
+			next:              &babelqueue.ReceivedMessage{Body: string(raw), Queue: "orders", RouteURN: gateRoute},
+		}
+		app := babelqueue.NewApp(tr, babelqueue.WithMaxAttempts(5), babelqueue.WithUnknownURNStrategy(babelqueue.StrategyRelease))
+		calls := 0
+		app.Handle(bodyURN, func(context.Context, babelqueue.Envelope) error { calls++; return nil })
+		if _, err := app.Drain(context.Background(), "orders", 1); err != nil {
+			t.Fatal(err)
+		}
+		if calls != 0 || len(tr.queues) != 0 || tr.acks != 1 {
+			t.Fatalf("calls = %d, re-published = %v, acks = %d; want 0, none, 1", calls, tr.queues, tr.acks)
 		}
 	})
 }
@@ -451,4 +505,271 @@ func TestAppUnknownRouteURNStillReleasesVerbatim(t *testing.T) {
 	if len(tr.published) != 1 || tr.published[0] != string(raw) || tr.routes[0] != routeURN {
 		t.Fatalf("published = %v routes = %v; want the original body re-published verbatim on %s", tr.published, tr.routes, routeURN)
 	}
+}
+
+// flakyDLQTransport redelivers its one message until it is acknowledged, and fails the first
+// failPublishes publishes (the dead-letter writes), recording every publish, ack and rewind.
+type flakyDLQTransport struct {
+	*babelqueue.InMemoryTransport
+	msg            *babelqueue.ReceivedMessage
+	acked          bool
+	failPublishes  int
+	publishQueues  []string
+	acks           int
+	rewinds        int
+	rewindErr      error
+	polls          int
+	withRewinder   bool
+	deadLettered   int
+	deadLetterBody string
+}
+
+func (f *flakyDLQTransport) Pop(context.Context, string, time.Duration) (*babelqueue.ReceivedMessage, error) {
+	f.polls++
+	if f.acked {
+		return nil, nil
+	}
+	m := *f.msg
+	return &m, nil
+}
+
+func (f *flakyDLQTransport) Publish(_ context.Context, queue, body string) error {
+	f.publishQueues = append(f.publishQueues, queue)
+	if f.failPublishes > 0 {
+		f.failPublishes--
+		return errors.New("dlq unavailable")
+	}
+	f.deadLettered++
+	f.deadLetterBody = body
+	return nil
+}
+
+func (f *flakyDLQTransport) Ack(context.Context, *babelqueue.ReceivedMessage) error {
+	f.acks++
+	f.acked = true
+	return nil
+}
+
+// rewindingFlakyDLQTransport adds the optional Rewinder capability.
+type rewindingFlakyDLQTransport struct{ *flakyDLQTransport }
+
+func (r rewindingFlakyDLQTransport) Rewind(context.Context, *babelqueue.ReceivedMessage) error {
+	r.rewinds++
+	return r.rewindErr
+}
+
+// A version-gated delivery whose dead-letter write fails is never lost: it is not acknowledged,
+// the failure is reported to the hook, the message is handed back for redelivery (Rewinder), the
+// handler never runs and nothing is re-published to the source queue (no retry). When the DLQ
+// recovers, the redelivered message is dead-lettered and only then acknowledged.
+func TestAppVersionGatedDeadLetterFailureIsNotAcked(t *testing.T) {
+	const bodyURN = "urn:babel:orders:created"
+	const gateRoute = "babelqueue:unsupported-schema-version:2"
+	env, err := babelqueue.Make(bodyURN, map[string]any{"order_id": 1}, babelqueue.WithQueue("orders"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := env.Encode()
+
+	newFlaky := func(failures int) *flakyDLQTransport {
+		return &flakyDLQTransport{
+			InMemoryTransport: babelqueue.NewInMemoryTransport(),
+			msg:               &babelqueue.ReceivedMessage{Body: string(raw), Queue: "orders", RouteURN: gateRoute},
+			failPublishes:     failures,
+		}
+	}
+
+	t.Run("failed write: no ack, hook fired, rewound, handler never runs, no retry publish", func(t *testing.T) {
+		base := newFlaky(1000)
+		tr := rewindingFlakyDLQTransport{base}
+		var hookErrs []error
+		app := babelqueue.NewApp(tr, babelqueue.WithMaxAttempts(5), babelqueue.WithDeadLetter(true),
+			babelqueue.WithRewindPause(0),
+			babelqueue.WithDeadLetterErrorHandler(func(_ context.Context, _ *babelqueue.ReceivedMessage, err error) {
+				hookErrs = append(hookErrs, err)
+			}))
+		calls := 0
+		app.Handle(bodyURN, func(context.Context, babelqueue.Envelope) error { calls++; return nil })
+		if _, err := app.Drain(context.Background(), "orders", 3); err != nil {
+			t.Fatal(err)
+		}
+		if calls != 0 {
+			t.Fatalf("handler ran %d times for a version-gated delivery", calls)
+		}
+		if base.acks != 0 {
+			t.Fatalf("acks = %d; a message whose dead-letter write failed must not be acknowledged", base.acks)
+		}
+		for _, q := range base.publishQueues {
+			if q != "orders.dlq" {
+				t.Fatalf("published to %q; only the DLQ may be written (no retry re-publish): %v", q, base.publishQueues)
+			}
+		}
+		if len(hookErrs) != 3 {
+			t.Fatalf("hook reports = %d, want 3 (one per failed write)", len(hookErrs))
+		}
+		if base.rewinds != 3 {
+			t.Fatalf("rewinds = %d, want 3", base.rewinds)
+		}
+	})
+
+	t.Run("DLQ recovers: redelivered message is dead-lettered once, then acknowledged", func(t *testing.T) {
+		base := newFlaky(2)
+		var rewound int
+		tr := &countingRewinder{flakyDLQTransport: base, rewound: &rewound}
+		app := babelqueue.NewApp(tr, babelqueue.WithMaxAttempts(5), babelqueue.WithDeadLetter(true),
+			babelqueue.WithRewindPause(0))
+		calls := 0
+		app.Handle(bodyURN, func(context.Context, babelqueue.Envelope) error { calls++; return nil })
+		if _, err := app.Drain(context.Background(), "orders", 5); err != nil {
+			t.Fatal(err)
+		}
+		if calls != 0 {
+			t.Fatalf("handler ran %d times", calls)
+		}
+		if rewound != 2 {
+			t.Errorf("rewinds = %d, want 2 (one per failed write)", rewound)
+		}
+		if base.deadLettered != 1 || base.acks != 1 {
+			t.Fatalf("dead-lettered = %d, acks = %d; want exactly one DLQ record and one ack", base.deadLettered, base.acks)
+		}
+		if len(base.publishQueues) != 3 {
+			t.Errorf("publishes = %v, want 3 DLQ attempts", base.publishQueues)
+		}
+	})
+
+	t.Run("a transport without Rewinder leaves the message unacked and does not panic", func(t *testing.T) {
+		base := newFlaky(1000)
+		app := babelqueue.NewApp(base, babelqueue.WithMaxAttempts(5), babelqueue.WithDeadLetter(true),
+			babelqueue.WithRewindPause(0))
+		if _, err := app.Drain(context.Background(), "orders", 1); err != nil {
+			t.Fatal(err)
+		}
+		if base.acks != 0 {
+			t.Fatalf("acks = %d, want 0", base.acks)
+		}
+	})
+
+	t.Run("a failing rewind is reported to the hook too", func(t *testing.T) {
+		base := newFlaky(1000)
+		var rewound int
+		tr := &countingRewinder{flakyDLQTransport: base, rewound: &rewound, err: errors.New("rewind failed")}
+		var hookErrs []error
+		app := babelqueue.NewApp(tr, babelqueue.WithDeadLetter(true), babelqueue.WithRewindPause(0),
+			babelqueue.WithDeadLetterErrorHandler(func(_ context.Context, _ *babelqueue.ReceivedMessage, err error) {
+				hookErrs = append(hookErrs, err)
+			}))
+		if _, err := app.Drain(context.Background(), "orders", 1); err != nil {
+			t.Fatal(err)
+		}
+		if len(hookErrs) != 2 || base.acks != 0 {
+			t.Fatalf("hook errors = %d (want write + rewind = 2), acks = %d (want 0)", len(hookErrs), base.acks)
+		}
+	})
+
+	t.Run("DLQ record carries only the transport-bounded rejected value", func(t *testing.T) {
+		base := newFlaky(0)
+		bounded := babelqueue.TruncateDeclaredVersion(strings.Repeat("9", 5000))
+		base.msg.RouteURN = "babelqueue:unsupported-schema-version:" + bounded
+		app := babelqueue.NewApp(base, babelqueue.WithDeadLetter(true))
+		if _, err := app.Drain(context.Background(), "orders", 1); err != nil {
+			t.Fatal(err)
+		}
+		if base.deadLettered != 1 || base.acks != 1 {
+			t.Fatalf("dead-lettered = %d, acks = %d", base.deadLettered, base.acks)
+		}
+		if !strings.Contains(base.deadLetterBody, strings.Repeat("9", 64)+"...") || len(base.deadLetterBody) > 2000 {
+			t.Fatalf("DLQ record must name the 64-char bounded value and stay small (len %d)", len(base.deadLetterBody))
+		}
+	})
+
+	t.Run("StrategyDelete drops a gated delivery with an ack even with dead-lettering on (Python parity)", func(t *testing.T) {
+		base := newFlaky(0)
+		app := babelqueue.NewApp(base, babelqueue.WithDeadLetter(true),
+			babelqueue.WithUnknownURNStrategy(babelqueue.StrategyDelete))
+		if _, err := app.Drain(context.Background(), "orders", 1); err != nil {
+			t.Fatal(err)
+		}
+		if base.acks != 1 || len(base.publishQueues) != 0 {
+			t.Fatalf("acks = %d, publishes = %v; want a plain drop", base.acks, base.publishQueues)
+		}
+	})
+}
+
+type countingRewinder struct {
+	*flakyDLQTransport
+	rewound *int
+	err     error
+}
+
+func (c *countingRewinder) Rewind(context.Context, *babelqueue.ReceivedMessage) error {
+	*c.rewound++
+	return c.err
+}
+
+func TestTruncateDeclaredVersion(t *testing.T) {
+	long := strings.Repeat("9", 5000)
+	if got, want := babelqueue.TruncateDeclaredVersion(long), strings.Repeat("9", 64)+"..."; got != want {
+		t.Fatalf("5000-char value: len %d, want %d", len(got), len(want))
+	}
+	exact := strings.Repeat("v", 64)
+	if got := babelqueue.TruncateDeclaredVersion(exact); got != exact {
+		t.Fatalf("exactly 64 characters must be unchanged, got %q", got)
+	}
+	if got := babelqueue.TruncateDeclaredVersion(exact + "x"); got != exact+"..." {
+		t.Fatalf("65 characters: got %q", got)
+	}
+	multibyte := strings.Repeat("ğ", 70)
+	if got := babelqueue.TruncateDeclaredVersion(multibyte); got != strings.Repeat("ğ", 64)+"..." {
+		t.Fatalf("multibyte values are cut on a rune boundary, got %q", got)
+	}
+	if got := babelqueue.TruncateDeclaredVersion(""); got != "" {
+		t.Fatalf("empty: %q", got)
+	}
+}
+
+// The dead-letter error hook runs after the message is handed back, and a panic in it is
+// recovered: Rewind is still called, nothing is acknowledged and the consume loop carries on.
+func TestAppDeadLetterErrorHookPanicDoesNotSkipRewind(t *testing.T) {
+	env, err := babelqueue.Make("urn:babel:orders:created", map[string]any{"order_id": 1}, babelqueue.WithQueue("orders"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := env.Encode()
+	base := &flakyDLQTransport{
+		InMemoryTransport: babelqueue.NewInMemoryTransport(),
+		msg: &babelqueue.ReceivedMessage{Body: string(raw), Queue: "orders",
+			RouteURN: "babelqueue:unsupported-schema-version:2"},
+		failPublishes: 1000,
+	}
+	var order []string
+	tr := &orderedRewinder{flakyDLQTransport: base, order: &order}
+	app := babelqueue.NewApp(tr, babelqueue.WithDeadLetter(true), babelqueue.WithRewindPause(0),
+		babelqueue.WithDeadLetterErrorHandler(func(context.Context, *babelqueue.ReceivedMessage, error) {
+			order = append(order, "hook")
+			panic("boom")
+		}))
+	n, err := app.Drain(context.Background(), "orders", 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != 3 {
+		t.Fatalf("processed %d deliveries, want 3 (the loop must survive a panicking hook)", n)
+	}
+	if base.acks != 0 {
+		t.Fatalf("acks = %d, want 0", base.acks)
+	}
+	want := []string{"rewind", "hook", "rewind", "hook", "rewind", "hook"}
+	if strings.Join(order, ",") != strings.Join(want, ",") {
+		t.Fatalf("order = %v, want %v (rewind first, then the hook)", order, want)
+	}
+}
+
+type orderedRewinder struct {
+	*flakyDLQTransport
+	order *[]string
+}
+
+func (o *orderedRewinder) Rewind(context.Context, *babelqueue.ReceivedMessage) error {
+	*o.order = append(*o.order, "rewind")
+	return nil
 }

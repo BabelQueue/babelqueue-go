@@ -9,6 +9,67 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Fixed
+
+- **core `App`: a version-gated delivery is dead-lettered directly, with no retry.** A delivery
+  whose transport handed it over under the reserved `babelqueue:unsupported-schema-version:<v>`
+  route (the `bq-schema-version` gate) can never be handled by any registered handler, so
+  retrying it only delays the same outcome. The `App` no longer sends it through `routePoison`'s
+  bounded retry: with `WithDeadLetter(true)` (or `StrategyDeadLetter`) it publishes one annotated
+  record (reason `unknown_urn`, the rejected version in the recorded cause) to the dead-letter
+  queue and acknowledges the original, and without dead-lettering it acknowledges (drops) it. This
+  holds for the `StrategyFail`, `StrategyRelease` and `StrategyDeadLetter` strategies, for any `WithMaxAttempts`,
+  for an undecodable body, and for every transport that gates (`pulsar`, `sqs`, `azureservicebus`,
+  `kafka`, `artemis`), matching the Python SDK. Handler failures and genuinely unknown URNs keep
+  their bounded retry. `StrategyDelete` is the exception, as in the Python SDK: it drops a
+  version-gated delivery (acknowledged, no dead-letter record) even with dead-lettering on. No
+  wire change. Transports must pin the core release that carries this change to get the direct
+  dead-letter path.
+- **core `App`: a version-gated delivery whose dead-letter write fails is never acknowledged.**
+  The failure is logged (`log/slog`) and reported to the new
+  `WithDeadLetterErrorHandler(func(ctx, msg, err))` hook; the handler is never called and the
+  retry path is never used. The message is handed back to the broker through the new optional
+  `Rewinder` transport interface (`Rewind(ctx, msg)`), then the consume loop pauses
+  `WithRewindPause(d)` (default 1s, as in the Python SDK) before the next poll. Transports
+  without `Rewinder` (`sqs`: the message reappears after its visibility timeout) simply leave it
+  unacknowledged. `kafka` implements `Rewind` by closing the cached group reader so the next
+  `Pop` resumes from the last committed offset, i.e. the failed record: because the offset
+  commit is cumulative, the commit never passes it. `artemis` releases the delivery
+  (`ReleaseMessage`), `azureservicebus` abandons the lock (`AbandonMessage`). New exported API:
+  `Rewinder`, `WithDeadLetterErrorHandler`, `WithRewindPause`, `TruncateDeclaredVersion`.
+  The message is handed back (`Rewind`) before the hook is called, and a panic in the hook is
+  recovered and logged, so a faulty hook cannot keep the message from being rewound.
+  Transports must pin the core release that carries these additions.
+- **`pulsar`: implements `Rewinder`.** When the `App` cannot write the dead-letter record for a
+  version-gated message, `pulsar.Transport.Rewind` hands it back with `Nack` on the consumer so
+  the broker redelivers it after the negative-ack delay; the message is never acked. The package
+  doc no longer describes the gate as going through the bounded retry path (it is dead-lettered
+  directly). Pin the `pulsar` module to the core release that carries `Rewinder`.
+- **`sqs`, `azureservicebus`, `kafka`, `artemis`: the rejected `bq-schema-version` is bounded.**
+  The declared value placed in the `WithOnSchemaVersionRejected` hook, in the reserved route and
+  therefore in the dead-letter record's error is at most its first 64 characters plus `...`
+  (`babelqueue.TruncateDeclaredVersion`), matching the Java and .NET SDKs; the gate comparison
+  itself still uses the full value.
+- **`sqs`, `azureservicebus`, `kafka`, `artemis`: pre-decode `schema-version` gate** (broker-bindings
+  §3.7, §4.7, §6.3/§6.7, §7.7). `Pop` now reads the `bq-schema-version` message attribute /
+  application property / record header (`bq_schema_version` on Artemis, ADR-0017) before it decodes
+  the body, like the `pulsar` module already did. A missing or blank (ASCII whitespace) value takes
+  the normal path; any other value that is not exactly the core's supported version (compared as-is,
+  never trimmed) is not decoded and is routed through the core's reserved
+  `babelqueue:unsupported-schema-version:<v>` route, so the `App` dead-letters it directly (see
+  the core entry above) instead of mis-decoding a future-version body. On Azure Service Bus the
+  application property is AMQP-typed: the string `"1"` and a native integer `1` of any width
+  (signed or unsigned) are accepted, and so is a null value (it carries no version, so it takes the
+  normal path like a missing property); every other value or type is rejected, floating-point
+  values included (`1.0` too), as in the Java and .NET SDKs. Each module gains the optional
+  `WithOnSchemaVersionRejected(func(version, queue string))` hook (same signature as `pulsar`).
+  The only API addition; no wire change (`schema_version` stays `1`). On `kafka` the rejected
+  record's delivery count is derived from its `bq-attempts` header.
+- **`sqs`, `azureservicebus`, `kafka`, `artemis`: core pin raised to `v1.10.0`.** `sqs` still
+  required `v1.9.0`, which predates `ReceivedMessage.RouteURN` and the reserved route; the local
+  `replace => ../` hid the mismatch from the repo's own tests but not from a consumer. `pulsar`
+  gains only the shared conformance reader for `schema_version_gate` (its gate is unchanged).
+
 ## [1.10.0] - 2026-10-10
 
 ### Added

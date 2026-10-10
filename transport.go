@@ -89,6 +89,18 @@ type Releaser interface {
 	Release(ctx context.Context, msg *ReceivedMessage, delay time.Duration) error
 }
 
+// Rewinder is an optional [Transport] capability: hand an unacknowledged reserved message back to
+// the broker so it is redelivered, and make sure nothing the consumer acknowledges afterwards can
+// move past it. The [App] uses it when a version-gated delivery could not be dead-lettered and
+// must not be lost: for an offset-committing broker (Kafka, where a commit is cumulative) it
+// rewinds the consumer to the message's offset; for a lock-based broker it releases or abandons
+// the lock. A transport whose unacknowledged messages already come back on their own (SQS
+// visibility timeout) need not implement it. It must never delete or acknowledge the message,
+// and must not alter its body or attempt counters.
+type Rewinder interface {
+	Rewind(ctx context.Context, msg *ReceivedMessage) error
+}
+
 // InMemoryTransport is an in-process [Transport] for tests and broker-free local
 // runs. It is safe for concurrent use. Pop returns immediately (it does not block
 // for the timeout) — when the queue is empty it returns (nil, nil).
