@@ -9,6 +9,19 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.11.0] - 2026-10-10
+
+### Added
+
+- **core: `Rewinder`, `WithDeadLetterErrorHandler`, `WithRewindPause`, `TruncateDeclaredVersion`.**
+  New exported API for the version-gate dead-letter path: the optional `Rewinder` transport
+  interface (`Rewind(ctx, msg)`), the `WithDeadLetterErrorHandler(func(ctx, msg, err))` hook, the
+  `WithRewindPause(d)` option and the `TruncateDeclaredVersion` helper. See the `### Fixed`
+  entries below for the behaviour.
+- **`sqs`, `azureservicebus`, `kafka`, `artemis`: `WithOnSchemaVersionRejected(func(version, queue string))`**
+  option (same signature as `pulsar`), and `Rewind` on `pulsar`, `azureservicebus`, `kafka` and
+  `artemis` (implementing `Rewinder`). No wire change.
+
 ### Fixed
 
 - **core `App`: a version-gated delivery is dead-lettered directly, with no retry.** A delivery
@@ -65,10 +78,19 @@ The envelope wire format is versioned separately by `meta.schema_version`
   `WithOnSchemaVersionRejected(func(version, queue string))` hook (same signature as `pulsar`).
   The only API addition; no wire change (`schema_version` stays `1`). On `kafka` the rejected
   record's delivery count is derived from its `bq-attempts` header.
-- **`sqs`, `azureservicebus`, `kafka`, `artemis`: core pin raised to `v1.10.0`.** `sqs` still
-  required `v1.9.0`, which predates `ReceivedMessage.RouteURN` and the reserved route; the local
-  `replace => ../` hid the mismatch from the repo's own tests but not from a consumer. `pulsar`
-  gains only the shared conformance reader for `schema_version_gate` (its gate is unchanged).
+- **`sqs`, `azureservicebus`, `kafka`, `artemis`, `pulsar`: core pin raised to `v1.11.0`.** The
+  modules depend on the `Rewinder` interface and the direct dead-letter path of this core release
+  (and `sqs` previously required `v1.9.0`, which predates `ReceivedMessage.RouteURN` and the
+  reserved route); the local `replace => ../` hides a stale pin from the repo's own tests but not
+  from a consumer. `pulsar` additionally gains the shared conformance reader for
+  `schema_version_gate` (its gate is unchanged).
+
+### Release note for the transport modules
+
+Tag the core `v1.11.0` first (new exported core API: `Rewinder`, `WithDeadLetterErrorHandler`,
+`WithRewindPause`, `TruncateDeclaredVersion` - MINOR), then the modules: `sqs/v1.10.0`,
+`azureservicebus/v1.1.0`, `kafka/v1.1.0`, `artemis/v1.1.0` (each: new `WithOnSchemaVersionRejected`
+option, MINOR) and `pulsar/v1.2.0` (new `Transport.Rewind`, MINOR).
 
 ## [1.10.0] - 2026-10-10
 
