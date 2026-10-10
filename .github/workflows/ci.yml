@@ -4,6 +4,7 @@ on:
   push:
     branches: [ main ]
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -225,6 +226,66 @@ jobs:
         env:
           BABELQUEUE_TEST_PG: postgres://postgres:postgres@localhost:5432/postgres?sslmode=disable
         run: go test -race -count=1 ./...
+
+  # Optional live-broker tests (Kafka §6, Artemis §7). Not a required check: it has no `needs`,
+  # is not listed in ci-green, and never runs on pull requests. The tests skip themselves
+  # unless BQ_INTEGRATION=1 is set, so the regular `go test ./...` never needs a broker.
+  integration-live:
+    name: integration (live Kafka + Artemis)
+    if: ${{ github.event_name == 'push' || github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      kafka:
+        image: apache/kafka:3.9.0
+        ports:
+          - 9092:9092
+        env:
+          KAFKA_NODE_ID: 1
+          KAFKA_PROCESS_ROLES: broker,controller
+          KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+          KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+          KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+          KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+          KAFKA_CONTROLLER_QUORUM_VOTERS: 1@localhost:9093
+          KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+          KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+          KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+        options: >-
+          --health-cmd "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"
+          --health-interval 10s --health-timeout 10s --health-retries 12 --health-start-period 20s
+      artemis:
+        image: apache/activemq-artemis:2.37.0
+        env:
+          ARTEMIS_USER: artemis
+          ARTEMIS_PASSWORD: artemis
+          ANONYMOUS_LOGIN: "true"
+        ports:
+          - 5672:5672
+        options: >-
+          --health-cmd "/var/lib/artemis-instance/bin/artemis check node --up --user artemis --password artemis"
+          --health-interval 10s --health-timeout 10s --health-retries 12 --health-start-period 20s
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "stable"
+
+      - name: Kafka live tests
+        working-directory: kafka
+        env:
+          BQ_INTEGRATION: "1"
+          BQ_KAFKA_BROKERS: localhost:9092
+        run: go test -count=1 -v -run Integration ./...
+
+      - name: Artemis live tests
+        working-directory: artemis
+        env:
+          BQ_INTEGRATION: "1"
+          BQ_ARTEMIS_URL: amqp://localhost:5672
+        run: go test -count=1 -v -run Integration ./...
 
   conformance:
     name: Conformance suite in sync
