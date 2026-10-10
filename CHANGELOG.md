@@ -9,6 +9,28 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Fixed
+
+- **core `App`: an undecodable (poison) body is dead-lettered wrapped, with no retry.** Previously the
+  `StrategyRelease` (and `StrategyFail` / `StrategyDeadLetter`) paths handed a body that does not
+  decode to the retry machinery with an empty `Envelope`, which re-published an empty envelope and
+  finally dead-lettered an annotated empty one, so the original body was lost. With dead-lettering
+  on (`WithDeadLetter(true)` or `StrategyDeadLetter`) the body is now dead-lettered at once, never
+  retried, and acknowledged only after the DLQ write succeeded. The record follows the PHP
+  reference (ADR-0009, `error-handling.md` §6): a body that is a JSON object keeps its keys and
+  values (key order and whitespace are normalised), any other body is carried as
+  `{"raw": <body>}`, and a `dead_letter` block with `reason: "poison"` is added (a body that is
+  not valid UTF-8 is stored with U+FFFD substitutions). A failed write is not acknowledged:
+  the message is handed back (`Rewinder` when the transport has it, otherwise it stays reserved), and the failure is reported to
+  `WithDeadLetterErrorHandler`.
+  `StrategyDelete` still drops it, and with dead-lettering off the behaviour is unchanged.
+- **core `App`: a failed dead-letter write is no longer swallowed.** After retries were exhausted
+  (or for an unknown URN under `StrategyDeadLetter`) the `App` ignored a DLQ publish error and
+  acknowledged the message anyway, losing it. It is now left unacknowledged and handed back the
+  same way as a version-gated delivery. Note that on redelivery the handler runs again until the
+  DLQ write succeeds (with a `Rewinder` transport, paced by `WithRewindPause`, 1s by default), so
+  a handler with side effects should be idempotent (see the idempotency helper, ADR-0022).
+
 ## [1.11.0] - 2026-10-10
 
 ### Added

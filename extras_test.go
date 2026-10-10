@@ -350,21 +350,37 @@ func (d *deliveryCountTransport) Ack(context.Context, *ReceivedMessage) error {
 	return d.ackErr
 }
 
-func TestAppDeliveryCountBoundsUndecodableRelease(t *testing.T) {
+// An undecodable body is never retried when dead-lettering is on: it goes to the DLQ at once,
+// with its original object kept and a poison dead_letter block, whatever the delivery count.
+func TestAppUndecodableBodyIsDeadLetteredRawWithoutRetry(t *testing.T) {
+	const body = `{"job":"urn:x","data":[1]}`
 	tr := &deliveryCountTransport{InMemoryTransport: NewInMemoryTransport()}
 	app := NewApp(tr, WithDefaultQueue("orders"), WithMaxAttempts(3), WithDeadLetter(true))
-	if err := tr.InMemoryTransport.Publish(context.Background(), "orders", `{"job":"urn:x","data":[1]}`); err != nil {
+	if err := tr.InMemoryTransport.Publish(context.Background(), "orders", body); err != nil {
 		t.Fatal(err)
 	}
 	n, err := app.Drain(context.Background(), "orders", 50)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n != 3 {
-		t.Fatalf("deliveries = %d, want 3", n)
+	if n != 1 {
+		t.Fatalf("deliveries = %d, want 1 (no retry)", n)
 	}
 	if tr.Size("orders") != 0 || tr.Size("orders.dlq") != 1 {
 		t.Errorf("orders=%d dlq=%d, want 0/1", tr.Size("orders"), tr.Size("orders.dlq"))
+	}
+	dl, err := tr.InMemoryTransport.Pop(context.Background(), "orders.dlq", 0)
+	if err != nil || dl == nil {
+		t.Fatalf("DLQ record = %+v (err %v), want one record", dl, err)
+	}
+	var rec struct {
+		Job        string `json:"job"`
+		DeadLetter struct {
+			Reason string `json:"reason"`
+		} `json:"dead_letter"`
+	}
+	if err := json.Unmarshal([]byte(dl.Body), &rec); err != nil || rec.Job != "urn:x" || rec.DeadLetter.Reason != "poison" {
+		t.Errorf("DLQ record = %q (err %v), want the original job and reason poison", dl.Body, err)
 	}
 }
 
@@ -447,8 +463,11 @@ func TestAppReleaseUnsupportedIsNotReported(t *testing.T) {
 	}
 }
 
+// A body that decodes but names no URN stays bounded by WithMaxAttempts under StrategyRelease.
+// (Undecodable bodies are dead-lettered raw without a retry; see
+// TestAppUndecodableBodyIsDeadLetteredRawWithoutRetry.)
 func TestAppReleaseStrategyBoundsPoisonBodies(t *testing.T) {
-	bodies := []string{`not json`, `{"job":"urn:x","data":[1]}`, `{"trace_id":"t","data":{}}`}
+	bodies := []string{`{"trace_id":"t","data":{}}`}
 	for _, body := range bodies {
 		// In-place release (native delivery count) and re-publish fallback.
 		for _, inPlace := range []bool{true, false} {

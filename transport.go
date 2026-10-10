@@ -91,11 +91,11 @@ type Releaser interface {
 
 // Rewinder is an optional [Transport] capability: hand an unacknowledged reserved message back to
 // the broker so it is redelivered, and make sure nothing the consumer acknowledges afterwards can
-// move past it. The [App] uses it when a version-gated delivery could not be dead-lettered and
-// must not be lost: for an offset-committing broker (Kafka, where a commit is cumulative) it
-// rewinds the consumer to the message's offset; for a lock-based broker it releases or abandons
-// the lock. A transport whose unacknowledged messages already come back on their own (SQS
-// visibility timeout) need not implement it. It must never delete or acknowledge the message,
+// move past it. The [App] uses it when a message could not be dead-lettered (a version-gated
+// delivery, an undecodable body, or a message whose retries are exhausted) and must not be
+// lost: for an offset-committing broker (Kafka, where a commit is cumulative) it rewinds the
+// consumer to the message's offset; for a lock-based broker it releases or abandons the lock.
+// A transport whose unacknowledged messages already come back on their own (SQS visibility timeout) need not implement it. It must never delete or acknowledge the message,
 // and must not alter its body or attempt counters.
 type Rewinder interface {
 	Rewind(ctx context.Context, msg *ReceivedMessage) error

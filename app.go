@@ -1,9 +1,12 @@
 package babelqueue
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"strings"
 	"time"
@@ -110,19 +113,20 @@ func WithReleaseErrorHandler(fn func(ctx context.Context, msg *ReceivedMessage, 
 	return func(a *App) { a.onReleaseError = fn }
 }
 
-// WithDeadLetterErrorHandler registers fn to observe a failed dead-letter write of a
-// version-gated delivery (the publish to the DLQ, or the record's encoding, failed). Such a
-// delivery is never acknowledged on that path: the App logs the failure, reports it here, hands
-// the message back to the broker (see [Rewinder]) and never retries it or runs a handler, so the
-// gate rejects it again on redelivery and the dead-letter write is retried. Without a handler the
-// error is only logged.
+// WithDeadLetterErrorHandler registers fn to observe a failed dead-letter write (the publish to
+// the DLQ, or the record's encoding, failed). It fires on three paths: a version-gated delivery,
+// an undecodable (poison) body, and a message whose retries are exhausted (or that hit
+// [StrategyDeadLetter] for an unknown URN). Such a message is never acknowledged: the App logs the
+// failure, reports it here and hands the message back to the broker (see [Rewinder]). The gate and
+// poison paths never run a handler; an exhausted message is delivered again, so its handler runs
+// again until the DLQ write succeeds. Without a handler the error is only logged.
 func WithDeadLetterErrorHandler(fn func(ctx context.Context, msg *ReceivedMessage, err error)) AppOption {
 	return func(a *App) { a.onDeadLetterErr = fn }
 }
 
-// WithRewindPause sets how long the App waits after handing an unsettled version-gated message
-// back to the broker before polling again (default 1s), so a persistent dead-letter outage does
-// not spin.
+// WithRewindPause sets how long the App waits after handing a message whose dead-letter write
+// failed (version-gated, poison, or retries exhausted) back to the broker before polling again
+// (default 1s), so a persistent dead-letter outage does not spin.
 func WithRewindPause(d time.Duration) AppOption { return func(a *App) { a.rewindPause = d } }
 
 // NewApp builds a runtime over the given transport.
@@ -356,24 +360,25 @@ func (a *App) settleVersionGated(ctx context.Context, msg *ReceivedMessage, env 
 	}
 	cause := fmt.Errorf("%w: %q", ErrUnknownURN, msg.RouteURN)
 	if err := a.writeDeadLetter(ctx, msg, env, "unknown_urn", cause); err != nil {
-		a.leaveGatedUnsettled(ctx, msg, err)
+		a.leaveDeadLetterUnsettled(ctx, msg, err, "a version-gated message")
 		return
 	}
 	a.ack(ctx, msg)
 }
 
-// leaveGatedUnsettled reports a failed dead-letter write of a version-gated delivery and hands
-// the unacknowledged message back to the broker. The message is settled first (Rewind) and the
-// failure is reported to the [WithDeadLetterErrorHandler] hook afterwards, so a misbehaving hook
-// can never keep the message from being handed back; a panic in the hook is recovered and logged.
-func (a *App) leaveGatedUnsettled(ctx context.Context, msg *ReceivedMessage, err error) {
-	slog.ErrorContext(ctx, "babelqueue: dead-lettering a version-gated message failed; it was not acknowledged and will be redelivered",
+// leaveDeadLetterUnsettled reports a failed dead-letter write of subject (e.g. a version-gated
+// or poison message) and hands the unacknowledged message back to the broker. The message is
+// settled first (Rewind) and the failure is reported to the [WithDeadLetterErrorHandler] hook
+// afterwards, so a misbehaving hook can never keep the message from being handed back; a panic
+// in the hook is recovered and logged.
+func (a *App) leaveDeadLetterUnsettled(ctx context.Context, msg *ReceivedMessage, err error, subject string) {
+	slog.ErrorContext(ctx, "babelqueue: dead-lettering "+subject+" failed; it was not acknowledged and will be redelivered",
 		"queue", msg.Queue, "route", msg.RouteURN, "error", err)
 	var rewindErr error
 	rw, canRewind := a.transport.(Rewinder)
 	if canRewind {
 		if rewindErr = rw.Rewind(ctx, msg); rewindErr != nil {
-			slog.ErrorContext(ctx, "babelqueue: rewinding an unsettled version-gated message failed",
+			slog.ErrorContext(ctx, "babelqueue: rewinding an unsettled dead-letter candidate failed",
 				"queue", msg.Queue, "error", rewindErr)
 		}
 	}
@@ -409,7 +414,17 @@ func (a *App) reportDeadLetterError(ctx context.Context, msg *ReceivedMessage, e
 // registered for it, so the unknown-URN strategy applies except [StrategyRelease]: releasing
 // would redeliver it forever, so it takes the bounded [StrategyFail] path instead (retries up
 // to WithMaxAttempts, floored by the broker's delivery count, then dead-letter or drop).
+//
+// An undecodable body (decodeErr != nil) is the exception to every retrying path: when
+// dead-lettering is on (WithDeadLetter, or [StrategyDeadLetter]) it is never retried — a retry
+// could only re-publish an empty envelope and lose the body — and it is written to the DLQ
+// wrapped with its original body preserved (see settleRawPoison). [StrategyDelete] still drops
+// it, and with dead-lettering off the strategy paths below apply unchanged.
 func (a *App) routePoison(ctx context.Context, msg *ReceivedMessage, env Envelope, decodeErr error) {
+	if decodeErr != nil && a.onUnknownURN != StrategyDelete && (a.deadLetter || a.onUnknownURN == StrategyDeadLetter) {
+		a.settleRawPoison(ctx, msg, decodeErr)
+		return
+	}
 	if a.onUnknownURN != StrategyRelease {
 		a.routeUnknown(ctx, "", msg, env)
 		return
@@ -419,6 +434,63 @@ func (a *App) routePoison(ctx context.Context, msg *ReceivedMessage, env Envelop
 		cause = fmt.Errorf("%w: undecodable body: %v", ErrUnknownURN, decodeErr)
 	}
 	a.retryOrDeadLetter(ctx, msg, env, cause)
+}
+
+// settleRawPoison dead-letters an undecodable body without retrying it. The DLQ record follows
+// the PHP reference (ADR-0009, error-handling §6): a body that is a JSON object is kept verbatim
+// and a body that is not is wrapped as {"raw": <body>}, then annotated with a dead_letter block
+// (reason "poison"); see poisonDeadLetterBody. It is acknowledged only after the DLQ write
+// succeeded; otherwise it is left unacknowledged and handed back to the broker, the same way a
+// failed version-gate dead-letter write is (see leaveDeadLetterUnsettled).
+func (a *App) settleRawPoison(ctx context.Context, msg *ReceivedMessage, decodeErr error) {
+	body, err := poisonDeadLetterBody(msg, decodeErr)
+	if err == nil {
+		err = a.republish(ctx, msg, a.deadLetterTarget(msg), string(body))
+	}
+	if err != nil {
+		a.leaveDeadLetterUnsettled(ctx, msg, err, "an undecodable message")
+		return
+	}
+	a.ack(ctx, msg)
+}
+
+// poisonDeadLetterBody builds the DLQ record for an undecodable body. A body that is a single JSON
+// object keeps its keys and values (numbers are not re-formatted; key order and whitespace are
+// normalised); anything else is carried as the string value of "raw" (a body that is not valid
+// UTF-8 cannot be represented in JSON and is stored with U+FFFD substitutions). The dead_letter block is the one [Annotate] writes, with the poison
+// reason and the decode error as its cause.
+func poisonDeadLetterBody(msg *ReceivedMessage, decodeErr error) ([]byte, error) {
+	record, ok := decodeJSONObject(msg.Body)
+	if !ok {
+		record = map[string]any{"raw": msg.Body}
+	}
+	attempts := msg.DeliveryCount - 1
+	if attempts < 0 {
+		attempts = 0
+	}
+	record["dead_letter"] = Annotate(Envelope{}, "poison", msg.Queue, attempts, decodeErr).DeadLetter
+
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(record); err != nil {
+		return nil, err
+	}
+	return bytes.TrimRight(buf.Bytes(), "\n"), nil
+}
+
+// decodeJSONObject parses body as exactly one JSON object, keeping numbers as json.Number.
+func decodeJSONObject(body string) (map[string]any, bool) {
+	dec := json.NewDecoder(strings.NewReader(body))
+	dec.UseNumber()
+	var obj map[string]any
+	if err := dec.Decode(&obj); err != nil || obj == nil {
+		return nil, false
+	}
+	if _, err := dec.Token(); err != io.EOF {
+		return nil, false
+	}
+	return obj, true
 }
 
 func (a *App) routeUnknown(ctx context.Context, urn string, msg *ReceivedMessage, env Envelope) {
@@ -503,8 +575,24 @@ func (a *App) release(ctx context.Context, msg *ReceivedMessage, delay time.Dura
 }
 
 func (a *App) deadLetterMessage(ctx context.Context, msg *ReceivedMessage, env Envelope, reason string, cause error) {
-	_ = a.writeDeadLetter(ctx, msg, env, reason, cause)
+	if err := a.writeDeadLetter(ctx, msg, env, reason, cause); err != nil {
+		// Never ack a message whose dead-letter record was not written.
+		subject := "a failed message"
+		if reason == "unknown_urn" {
+			subject = "an unknown-URN message"
+		}
+		a.leaveDeadLetterUnsettled(ctx, msg, err, subject)
+		return
+	}
 	a.ack(ctx, msg)
+}
+
+// deadLetterTarget is the queue msg's dead-letter record is written to.
+func (a *App) deadLetterTarget(msg *ReceivedMessage) string {
+	if a.deadLetterQueue != "" {
+		return a.deadLetterQueue
+	}
+	return msg.Queue + a.deadLetterSuffix
 }
 
 // writeDeadLetter encodes the annotated dead-letter record and publishes it to the DLQ. It does
@@ -516,13 +604,9 @@ func (a *App) writeDeadLetter(ctx context.Context, msg *ReceivedMessage, env Env
 	}
 	annotated := Annotate(env, reason, originalQueue, env.Attempts, cause)
 
-	target := a.deadLetterQueue
-	if target == "" {
-		target = msg.Queue + a.deadLetterSuffix
-	}
 	body, err := annotated.Encode()
 	if err != nil {
 		return err
 	}
-	return a.republish(ctx, msg, target, string(body))
+	return a.republish(ctx, msg, a.deadLetterTarget(msg), string(body))
 }

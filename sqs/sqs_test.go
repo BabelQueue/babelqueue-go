@@ -2,6 +2,7 @@ package sqs
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"math"
 	neturl "net/url"
@@ -18,6 +19,31 @@ import (
 )
 
 var errFake = errors.New("fake sqs error")
+
+// requirePoisonDLQBody asserts got is the wrapped poison DLQ record for body: a body that is a
+// JSON object is kept verbatim (its keys survive), anything else is carried as "raw"; either way
+// a dead_letter block with reason "poison" and the source queue is added.
+func requirePoisonDLQBody(t *testing.T, got, body string) {
+	t.Helper()
+	var rec map[string]any
+	if err := json.Unmarshal([]byte(got), &rec); err != nil {
+		t.Fatalf("%q: dead-letter body is not a JSON object: %v: %q", body, err, got)
+	}
+	var orig map[string]any
+	if json.Unmarshal([]byte(body), &orig) == nil && orig != nil {
+		for k, v := range orig {
+			if rec[k] == nil && v != nil {
+				t.Errorf("%q: key %q lost from the dead-letter record %q", body, k, got)
+			}
+		}
+	} else if rec["raw"] != body {
+		t.Errorf("%q: raw = %v, want the original body", body, rec["raw"])
+	}
+	dl, _ := rec["dead_letter"].(map[string]any)
+	if dl == nil || dl["reason"] != "poison" || dl["original_queue"] != "orders" {
+		t.Errorf("%q: dead_letter = %v, want reason poison, original_queue orders", body, dl)
+	}
+}
 
 // fakeSQS is an in-memory API implementation — no AWS, no network.
 type fakeSQS struct {
@@ -537,11 +563,10 @@ func TestAppRetryUsesChangeMessageVisibility(t *testing.T) {
 	}
 }
 
-// An undecodable body carries no attempts counter and the in-place release never
-// rewrites it, so only ApproximateReceiveCount (ReceivedMessage.DeliveryCount) can
-// bound the retries. With the default 0s backoff it must still stop at
-// WithMaxAttempts and reach the dead-letter queue instead of looping forever.
-func TestAppUndecodableBodyIsBoundedAndDeadLettered(t *testing.T) {
+// An undecodable body can never succeed on retry, so with dead-lettering on it is moved to
+// <queue>.dlq wrapped (original object or {"raw": <body>} plus a poison dead_letter block) on the
+// first delivery: no ChangeMessageVisibility release, no retry, and a single delete as the final ack.
+func TestAppUndecodableBodyIsDeadLetteredWrappedWithoutRetry(t *testing.T) {
 	for _, body := range []string{
 		`{"job":"urn:babel:orders:created","trace_id":"t","data":[1,2],"meta":{"schema_version":1},"attempts":0}`,
 		`not json at all`,
@@ -559,27 +584,16 @@ func TestAppUndecodableBodyIsBoundedAndDeadLettered(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if n != 3 {
-			t.Errorf("%q: processed %d deliveries, want 3 (bounded by WithMaxAttempts)", body, n)
+		if n != 1 {
+			t.Errorf("%q: processed %d deliveries, want 1 (no retry)", body, n)
 		}
-		if len(fake.visibility) != 2 {
-			t.Errorf("%q: ChangeMessageVisibility calls = %d, want 2", body, len(fake.visibility))
-		}
-		for _, in := range fake.visibility {
-			if in.VisibilityTimeout != 0 {
-				t.Errorf("%q: VisibilityTimeout = %d, want 0 (default backoff)", body, in.VisibilityTimeout)
-			}
+		if len(fake.visibility) != 0 {
+			t.Errorf("%q: ChangeMessageVisibility calls = %d, want 0", body, len(fake.visibility))
 		}
 		if len(fake.sent) != 1 || aws.ToString(fake.sent[0].QueueUrl) != "http://fake/orders.dlq" {
 			t.Fatalf("%q: sends = %d, want exactly one to orders.dlq", body, len(fake.sent))
 		}
-		dl, err := babelqueue.Decode([]byte(aws.ToString(fake.sent[0].MessageBody)))
-		if err != nil {
-			t.Fatalf("%q: dead-letter body: %v", body, err)
-		}
-		if dl.Attempts != 3 || dl.DeadLetter == nil || dl.DeadLetter.Reason != "unknown_urn" {
-			t.Errorf("%q: dead letter attempts=%d dead_letter=%+v, want attempts 3 reason unknown_urn", body, dl.Attempts, dl.DeadLetter)
-		}
+		requirePoisonDLQBody(t, aws.ToString(fake.sent[0].MessageBody), body)
 		if len(fake.deleted) != 1 {
 			t.Errorf("%q: deletes = %v, want exactly the final ack", body, fake.deleted)
 		}
@@ -730,10 +744,11 @@ func TestAppReleaseErrorLeavesMessageReserved(t *testing.T) {
 	}
 }
 
-// Under the unknown-URN release strategy an undecodable body must not be released
-// forever (no handler can ever claim it): it is bounded by ApproximateReceiveCount and
-// dead-lettered, like the fail strategy.
-func TestAppUndecodableBodyUnderReleaseStrategyIsBounded(t *testing.T) {
+// Under the unknown-URN release strategy an undecodable body must not be released or retried
+// (no handler can ever claim it): with dead-lettering on it is written to the DLQ wrapped
+// ({"raw": <body>} plus a poison dead_letter block) in a single delivery, and only then acknowledged.
+func TestAppUndecodableBodyUnderReleaseStrategyIsDeadLetteredWrapped(t *testing.T) {
+	const body = `not json at all`
 	fake := newFakeSQS()
 	tr := NewWithClient(fake, WithQueueURLPrefix("http://fake"))
 	app := babelqueue.NewApp(tr,
@@ -742,21 +757,22 @@ func TestAppUndecodableBodyUnderReleaseStrategyIsBounded(t *testing.T) {
 		babelqueue.WithDeadLetter(true),
 		babelqueue.WithUnknownURNStrategy(babelqueue.StrategyRelease),
 	)
-	fake.seed("http://fake/orders", `not json at all`, 1)
+	fake.seed("http://fake/orders", body, 1)
 
 	n, err := app.Drain(context.Background(), "orders", 50)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if n != 3 {
-		t.Errorf("processed %d deliveries, want 3 (bounded by WithMaxAttempts)", n)
+	if n != 1 {
+		t.Errorf("processed %d deliveries, want 1 (no retry)", n)
 	}
-	if len(fake.visibility) != 2 {
-		t.Errorf("ChangeMessageVisibility calls = %d, want 2", len(fake.visibility))
+	if len(fake.visibility) != 0 {
+		t.Errorf("ChangeMessageVisibility calls = %d, want 0", len(fake.visibility))
 	}
 	if len(fake.sent) != 1 || aws.ToString(fake.sent[0].QueueUrl) != "http://fake/orders.dlq" {
 		t.Fatalf("sends = %d, want exactly one to orders.dlq", len(fake.sent))
 	}
+	requirePoisonDLQBody(t, aws.ToString(fake.sent[0].MessageBody), body)
 	if len(fake.deleted) != 1 {
 		t.Errorf("deletes = %v, want exactly the final ack", fake.deleted)
 	}
