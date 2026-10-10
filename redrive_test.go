@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 )
 
 // deadLettered builds a dead-lettered envelope and puts it on the dlq queue.
@@ -233,5 +234,59 @@ func TestRedrive_UndecodableRestored(t *testing.T) {
 	msg, _ := tr.Pop(context.Background(), "dlq", 0)
 	if msg == nil || msg.Body != "not-json{{{" {
 		t.Error("an undecodable body must be restored to the DLQ, not lost")
+	}
+}
+
+// routedDLQ stamps a RouteURN on every message it pops and records what is published through
+// the optional RoutedPublisher capability as (queue, routeURN).
+type routedDLQ struct {
+	*InMemoryTransport
+	route  string
+	routed [][2]string
+}
+
+func (r *routedDLQ) Pop(ctx context.Context, queue string, timeout time.Duration) (*ReceivedMessage, error) {
+	msg, err := r.InMemoryTransport.Pop(ctx, queue, timeout)
+	if msg != nil {
+		msg.RouteURN = r.route
+	}
+	return msg, err
+}
+
+func (r *routedDLQ) PublishRouted(ctx context.Context, queue, body, routeURN string) error {
+	r.routed = append(r.routed, [2]string{queue, routeURN})
+	return r.InMemoryTransport.Publish(ctx, queue, body)
+}
+
+// Redrive keeps the dead-lettered message's route URN on the message it writes back, and on a
+// message it restores to the DLQ (unselected / dry-run); without a route it is a plain Publish.
+func TestRedrive_KeepsTheRouteURN(t *testing.T) {
+	const route = "urn:babel:orders:refunded"
+	tr := &routedDLQ{InMemoryTransport: NewInMemoryTransport(), route: route}
+	deadLettered(t, tr.InMemoryTransport, "dlq", "urn:babel:orders:created", "orders", nil)
+
+	if _, err := Redrive(context.Background(), tr, "dlq", RedriveOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(tr.routed) != 1 || tr.routed[0] != [2]string{"orders", route} {
+		t.Errorf("redrive routed = %v, want [[orders %s]]", tr.routed, route)
+	}
+
+	tr2 := &routedDLQ{InMemoryTransport: NewInMemoryTransport(), route: route}
+	deadLettered(t, tr2.InMemoryTransport, "dlq", "urn:babel:orders:created", "orders", nil)
+	if _, err := Redrive(context.Background(), tr2, "dlq", RedriveOptions{DryRun: true}); err != nil {
+		t.Fatal(err)
+	}
+	if len(tr2.routed) != 1 || tr2.routed[0] != [2]string{"dlq", route} {
+		t.Errorf("dry-run restore routed = %v, want [[dlq %s]]", tr2.routed, route)
+	}
+
+	tr3 := &routedDLQ{InMemoryTransport: NewInMemoryTransport()} // no route
+	deadLettered(t, tr3.InMemoryTransport, "dlq", "urn:babel:orders:created", "orders", nil)
+	if _, err := Redrive(context.Background(), tr3, "dlq", RedriveOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	if len(tr3.routed) != 0 || len(drain(t, tr3.InMemoryTransport, "orders")) != 1 {
+		t.Errorf("no-route redrive used PublishRouted: %v", tr3.routed)
 	}
 }

@@ -22,6 +22,13 @@ type ReceivedMessage struct {
 	// WithMaxAttempts bound and dead-lettering still hold when a message is released
 	// in place and its body cannot carry the counter (e.g. it does not decode).
 	DeliveryCount int
+	// RouteURN is an optional routing override: when non-empty the [App] looks the
+	// handler up by this URN instead of the decoded body's URN. A transport whose
+	// broker carries the URN out of band (e.g. the Pulsar bq-job property) fills it so
+	// routing follows the property while the body is left untouched — the handler,
+	// retries and the dead-letter record all keep the producer's original body.
+	// Empty means "route on the body URN" (the default for every other transport).
+	RouteURN string
 }
 
 // Transport is the minimal broker contract the [App] runtime talks to: publish a
@@ -45,6 +52,29 @@ type Transport interface {
 // headers — callers fall back to plain Publish (ADR-0027).
 type HeaderPublisher interface {
 	PublishWithHeaders(ctx context.Context, queue, body string, headers map[string]string) error
+}
+
+// RoutedPublisher is an optional [Transport] capability: re-publish a body while keeping
+// the routing identity the broker's own routing property carried on the original delivery
+// (see [ReceivedMessage.RouteURN]). The [App] uses it for its retry and unknown-URN release
+// re-publishes when the received message was routed on a URN that differs from its body, so
+// a routing-property mismatch does not flip to the body URN on the next attempt (contract
+// §5.2/§5.7). routeURN is non-empty; a transport that does not implement this falls back to
+// plain Publish.
+type RoutedPublisher interface {
+	PublishRouted(ctx context.Context, queue, body, routeURN string) error
+}
+
+// publishKeepingRoute publishes body to queue, carrying routeURN when it is non-empty and t
+// implements [RoutedPublisher]; otherwise it is a plain Publish. Shared by the App's re-publishes
+// (retry, release, dead-letter) and by [Redrive].
+func publishKeepingRoute(ctx context.Context, t Transport, queue, body, routeURN string) error {
+	if routeURN != "" {
+		if rp, ok := t.(RoutedPublisher); ok {
+			return rp.PublishRouted(ctx, queue, body, routeURN)
+		}
+	}
+	return t.Publish(ctx, queue, body)
 }
 
 // Releaser is an optional [Transport] capability: return a reserved message to its

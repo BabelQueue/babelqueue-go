@@ -82,7 +82,7 @@ func Redrive(ctx context.Context, t Transport, dlq string, opts RedriveOptions) 
 	res := RedriveResult{Items: make([]RedriveItem, 0, len(batch))}
 	for _, p := range batch {
 		if !p.decoded {
-			_ = t.Publish(ctx, dlq, p.msg.Body) // restore the poison body; never drop it
+			_ = publishKeepingRoute(ctx, t, dlq, p.msg.Body, p.msg.RouteURN) // restore the poison body; never drop it
 			_ = t.Ack(ctx, p.msg)
 			res.Skipped++
 			res.Items = append(res.Items, RedriveItem{From: dlq})
@@ -100,7 +100,7 @@ func Redrive(ctx context.Context, t Transport, dlq string, opts RedriveOptions) 
 		}
 
 		if opts.Select != nil && !opts.Select(p.env) {
-			_ = t.Publish(ctx, dlq, p.msg.Body) // not selected: restore unchanged
+			_ = publishKeepingRoute(ctx, t, dlq, p.msg.Body, p.msg.RouteURN) // not selected: restore unchanged
 			_ = t.Ack(ctx, p.msg)
 			res.Skipped++
 			res.Items = append(res.Items, item)
@@ -114,7 +114,7 @@ func Redrive(ctx context.Context, t Transport, dlq string, opts RedriveOptions) 
 		item.To = target
 
 		if opts.DryRun {
-			_ = t.Publish(ctx, dlq, p.msg.Body) // report the plan; restore unchanged
+			_ = publishKeepingRoute(ctx, t, dlq, p.msg.Body, p.msg.RouteURN) // report the plan; restore unchanged
 			_ = t.Ack(ctx, p.msg)
 			res.Skipped++
 			res.Items = append(res.Items, item)
@@ -126,13 +126,13 @@ func Redrive(ctx context.Context, t Transport, dlq string, opts RedriveOptions) 
 		reset.Attempts = 0
 		body, err := reset.Encode()
 		if err != nil {
-			_ = t.Publish(ctx, dlq, p.msg.Body) // restore on a re-encode failure
+			_ = publishKeepingRoute(ctx, t, dlq, p.msg.Body, p.msg.RouteURN) // restore on a re-encode failure
 			_ = t.Ack(ctx, p.msg)
 			return res, err
 		}
-		bypassed, err := publishRedriven(ctx, t, target, string(body), opts.Bypass)
+		bypassed, err := publishRedriven(ctx, t, target, string(body), opts.Bypass, p.msg.RouteURN)
 		if err != nil {
-			_ = t.Publish(ctx, dlq, p.msg.Body) // restore on a publish failure
+			_ = publishKeepingRoute(ctx, t, dlq, p.msg.Body, p.msg.RouteURN) // restore on a publish failure
 			_ = t.Ack(ctx, p.msg)
 			return res, err
 		}
@@ -156,12 +156,14 @@ func sourceQueueOf(env Envelope) string {
 
 // publishRedriven re-publishes a reset message to queue. When bypass is set and the transport
 // is a [HeaderPublisher], it stamps the bq-replay-bypass header and reports bypassed=true;
-// otherwise it publishes plainly and reports bypassed=false.
-func publishRedriven(ctx context.Context, t Transport, queue, body string, bypass bool) (bool, error) {
+// otherwise it publishes plainly and reports bypassed=false. Either way, a non-empty routeURN
+// (the dead-lettered message's routing property, see [ReceivedMessage.RouteURN]) is carried back
+// to the source queue through [RoutedPublisher] when the transport implements it.
+func publishRedriven(ctx context.Context, t Transport, queue, body string, bypass bool, routeURN string) (bool, error) {
 	if bypass {
 		if hp, ok := t.(HeaderPublisher); ok {
 			return true, hp.PublishWithHeaders(ctx, queue, body, map[string]string{HeaderReplayBypass: "1"})
 		}
 	}
-	return false, t.Publish(ctx, queue, body)
+	return false, publishKeepingRoute(ctx, t, queue, body, routeURN)
 }

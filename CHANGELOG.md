@@ -9,6 +9,39 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Added
+
+- **`ReceivedMessage.RouteURN` routing seam** (core, MINOR). An optional field a transport can
+  set when its broker carries the URN out of band. When non-empty the `App` looks the handler
+  up by it instead of the decoded body's URN; empty (the default for every existing transport)
+  keeps routing on the body. The body is never rewritten, so the handler, the retry re-publish
+  and the dead-letter record all carry the producer's original body. No wire change.
+- **`RoutedPublisher` optional transport capability** (core, MINOR). `PublishRouted(ctx, queue,
+  body, routeURN)`. When a delivery carries a `RouteURN` and the transport implements it, the
+  `App` uses it for its retry, unknown-URN release and dead-letter writes, and `Redrive`, so the broker's routing
+  property keeps the original value across attempts (no flip to the body URN on the second
+  delivery, and the DLQ record keeps it too). Transports without it, and deliveries without a `RouteURN`, use plain `Publish`.
+  The `pulsar` module implements it (`bq-job` pinned to the route URN; blank derives from the
+  body). No wire change.
+
+### Fixed
+
+- **Pulsar consumer follows broker-bindings §5.2 / §5.7** (`pulsar` module). `Pop` now routes
+  on the `bq-job` property (the body's `job` is used only when the property is absent or
+  blank) and takes `attempts` from the authoritative `bq-attempts` property (the body's value
+  is used when the property is absent or not a plain non-negative ASCII-decimal integer that
+  fits a 32-bit int), then raises it to `max(.., RedeliveryCount)`. Previously the body decided
+  both and `bq-attempts` was never read. Routing is done through the new
+  `ReceivedMessage.RouteURN` (filled from `bq-job`); the body's `job` / `urn` alias is **not**
+  rewritten, so a `bq-job` / body mismatch no longer leaks into retries or the DLQ. A body with
+  no `job` is still rejected as non-conformant. The new optional
+  `pulsar.WithOnRoutingMismatch(func(propertyURN, bodyURN string, env *babelqueue.Envelope))`
+  option reports a mismatch for an accepted envelope, after attempts are reconciled (a panic in
+  it is recovered; delivery and ack are unaffected). No wire change.
+- **Release note for the `pulsar` module:** it now depends on the core's
+  `ReceivedMessage.RouteURN`, so the next `pulsar/v*` tag must `require` the core version that
+  ships this seam (the module currently resolves the core through `replace ../` locally).
+
 ## [1.9.0] - 2026-10-03
 
 Forward-compatible re-emit, Unicode-correct `minLength`, the SQS §3 in-place release,

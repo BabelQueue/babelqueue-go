@@ -249,6 +249,9 @@ func (a *App) dispatch(ctx context.Context, msg *ReceivedMessage) {
 		env.Attempts = native
 	}
 	urn := env.URN()
+	if decodeErr == nil && msg.RouteURN != "" {
+		urn = msg.RouteURN // transport-supplied routing override; the body is not rewritten
+	}
 
 	if decodeErr != nil || urn == "" {
 		a.routePoison(ctx, msg, env, decodeErr)
@@ -299,7 +302,7 @@ func (a *App) routeUnknown(ctx context.Context, urn string, msg *ReceivedMessage
 		if a.release(ctx, msg, a.unknownURNDelay) {
 			return
 		}
-		_ = a.transport.Publish(ctx, msg.Queue, msg.Body)
+		_ = a.republish(ctx, msg, msg.Queue, msg.Body)
 		a.ack(ctx, msg)
 	case StrategyDeadLetter:
 		a.deadLetterMessage(ctx, msg, env, "unknown_urn", nil)
@@ -318,7 +321,7 @@ func (a *App) retryOrDeadLetter(ctx context.Context, msg *ReceivedMessage, env E
 			return
 		}
 		if body, err := env.Encode(); err == nil {
-			_ = a.transport.Publish(ctx, msg.Queue, string(body))
+			_ = a.republish(ctx, msg, msg.Queue, string(body))
 		}
 		a.ack(ctx, msg)
 		return
@@ -336,6 +339,15 @@ func (a *App) retryOrDeadLetter(ctx context.Context, msg *ReceivedMessage, env E
 	// Retries exhausted and no dead-letter configured — drop it (ack so it leaves
 	// the queue).
 	a.ack(ctx, msg)
+}
+
+// republish puts body on queue on behalf of msg: a retry or release (queue is msg's own) or the
+// dead-letter record (queue is the DLQ). When the delivery was routed on a URN taken from
+// the transport's routing property ([ReceivedMessage.RouteURN]) and the transport implements
+// [RoutedPublisher], that URN is carried onto the re-published message, so the route stays
+// constant across retries; otherwise it is a plain Publish.
+func (a *App) republish(ctx context.Context, msg *ReceivedMessage, queue, body string) error {
+	return publishKeepingRoute(ctx, a.transport, queue, body, msg.RouteURN)
 }
 
 // release hands msg back to its queue via the transport's [Releaser] capability.
@@ -375,7 +387,7 @@ func (a *App) deadLetterMessage(ctx context.Context, msg *ReceivedMessage, env E
 		target = msg.Queue + a.deadLetterSuffix
 	}
 	if body, err := annotated.Encode(); err == nil {
-		_ = a.transport.Publish(ctx, target, string(body))
+		_ = a.republish(ctx, msg, target, string(body))
 	}
 	a.ack(ctx, msg)
 }

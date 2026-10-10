@@ -47,7 +47,7 @@ func TestPulsarConformance(t *testing.T) {
 		if err != nil {
 			t.Fatalf("fixture: %v", err)
 		}
-		got := message(string(body)).Properties
+		got := message(string(body), "").Properties
 		want := m.Pulsar.PropertyProjection.Properties
 		if len(got) != len(want) {
 			t.Fatalf("projected %d properties, want %d", len(got), len(want))
@@ -65,7 +65,7 @@ func TestPulsarConformance(t *testing.T) {
 			env.Attempts = c.BodyAttempts
 			body, _ := env.Encode()
 
-			out := reconcileAttempts(string(body), c.RedeliveryCount)
+			out, _ := reconcile(string(body), nil, c.RedeliveryCount, nil)
 			decoded, _ := babelqueue.Decode([]byte(out))
 			if decoded.Attempts != c.ExpectedAttempts {
 				t.Errorf("attempts = %d, want %d", decoded.Attempts, c.ExpectedAttempts)
