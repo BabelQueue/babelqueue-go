@@ -34,9 +34,10 @@ type asbManifest struct {
 		SchemaVersionGate struct {
 			Fixture string `json:"fixture"`
 			Cases   []struct {
-				Value  any    `json:"value"`
-				Absent bool   `json:"absent"`
-				Expect string `json:"expect"`
+				Value     any    `json:"value"`
+				ValueType string `json:"value_type"`
+				Absent    bool   `json:"absent"`
+				Expect    string `json:"expect"`
 			} `json:"cases"`
 		} `json:"schema_version_gate"`
 	} `json:"asb"`
@@ -121,8 +122,14 @@ func TestAsbConformance(t *testing.T) {
 		for i, c := range gate.Cases {
 			// A JSON number carries no width, so a native AMQP integer is exercised at every
 			// width the SDK can hand over; a string or an absent property has exactly one form.
+			if c.ValueType != "" && c.ValueType != "float" {
+				t.Fatalf("case %d: unknown value_type %q (this reader only understands \"float\")", i, c.ValueType)
+			}
 			values := []any{c.Value}
-			if f, ok := c.Value.(float64); ok && f == float64(int64(f)) {
+			if f, ok := c.Value.(float64); ok && c.ValueType == "float" {
+				// An explicit floating-point case (e.g. 1.0): hand over real floats, never integers.
+				values = []any{f, float32(f)}
+			} else if ok && f == float64(int64(f)) {
 				values = []any{int(f), int32(f), int64(f), uint8(f), uint32(f), uint64(f)}
 			}
 			for _, v := range values {
