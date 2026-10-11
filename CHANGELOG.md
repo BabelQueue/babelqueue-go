@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.13.0] - 2026-10-11
+
 ### Added
 
 - **core `Redrive`: now uses the optional `KeyedRepublisher` capability.** A DLQ redrive (ADR-0026)
@@ -34,6 +36,9 @@ The envelope wire format is versioned separately by `meta.schema_version`
   restore write back to the DLQ (a null key stays null and a non-empty key is carried
   byte-for-byte; never synthesised), per contract §6.5. An empty key is the exception: see
   Known limitations. Requires the core release containing the `Redrive` change above.
+- **`kafka`: core pin raised to `v1.13.0`.** Keyed redrive and the no-ack-on-failed-restore fix
+  live in the core `Redrive`; the local `replace => ../` hides a stale pin from the repo's own
+  tests but not from a consumer.
 
 ### Known limitations
 
@@ -44,6 +49,11 @@ The envelope wire format is versioned separately by `meta.schema_version`
   a null key instead. Null and non-empty keys are carried byte-for-byte. The other SDKs preserve
   an empty key (contract §6.5 SHOULD); a fix would need a protocol-level reader instead of
   `kafka.Reader`. The live integration test pins this behaviour.
+
+### Release note for the transport modules
+
+Tag the core `v1.13.0` first, then `kafka/v1.2.1` (PATCH: keyed redrive, byte-exact restore).
+The other transport modules are unchanged and keep their pins.
 
 ## [1.12.0] - 2026-10-11
 
