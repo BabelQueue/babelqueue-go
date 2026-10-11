@@ -9,6 +9,26 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Changed
+
+- **core `App` and the gating transports (`kafka`, `artemis`, `sqs`, `pulsar`, `azureservicebus`):
+  a version-gated delivery is dead-lettered as the incoming raw body, byte-identical.** The
+  `bq-schema-version` gate (`bq_schema_version` on Artemis) rejects a message "without decoding it"
+  (contract `broker-bindings.md` §3.7, §4.7, §5.7, §6.7, §7.7); the `App` previously decoded the body
+  anyway and wrote a `dead_letter{reason: "unknown_urn"}`-annotated record, which made Go differ
+  from Java, .NET and Node (they forward the raw value). The `App` now checks the gate route before
+  decoding and publishes `ReceivedMessage.Body` to the dead-letter queue unchanged: no decode, no
+  `dead_letter` block. A failed dead-letter write is still not acknowledged (the `Rewinder` /
+  stay-reserved pattern is unchanged), the delivery is still never retried, `StrategyDelete` and
+  dead-lettering off still drop it, and the poison, handler-error and unknown-URN dead-letter
+  records are unchanged. Impact: a DLQ consumer that expected an annotated `unknown_urn` record
+  for a version-gated message now receives the original body instead (the rejected version is still
+  reported through `WithOnSchemaVersionRejected`). The `Transport` API only carries a body, so the
+  Java/.NET/Node forwarding of the source key and headers is not reproduced. No wire change; this
+  reverses the annotated-record decision of the previous release's gate work. The transport
+  modules (`kafka`, `artemis`, `sqs`, `pulsar`, `azureservicebus`) need no code change of their
+  own - they already hand the raw body over - but should pin the core release that carries this.
+
 ### Fixed
 
 - **core `App`: an undecodable (poison) body is dead-lettered wrapped, with no retry.** Previously the

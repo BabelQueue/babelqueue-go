@@ -725,7 +725,7 @@ func TestRoutingMismatchHookNotCalledForGatedMessage(t *testing.T) {
 }
 
 // End to end: a gated message never reaches a handler (neither the body URN's nor the bq-job's)
-// and is quarantined through the App's unknown-URN dead-letter path with the original body.
+// and is quarantined to the DLQ as the raw, unchanged body (never decoded, no dead_letter block).
 func TestAppQuarantinesUnsupportedSchemaVersion(t *testing.T) {
 	body := bodyWith(t, urn, 0)
 	for _, v := range []string{"2", "x"} {
@@ -751,8 +751,11 @@ func TestAppQuarantinesUnsupportedSchemaVersion(t *testing.T) {
 			if dead.Job != urn {
 				t.Errorf("dead-letter body job = %q, want the producer's %q", dead.Job, urn)
 			}
-			if !strings.Contains(string(producer.sent[0].Payload), "unknown_urn") {
-				t.Errorf("dead-letter record does not carry the unknown_urn reason: %s", producer.sent[0].Payload)
+			if string(producer.sent[0].Payload) != body {
+				t.Errorf("dead-letter body is not byte-identical to the incoming body:\n got: %s\nwant: %s", producer.sent[0].Payload, body)
+			}
+			if strings.Contains(string(producer.sent[0].Payload), "dead_letter") {
+				t.Errorf("dead-letter record carries a dead_letter block: %s", producer.sent[0].Payload)
 			}
 		})
 	}
@@ -891,7 +894,7 @@ func TestRejectedHookIsNotCalledForSupportedVersionAndPanicIsIgnored(t *testing.
 // A gated message goes straight to the dead-letter queue, with no retry, even when the App is
 // configured with StrategyRelease and several attempts: neither a release nor a retry can make a
 // future-version message handleable, so the handler is never reached and exactly one record (the
-// dead-letter copy, with the original properties) is written, after which the original is acked.
+// raw dead-letter copy, with the original properties) is written, after which the original is acked.
 func TestGatedMessageIsDeadLetteredDirectlyUnderStrategyRelease(t *testing.T) {
 	body := bodyWith(t, urn, 0)
 	props := map[string]string{"bq-schema-version": "2", "bq-job": urn}
@@ -915,15 +918,11 @@ func TestGatedMessageIsDeadLetteredDirectlyUnderStrategyRelease(t *testing.T) {
 	if sent.Properties["bq-schema-version"] != "2" || sent.Properties["bq-job"] != urn {
 		t.Errorf("dead-letter properties = %v, want the originals", sent.Properties)
 	}
-	dead, err := babelqueue.Decode(sent.Payload)
-	if err != nil {
-		t.Fatalf("dead-letter record does not decode: %v", err)
+	if string(sent.Payload) != body {
+		t.Errorf("dead-letter body is not byte-identical to the incoming body:\n got: %s\nwant: %s", sent.Payload, body)
 	}
-	if dead.Attempts != 0 {
-		t.Errorf("dead-letter attempts = %d, want 0 (no retry happened)", dead.Attempts)
-	}
-	if !strings.Contains(string(sent.Payload), "unknown_urn") {
-		t.Errorf("the record is not the dead-letter record: %s", sent.Payload)
+	if strings.Contains(string(sent.Payload), "dead_letter") {
+		t.Errorf("dead-letter record carries a dead_letter block: %s", sent.Payload)
 	}
 }
 

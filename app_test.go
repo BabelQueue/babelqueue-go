@@ -423,15 +423,13 @@ func TestAppVersionGatedRouteIsDeadLetteredWithoutRetry(t *testing.T) {
 			if tr.acks != 1 {
 				t.Errorf("acks = %d, want 1", tr.acks)
 			}
-			dead, err := babelqueue.Decode([]byte(tr.bodies[0]))
-			if err != nil {
-				t.Fatalf("dead-letter record does not decode: %v", err)
+			// §3.7 etc.: the gate rejects without decoding, so the DLQ record is the incoming body
+			// byte for byte, with no dead_letter block.
+			if tr.bodies[0] != string(raw) {
+				t.Errorf("dead-letter body is not byte-identical to the incoming body:\n got: %s\nwant: %s", tr.bodies[0], raw)
 			}
-			if dead.Attempts != 0 {
-				t.Errorf("dead-letter attempts = %d, want 0 (no retry happened)", dead.Attempts)
-			}
-			if !strings.Contains(tr.bodies[0], "unknown_urn") || !strings.Contains(tr.bodies[0], "unsupported-schema-version:2") {
-				t.Errorf("dead-letter record lacks the unknown_urn reason or the rejected version: %s", tr.bodies[0])
+			if strings.Contains(tr.bodies[0], "dead_letter") {
+				t.Errorf("dead-letter record carries a dead_letter block: %s", tr.bodies[0])
 			}
 		})
 	}
@@ -464,6 +462,9 @@ func TestAppVersionGatedRouteIsDeadLetteredWithoutRetry(t *testing.T) {
 		}
 		if len(tr.queues) != 1 || tr.queues[0] != "orders.dlq" {
 			t.Fatalf("re-published to %v; want one orders.dlq record", tr.queues)
+		}
+		if tr.bodies[0] != "not-json" {
+			t.Errorf("dead-letter body = %q, want the raw body %q unchanged", tr.bodies[0], "not-json")
 		}
 	})
 
@@ -666,7 +667,7 @@ func TestAppVersionGatedDeadLetterFailureIsNotAcked(t *testing.T) {
 		}
 	})
 
-	t.Run("DLQ record carries only the transport-bounded rejected value", func(t *testing.T) {
+	t.Run("DLQ record is the raw incoming body; the rejected value never reaches it", func(t *testing.T) {
 		base := newFlaky(0)
 		bounded := babelqueue.TruncateDeclaredVersion(strings.Repeat("9", 5000))
 		base.msg.RouteURN = "babelqueue:unsupported-schema-version:" + bounded
@@ -677,8 +678,11 @@ func TestAppVersionGatedDeadLetterFailureIsNotAcked(t *testing.T) {
 		if base.deadLettered != 1 || base.acks != 1 {
 			t.Fatalf("dead-lettered = %d, acks = %d", base.deadLettered, base.acks)
 		}
-		if !strings.Contains(base.deadLetterBody, strings.Repeat("9", 64)+"...") || len(base.deadLetterBody) > 2000 {
-			t.Fatalf("DLQ record must name the 64-char bounded value and stay small (len %d)", len(base.deadLetterBody))
+		if base.deadLetterBody != string(raw) {
+			t.Fatalf("DLQ record is not byte-identical to the incoming body (len %d vs %d)", len(base.deadLetterBody), len(raw))
+		}
+		if strings.Contains(base.deadLetterBody, "99999") || strings.Contains(base.deadLetterBody, "dead_letter") {
+			t.Fatalf("DLQ record must stay the raw body: %s", base.deadLetterBody)
 		}
 	})
 

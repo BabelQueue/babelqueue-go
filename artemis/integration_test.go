@@ -168,9 +168,9 @@ func TestIntegrationHandlerErrorDeadLettersAfterMaxTries(t *testing.T) {
 // Scenario 2: a message whose bq_schema_version property is "2" is rejected by the §7.7 gate on
 // the property alone, before any decode. The seeded body is deliberately not a v1 envelope (it is
 // not even JSON), so the test proves the body is never needed. The Go App dead-letters a gated
-// message directly, with no retry: the DLQ gets exactly one record, annotated "unknown_urn" (the
-// record is rebuilt from what Decode could recover, which for this body is nothing, so the
-// original body is not asserted), no handler runs, and the source message is settled (accepted,
+// message directly, with no retry: the DLQ gets exactly one record, the incoming body verbatim
+// (byte-identical, never decoded, no dead_letter block), no handler runs, and the source message
+// is settled (accepted,
 // so the broker never redelivers it and the gate never fires a second time).
 func TestIntegrationVersionGateRejectionReachesDLQ(t *testing.T) {
 	url := integrationURL(t)
@@ -227,25 +227,14 @@ func TestIntegrationVersionGateRejectionReachesDLQ(t *testing.T) {
 	}
 
 	raw := popWithin(t, dlqReader, dlq, 60*time.Second).Body
-	rec := decodeObject(t, raw)
-	dl, ok := rec["dead_letter"].(map[string]any)
-	if !ok {
-		t.Fatalf("DLQ record has no dead_letter block: %v", rec)
+	// §7.7: the gate rejects without decoding, so the DLQ record is the incoming body verbatim -
+	// byte-identical, no dead_letter block (the body is not even JSON).
+	wantBody := "future-format-" + suffix
+	if raw != wantBody {
+		t.Errorf("DLQ body = %q, want the incoming body %q byte-for-byte", raw, wantBody)
 	}
-	if dl["reason"] != "unknown_urn" {
-		t.Errorf("dead_letter.reason = %v, want unknown_urn", dl["reason"])
-	}
-	if dl["original_queue"] != queue {
-		t.Errorf("dead_letter.original_queue = %v, want %s", dl["original_queue"], queue)
-	}
-	if dl["lang"] != "go" {
-		t.Errorf("dead_letter.lang = %v, want go", dl["lang"])
-	}
-	if attempts, _ := dl["attempts"].(float64); attempts != 0 {
-		t.Errorf("dead_letter.attempts = %v, want 0 (a gated message is not retried)", dl["attempts"])
-	}
-	if msg, _ := dl["error"].(string); !strings.Contains(msg, "unsupported-schema-version:2") {
-		t.Errorf("dead_letter.error = %v, want it to name the rejected version", dl["error"])
+	if strings.Contains(raw, "dead_letter") {
+		t.Errorf("DLQ body carries a dead_letter block: %q", raw)
 	}
 	if calls.Load() != 0 {
 		t.Errorf("handler ran %d times for a version-gated message", calls.Load())

@@ -327,8 +327,9 @@ var _ babelqueue.Transport = (*Transport)(nil)
 
 // unsupportedSchemaRoutePrefix is the reserved [babelqueue.ReceivedMessage.RouteURN] prefix of a
 // version-gated delivery (the same string the core App recognises). It is not a "urn:babel:"
-// URN, so no handler owns it; the App reports it as an unknown URN, which names the rejected
-// bq-schema-version in the logged error. It is an in-process marker only and never reaches the wire.
+// URN, so no handler owns it; the App dead-letters it directly (never retried, never decoded;
+// the DLQ record is the incoming raw body, see settleVersionGated). The rejected bq-schema-version
+// is carried after the prefix; the marker is in-process only and never reaches the wire.
 const unsupportedSchemaRoutePrefix = "babelqueue:unsupported-schema-version:"
 
 // unsupportedSchemaVersion implements the §4.7 gate on the bq-schema-version application

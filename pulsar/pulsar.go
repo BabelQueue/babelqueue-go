@@ -366,7 +366,7 @@ func properties(env babelqueue.Envelope) map[string]string {
 
 // unsupportedSchemaRoutePrefix prefixes the reserved route URN a version-gated message is
 // delivered under. It is not a "urn:babel:" URN, so no handler can legitimately own it; the App
-// reports it as an unknown URN, which names the rejected bq-schema-version in the logged error.
+// recognises the prefix and dead-letters (or drops) the delivery with its raw body, undecoded.
 // It is an in-process marker only: [message] never writes it to the wire.
 const unsupportedSchemaRoutePrefix = "babelqueue:unsupported-schema-version:"
 

@@ -429,6 +429,9 @@ func TestGatedDeadLetterFailureRewindsAndNeverCommitsPastTheRecord(t *testing.T)
 	if len(w.sent) != 1 || w.sent[0].Topic != "orders.dlq" {
 		t.Fatalf("writes = %+v; want exactly one DLQ record", w.sent)
 	}
+	if string(w.sent[0].Value) != "not json" {
+		t.Fatalf("DLQ value = %q; want the incoming value verbatim (never decoded, no dead_letter block)", w.sent[0].Value)
+	}
 	if len(log.fetched) != 2 || log.fetched[0] != 0 || log.fetched[1] != 1 {
 		t.Fatalf("fetched = %v, want [0 1]", log.fetched)
 	}

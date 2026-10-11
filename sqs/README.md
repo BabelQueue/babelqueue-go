@@ -99,8 +99,8 @@ Anything else is compared as-is — never trimmed — with the version the core 
 **not decoded** and is handed to the `App` untouched with the reserved route
 `babelqueue:unsupported-schema-version:<v>`. No handler owns that route, so the `App`
 dead-letters the message **directly, with no retry** — whatever `WithMaxAttempts` is (the
-handler is never reached): with `WithDeadLetter(true)` it lands on the dead-letter queue with
-the `unknown_urn` reason and the rejected version in the recorded cause, and without
+handler is never reached): with `WithDeadLetter(true)` it lands on the dead-letter queue as the
+incoming body, byte-identical (never decoded, no `dead_letter` block), and without
 dead-lettering it is acknowledged (deleted) and dropped. `StrategyDelete` is the one
 exception: it drops the message (acknowledged, no dead-letter record), as in the Python SDK.
 If the dead-letter write itself fails the message is **not** deleted: it stays in the queue

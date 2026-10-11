@@ -928,7 +928,8 @@ func TestAppQuarantinesVersionGatedMessage(t *testing.T) {
 		return nil
 	})
 	v := "2"
-	fake.seedWithVersion("http://fake/orders", gateBody(t), &v, 1)
+	incoming := gateBody(t)
+	fake.seedWithVersion("http://fake/orders", incoming, &v, 1)
 
 	n, err := app.Drain(context.Background(), "orders", 50)
 	if err != nil {
@@ -942,6 +943,13 @@ func TestAppQuarantinesVersionGatedMessage(t *testing.T) {
 	}
 	if len(fake.sent) != 1 || aws.ToString(fake.sent[0].QueueUrl) != "http://fake/orders.dlq" {
 		t.Fatalf("sends = %d, want exactly one to orders.dlq", len(fake.sent))
+	}
+	// The DLQ record is the incoming body verbatim (never decoded, no dead_letter block).
+	if got := aws.ToString(fake.sent[0].MessageBody); got != incoming {
+		t.Errorf("DLQ body = %q, want the incoming body %q byte-for-byte", got, incoming)
+	}
+	if strings.Contains(aws.ToString(fake.sent[0].MessageBody), "dead_letter") {
+		t.Error("DLQ body carries a dead_letter block")
 	}
 }
 

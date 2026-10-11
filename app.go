@@ -265,6 +265,15 @@ func (a *App) dispatch(ctx context.Context, msg *ReceivedMessage) {
 	if msg.Headers[HeaderReplayBypass] != "" {
 		ctx = withReplay(ctx)
 	}
+	// A version-gated delivery (a transport's reserved unsupported-schema-version route, see
+	// [unsupportedSchemaRoutePrefix]) can never be handled by any registered handler, and a retry
+	// cannot change that: it is dead-lettered directly, with no retry, whatever its body looks
+	// like. It is checked before the body is decoded: a gated body is never parsed, and the DLQ record
+	// is the raw body (see settleVersionGated).
+	if strings.HasPrefix(msg.RouteURN, unsupportedSchemaRoutePrefix) {
+		a.settleVersionGated(ctx, msg)
+		return
+	}
 	env, decodeErr := Decode([]byte(msg.Body))
 	// The broker's own delivery count is a floor for attempts: an in-place release
 	// does not rewrite the body, and an undecodable body carries no counter at all,
@@ -277,14 +286,6 @@ func (a *App) dispatch(ctx context.Context, msg *ReceivedMessage) {
 		urn = msg.RouteURN // transport-supplied routing override; the body is not rewritten
 	}
 
-	// A version-gated delivery (a transport's reserved unsupported-schema-version route, see
-	// [unsupportedSchemaRoutePrefix]) can never be handled by any registered handler, and a retry
-	// cannot change that: it is dead-lettered directly, with no retry, whatever its body looks
-	// like. The route URN stays in the recorded cause so the DLQ record names the rejected version.
-	if strings.HasPrefix(msg.RouteURN, unsupportedSchemaRoutePrefix) {
-		a.settleVersionGated(ctx, msg, env)
-		return
-	}
 	if decodeErr != nil || urn == "" {
 		a.routePoison(ctx, msg, env, decodeErr)
 		return
@@ -338,10 +339,11 @@ func TruncateDeclaredVersion(v string) string {
 
 // settleVersionGated settles a version-gated delivery (RouteURN under
 // [unsupportedSchemaRoutePrefix]) without retrying it and without ever running a handler. It is
-// acknowledged (dropped) under [StrategyDelete], dead-lettered with the "unknown_urn" reason when
-// dead-lettering is on (WithDeadLetter, or [StrategyDeadLetter]), and acknowledged (dropped)
-// otherwise. This holds for [StrategyFail] and [StrategyRelease] too, and for every transport
-// that gates on a version property.
+// acknowledged (dropped) under [StrategyDelete], dead-lettered when dead-lettering is on
+// (WithDeadLetter, or [StrategyDeadLetter]), and acknowledged (dropped) otherwise. The DLQ record
+// is the raw body, byte-identical to the incoming one (never decoded, no dead_letter block). This
+// holds for [StrategyFail] and [StrategyRelease] too, and for every transport that gates on a
+// version property.
 //
 // A failed dead-letter write never loses the message: it is NOT acknowledged. The failure is
 // logged and reported to the [WithDeadLetterErrorHandler] hook, and the message is handed back
@@ -349,7 +351,7 @@ func TruncateDeclaredVersion(v string) string {
 // redelivers it when the reservation lapses). The gate rejects the redelivery again, so the
 // dead-letter write is retried; an offset-committing broker (Kafka) is rewound so a later commit
 // can never move past this message.
-func (a *App) settleVersionGated(ctx context.Context, msg *ReceivedMessage, env Envelope) {
+func (a *App) settleVersionGated(ctx context.Context, msg *ReceivedMessage) {
 	if a.onUnknownURN == StrategyDelete {
 		a.ack(ctx, msg)
 		return
@@ -358,8 +360,10 @@ func (a *App) settleVersionGated(ctx context.Context, msg *ReceivedMessage, env 
 		a.ack(ctx, msg)
 		return
 	}
-	cause := fmt.Errorf("%w: %q", ErrUnknownURN, msg.RouteURN)
-	if err := a.writeDeadLetter(ctx, msg, env, "unknown_urn", cause); err != nil {
+	// §3.7/§4.7/§5.7/§6.7/§7.7: reject WITHOUT decoding. The DLQ record is the raw body exactly as
+	// it arrived: an unknown schema is never best-effort parsed or re-encoded, so no dead_letter
+	// block is added and the bytes stay identical to the incoming body (Java/.NET/Node parity).
+	if err := a.republish(ctx, msg, a.deadLetterTarget(msg), msg.Body); err != nil {
 		a.leaveDeadLetterUnsettled(ctx, msg, err, "a version-gated message")
 		return
 	}

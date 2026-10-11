@@ -6,6 +6,7 @@ package kafka
 //	BQ_INTEGRATION=1 BQ_KAFKA_BROKERS=localhost:9092 go test ./... -run Integration -v
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -174,9 +175,9 @@ func committedOffset(t *testing.T, brokers []string, group, topic string) int64 
 // Scenario 2: a record whose bq-schema-version header is "2" is rejected by the §6.7 gate on the
 // header alone, before any decode. The seeded body is deliberately not a v1 envelope (it is not
 // even JSON), so the test proves the body is never needed. The Go App dead-letters a gated record
-// directly, with no retry: the DLQ gets exactly one record, annotated "unknown_urn" (the record
-// is rebuilt from what Decode could recover, which for this body is nothing, so the original body
-// is not asserted), no handler runs, and the source record is settled (its offset committed).
+// directly, with no retry: the DLQ gets exactly one record, the incoming value verbatim
+// (byte-identical, never decoded, no dead_letter block), no handler runs, and the source record is
+// settled (its offset committed).
 func TestIntegrationVersionGateRejectionReachesDLQ(t *testing.T) {
 	brokers := integrationBrokers(t)
 	suffix := strconv.FormatInt(time.Now().UnixNano(), 36)
@@ -217,25 +218,14 @@ func TestIntegrationVersionGateRejectionReachesDLQ(t *testing.T) {
 	startApp(t, app, queue)
 
 	raw := readDLQ(t, brokers, dlq, 60*time.Second).Value
-	rec := decodeObject(t, raw)
-	dl, ok := rec["dead_letter"].(map[string]any)
-	if !ok {
-		t.Fatalf("DLQ record has no dead_letter block: %v", rec)
+	// §6.7: the gate rejects without decoding, so the DLQ record is the incoming value verbatim -
+	// byte-identical, no dead_letter block (the body is not even JSON).
+	wantBody := "future-format-" + suffix
+	if string(raw) != wantBody {
+		t.Errorf("DLQ value = %q, want the incoming value %q byte-for-byte", raw, wantBody)
 	}
-	if dl["reason"] != "unknown_urn" {
-		t.Errorf("dead_letter.reason = %v, want unknown_urn", dl["reason"])
-	}
-	if dl["original_queue"] != queue {
-		t.Errorf("dead_letter.original_queue = %v, want %s", dl["original_queue"], queue)
-	}
-	if dl["lang"] != "go" {
-		t.Errorf("dead_letter.lang = %v, want go", dl["lang"])
-	}
-	if attempts, _ := dl["attempts"].(float64); attempts != 0 {
-		t.Errorf("dead_letter.attempts = %v, want 0 (a gated record is not retried)", dl["attempts"])
-	}
-	if msg, _ := dl["error"].(string); !strings.Contains(msg, "unsupported-schema-version:2") {
-		t.Errorf("dead_letter.error = %v, want it to name the rejected version", dl["error"])
+	if bytes.Contains(raw, []byte("dead_letter")) {
+		t.Errorf("DLQ value carries a dead_letter block: %q", raw)
 	}
 	if calls.Load() != 0 {
 		t.Errorf("handler ran %d times for a version-gated record", calls.Load())
