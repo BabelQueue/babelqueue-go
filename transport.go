@@ -65,6 +65,19 @@ type RoutedPublisher interface {
 	PublishRouted(ctx context.Context, queue, body, routeURN string) error
 }
 
+// KeyedRepublisher is an optional [Transport] capability: re-publish a body on behalf of a
+// message the transport itself reserved, carrying whatever native per-message metadata the
+// broker attaches that the plain [Transport.Publish] cannot express — for Kafka, the record key
+// (contract §6.5). The [App] uses it for every re-publish it makes from a received message
+// (retry, unknown-URN release fallback, dead-letter writes). from is the received message the
+// republish stands in for, never nil. An implementation that also routes on
+// [ReceivedMessage.RouteURN] (see [RoutedPublisher]) must honour that itself. A transport that
+// does not implement this falls back to [RoutedPublisher] / plain Publish, so the metadata is
+// simply not carried.
+type KeyedRepublisher interface {
+	PublishFrom(ctx context.Context, queue, body string, from *ReceivedMessage) error
+}
+
 // publishKeepingRoute publishes body to queue, carrying routeURN when it is non-empty and t
 // implements [RoutedPublisher]; otherwise it is a plain Publish. Shared by the App's re-publishes
 // (retry, release, dead-letter) and by [Redrive].

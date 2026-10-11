@@ -9,7 +9,24 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Added
+
+- **core: optional `KeyedRepublisher` transport capability** (`PublishFrom(ctx, queue, body, from)`).
+  The `App` now hands the received message to a transport that implements it for every re-publish
+  it makes on that message's behalf (retry, unknown-URN release fallback, dead-letter writes), so
+  broker-native per-message metadata the plain `Publish` cannot express can be carried over.
+  Additive and opt-in (a transport without it behaves exactly as before); this new exported
+  interface makes the next core release a MINOR.
+
 ### Fixed
+
+- **`kafka`: a retry or dead-letter re-publish now keeps the consumed record's key.** The
+  `kafka` `Transport` implements `KeyedRepublisher`: the retry re-publish, the envelope
+  dead-letter write and the raw / version-gated (poison) dead-letter write carry the original
+  record key byte-for-byte (a null key stays null, an empty key stays empty; a key is never
+  synthesised). Previously the key was dropped (contract §6.5). Partition equality is not
+  guaranteed. Envelope, `dead_letter` block and header projection are unchanged; the `kafka`
+  module's next release is a MINOR with the core.
 
 - **core `App`: a failed re-publish on the retry and unknown-URN release paths no longer loses the
   message.** When a transport has no in-place `Releaser` (or reports `ErrReleaseUnsupported`), a

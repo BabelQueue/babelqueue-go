@@ -596,8 +596,12 @@ func (a *App) retryOrDeadLetter(ctx context.Context, msg *ReceivedMessage, env E
 // dead-letter record (queue is the DLQ). When the delivery was routed on a URN taken from
 // the transport's routing property ([ReceivedMessage.RouteURN]) and the transport implements
 // [RoutedPublisher], that URN is carried onto the re-published message, so the route stays
-// constant across retries; otherwise it is a plain Publish.
+// constant across retries; a transport implementing [KeyedRepublisher] (Kafka: the record key)
+// takes over the whole re-publish instead; otherwise it is a plain Publish.
 func (a *App) republish(ctx context.Context, msg *ReceivedMessage, queue, body string) error {
+	if kr, ok := a.transport.(KeyedRepublisher); ok {
+		return kr.PublishFrom(ctx, queue, body, msg)
+	}
 	return publishKeepingRoute(ctx, a.transport, queue, body, msg.RouteURN)
 }
 

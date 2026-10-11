@@ -221,6 +221,21 @@ func (t *Transport) Publish(ctx context.Context, queue, body string) error {
 	return t.writer.WriteMessages(ctx, message(queue, body))
 }
 
+// PublishFrom implements [babelqueue.KeyedRepublisher]: it writes body to queue like Publish and
+// carries the key of the record from reserved, byte-for-byte — a null key stays null and an empty
+// key stays empty (§6.5). It is how the App's retry and dead-letter re-publishes keep the
+// consumed record's key. A from that carries no Kafka record (not reserved by this transport)
+// yields a keyless record, exactly as Publish does. The key is never synthesised.
+func (t *Transport) PublishFrom(ctx context.Context, queue, body string, from *babelqueue.ReceivedMessage) error {
+	m := message(queue, body)
+	if from != nil {
+		if km, ok := from.Handle.(kafkago.Message); ok {
+			m.Key = km.Key
+		}
+	}
+	return t.writer.WriteMessages(ctx, m)
+}
+
 // Pop reserves the next record (FetchMessage, no auto-commit), bounded by timeout (and
 // WithMaxWaitTime). It reconciles attempts from the authoritative bq-attempts header. Returns
 // (nil, nil) when no record arrives before the deadline.
@@ -423,4 +438,7 @@ func notifyRejected(fn OnSchemaVersionRejected, version, queue string) {
 	fn(version, queue)
 }
 
-var _ babelqueue.Transport = (*Transport)(nil)
+var (
+	_ babelqueue.Transport        = (*Transport)(nil)
+	_ babelqueue.KeyedRepublisher = (*Transport)(nil)
+)
