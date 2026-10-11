@@ -9,6 +9,31 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Added
+
+- **core `Redrive`: now uses the optional `KeyedRepublisher` capability.** A DLQ redrive (ADR-0026)
+  re-publishes through `PublishFrom` when the transport implements it, for both the write to the
+  work topic and the restore write back to the DLQ (dry run, unselected, undecodable body, failed
+  redrive write), so broker-native per-message metadata such as the Kafka record key is carried
+  over. A transport without the capability behaves exactly as before (route-preserving plain
+  publish); with `Bypass` set, a `HeaderPublisher` still takes precedence for the redrive write.
+  No new exported API; envelope, `dead_letter` block and header projection unchanged. Core MINOR.
+
+### Fixed
+
+- **core `Redrive`: a failed restore write no longer acks the DLQ message.** When writing a
+  message back to the DLQ fails (dry run, unselected, undecodable body, failed redrive write), the
+  error is now returned and the DLQ message is not acknowledged, so it stays on the DLQ instead of
+  being lost. Previously the restore error was swallowed and the message was acked
+  unconditionally. Matches the Java and .NET SDKs.
+- **`kafka`: the restore write back to the DLQ now preserves the record exactly.** Key, headers
+  and value (including a null value or a non-UTF-8 body) are written back byte-for-byte, matching
+  the Java and .NET Kafka transports.
+- **`kafka`: a DLQ redrive now keeps the DLQ record's key.** Redrive through the `kafka`
+  `Transport` (`KeyedRepublisher`) carries the key byte-for-byte on the redrive write and on the
+  restore write back to the DLQ (a null key stays null, an empty key stays empty; never
+  synthesised), per contract §6.5. Requires the core release containing the `Redrive` change above.
+
 ## [1.12.0] - 2026-10-11
 
 ### Added

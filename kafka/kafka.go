@@ -221,19 +221,36 @@ func (t *Transport) Publish(ctx context.Context, queue, body string) error {
 	return t.writer.WriteMessages(ctx, message(queue, body))
 }
 
-// PublishFrom implements [babelqueue.KeyedRepublisher]: it writes body to queue like Publish and
-// carries the key of the record from reserved, byte-for-byte — a null key stays null and an empty
-// key stays empty (§6.5). It is how the App's retry and dead-letter re-publishes keep the
-// consumed record's key. A from that carries no Kafka record (not reserved by this transport)
-// yields a keyless record, exactly as Publish does. The key is never synthesised.
+// PublishFrom implements [babelqueue.KeyedRepublisher]. It has two modes:
+//
+//   - Restore: queue is the topic of the reserved record and body is the body Pop returned for it
+//     (the redrive tool writing an unchanged DLQ record back). The original record is re-written
+//     verbatim: its value (a null value stays null), headers and key, with a fresh timestamp so
+//     the restored copy does not age out of the DLQ early. Nothing is re-projected from the body.
+//   - Republish: any other queue/body (a redrive to the work topic, a retry) is written like
+//     Publish (§6 header projection, created_at timestamp) and carries the key of the reserved
+//     record byte-for-byte — a null key stays null and an empty key stays empty (§6.5).
+//
+// A from that carries no Kafka record (not reserved by this transport) yields a keyless record,
+// exactly as Publish does. The key is never synthesised.
 func (t *Transport) PublishFrom(ctx context.Context, queue, body string, from *babelqueue.ReceivedMessage) error {
-	m := message(queue, body)
 	if from != nil {
 		if km, ok := from.Handle.(kafkago.Message); ok {
+			if queue == km.Topic && body == from.Body {
+				return t.writer.WriteMessages(ctx, kafkago.Message{
+					Topic:   km.Topic,
+					Key:     km.Key,
+					Value:   km.Value,
+					Headers: km.Headers,
+					Time:    time.Now(),
+				})
+			}
+			m := message(queue, body)
 			m.Key = km.Key
+			return t.writer.WriteMessages(ctx, m)
 		}
 	}
-	return t.writer.WriteMessages(ctx, m)
+	return t.writer.WriteMessages(ctx, message(queue, body))
 }
 
 // Pop reserves the next record (FetchMessage, no auto-commit), bounded by timeout (and

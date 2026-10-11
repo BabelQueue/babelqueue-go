@@ -82,8 +82,9 @@ func Redrive(ctx context.Context, t Transport, dlq string, opts RedriveOptions) 
 	res := RedriveResult{Items: make([]RedriveItem, 0, len(batch))}
 	for _, p := range batch {
 		if !p.decoded {
-			_ = publishKeepingRoute(ctx, t, dlq, p.msg.Body, p.msg.RouteURN) // restore the poison body; never drop it
-			_ = t.Ack(ctx, p.msg)
+			if rerr := restoreToDLQ(ctx, t, dlq, p.msg); rerr != nil { // restore the poison body; never drop it
+				return res, rerr
+			}
 			res.Skipped++
 			res.Items = append(res.Items, RedriveItem{From: dlq})
 			continue
@@ -100,8 +101,9 @@ func Redrive(ctx context.Context, t Transport, dlq string, opts RedriveOptions) 
 		}
 
 		if opts.Select != nil && !opts.Select(p.env) {
-			_ = publishKeepingRoute(ctx, t, dlq, p.msg.Body, p.msg.RouteURN) // not selected: restore unchanged
-			_ = t.Ack(ctx, p.msg)
+			if rerr := restoreToDLQ(ctx, t, dlq, p.msg); rerr != nil { // not selected: restore unchanged
+				return res, rerr
+			}
 			res.Skipped++
 			res.Items = append(res.Items, item)
 			continue
@@ -114,8 +116,9 @@ func Redrive(ctx context.Context, t Transport, dlq string, opts RedriveOptions) 
 		item.To = target
 
 		if opts.DryRun {
-			_ = publishKeepingRoute(ctx, t, dlq, p.msg.Body, p.msg.RouteURN) // report the plan; restore unchanged
-			_ = t.Ack(ctx, p.msg)
+			if rerr := restoreToDLQ(ctx, t, dlq, p.msg); rerr != nil { // report the plan; restore unchanged
+				return res, rerr
+			}
 			res.Skipped++
 			res.Items = append(res.Items, item)
 			continue
@@ -126,14 +129,12 @@ func Redrive(ctx context.Context, t Transport, dlq string, opts RedriveOptions) 
 		reset.Attempts = 0
 		body, err := reset.Encode()
 		if err != nil {
-			_ = publishKeepingRoute(ctx, t, dlq, p.msg.Body, p.msg.RouteURN) // restore on a re-encode failure
-			_ = t.Ack(ctx, p.msg)
+			_ = restoreToDLQ(ctx, t, dlq, p.msg) // restore on a re-encode failure; no ack if it fails
 			return res, err
 		}
-		bypassed, err := publishRedriven(ctx, t, target, string(body), opts.Bypass, p.msg.RouteURN)
+		bypassed, err := publishRedriven(ctx, t, target, string(body), opts.Bypass, p.msg)
 		if err != nil {
-			_ = publishKeepingRoute(ctx, t, dlq, p.msg.Body, p.msg.RouteURN) // restore on a publish failure
-			_ = t.Ack(ctx, p.msg)
+			_ = restoreToDLQ(ctx, t, dlq, p.msg) // restore on a publish failure; no ack if it fails
 			return res, err
 		}
 		_ = t.Ack(ctx, p.msg)
@@ -154,16 +155,38 @@ func sourceQueueOf(env Envelope) string {
 	return env.Meta.Queue
 }
 
-// publishRedriven re-publishes a reset message to queue. When bypass is set and the transport
-// is a [HeaderPublisher], it stamps the bq-replay-bypass header and reports bypassed=true;
-// otherwise it publishes plainly and reports bypassed=false. Either way, a non-empty routeURN
-// (the dead-lettered message's routing property, see [ReceivedMessage.RouteURN]) is carried back
-// to the source queue through [RoutedPublisher] when the transport implements it.
-func publishRedriven(ctx context.Context, t Transport, queue, body string, bypass bool, routeURN string) (bool, error) {
+// publishRedriven re-publishes a reset message to queue on behalf of the DLQ message from. When
+// bypass is set and the transport is a [HeaderPublisher], it stamps the bq-replay-bypass header
+// and reports bypassed=true (that path carries no record key); otherwise it re-publishes through
+// [republishFrom] and reports bypassed=false.
+func publishRedriven(ctx context.Context, t Transport, queue, body string, bypass bool, from *ReceivedMessage) (bool, error) {
 	if bypass {
 		if hp, ok := t.(HeaderPublisher); ok {
 			return true, hp.PublishWithHeaders(ctx, queue, body, map[string]string{HeaderReplayBypass: "1"})
 		}
 	}
-	return false, publishKeepingRoute(ctx, t, queue, body, routeURN)
+	return false, republishFrom(ctx, t, queue, body, from)
+}
+
+// restoreToDLQ writes the reserved DLQ message back to the DLQ unchanged and acknowledges it only
+// when that write succeeded. A failed restore leaves the message unacknowledged (so the broker
+// redelivers it) and returns the write error: the original is never dropped.
+func restoreToDLQ(ctx context.Context, t Transport, dlq string, msg *ReceivedMessage) error {
+	if err := republishFrom(ctx, t, dlq, msg.Body, msg); err != nil {
+		return err
+	}
+	_ = t.Ack(ctx, msg)
+	return nil
+}
+
+// republishFrom re-publishes body to queue on behalf of the reserved message from. A transport
+// implementing [KeyedRepublisher] (Kafka: the record key, contract §6.5) takes over the whole
+// re-publish so the DLQ record's key is carried byte-for-byte; otherwise a non-empty
+// from.RouteURN is carried back through [RoutedPublisher] when available, else a plain Publish.
+// It is used for both the redrive write and the restore write back to the DLQ.
+func republishFrom(ctx context.Context, t Transport, queue, body string, from *ReceivedMessage) error {
+	if kr, ok := t.(KeyedRepublisher); ok {
+		return kr.PublishFrom(ctx, queue, body, from)
+	}
+	return publishKeepingRoute(ctx, t, queue, body, from.RouteURN)
 }

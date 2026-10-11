@@ -290,3 +290,43 @@ func TestRedrive_KeepsTheRouteURN(t *testing.T) {
 		t.Errorf("no-route redrive used PublishRouted: %v", tr3.routed)
 	}
 }
+
+// failAllPublishAck refuses every publish and records acks, to prove a message is acknowledged
+// only after its restore write to the DLQ succeeded.
+type failAllPublishAck struct {
+	*InMemoryTransport
+	acks int
+}
+
+func (f *failAllPublishAck) Publish(context.Context, string, string) error {
+	return errors.New("broker unavailable")
+}
+
+func (f *failAllPublishAck) Ack(context.Context, *ReceivedMessage) error {
+	f.acks++
+	return nil
+}
+
+func TestRedrive_FailedRestoreIsNotAcked(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts RedriveOptions
+	}{
+		{"dry-run", RedriveOptions{DryRun: true}},
+		{"not-selected", RedriveOptions{Select: func(Envelope) bool { return false }}},
+		{"redrive-then-restore", RedriveOptions{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := NewInMemoryTransport()
+			deadLettered(t, base, "dlq", "urn:babel:orders:created", "orders", nil)
+			tr := &failAllPublishAck{InMemoryTransport: base}
+
+			if _, err := Redrive(context.Background(), tr, "dlq", tc.opts); err == nil {
+				t.Fatal("expected the failed write to surface")
+			}
+			if tr.acks != 0 {
+				t.Errorf("a message whose restore failed must not be acknowledged, got %d ack(s)", tr.acks)
+			}
+		})
+	}
+}
