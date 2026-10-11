@@ -473,3 +473,164 @@ func TestPopSchemaGateTruncatesLongDeclaredVersion(t *testing.T) {
 		t.Errorf("a 64-character value must not be truncated, got %q", msg.RouteURN)
 	}
 }
+
+// The Writer New builds on its own must not use kafka-go's shared default Transport (6s metadata
+// TTL, negative answers cached) and must wait for broker acknowledgements (RequireAll).
+func TestDefaultWriterUsesOwnTransportAndRequireAll(t *testing.T) {
+	tr, err := New(WithBrokers("localhost:9092"), WithGroupID("g"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tr.Close() }()
+
+	w, ok := tr.writer.(*kafkago.Writer)
+	if !ok {
+		t.Fatalf("default writer is %T, want *kafkago.Writer", tr.writer)
+	}
+	if w.RequiredAcks != kafkago.RequireAll {
+		t.Errorf("RequiredAcks = %v, want RequireAll", w.RequiredAcks)
+	}
+	kt, ok := w.Transport.(*kafkago.Transport)
+	if !ok || kt == nil {
+		t.Fatalf("Writer.Transport = %T, want its own *kafkago.Transport", w.Transport)
+	}
+	if kt == kafkago.DefaultTransport {
+		t.Error("Writer.Transport is the shared kafka-go DefaultTransport")
+	}
+	if kt.MetadataTTL != time.Second {
+		t.Errorf("MetadataTTL = %v, want 1s", kt.MetadataTTL)
+	}
+	if tr.ownedTransport != kt {
+		t.Error("the transport's owned Transport is not the one the Writer uses")
+	}
+	// Two transports must not share a kafka-go Transport (and its metadata cache).
+	tr2, err := New(WithBrokers("localhost:9092"), WithGroupID("g"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tr2.Close() }()
+	if tr2.ownedTransport == tr.ownedTransport {
+		t.Error("two transports share one kafka-go Transport")
+	}
+}
+
+// closeCountingWriter is an injected Writer that counts Close calls.
+type closeCountingWriter struct {
+	fakeWriter
+	closes int
+}
+
+func (w *closeCountingWriter) Close() error { w.closes++; return nil }
+
+// WithWriter keeps its semantics: the injected Writer is used as is and Close leaves it open.
+func TestWithWriterIsNotOwned(t *testing.T) {
+	fw := &closeCountingWriter{}
+	tr, err := New(WithWriter(fw), WithReaderFactory(func(string) Reader { return &fakeReader{} }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tr.writer != Writer(fw) || tr.owned != nil || tr.ownedTransport != nil {
+		t.Fatal("an injected Writer must be used unchanged and not owned")
+	}
+	if err := tr.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if fw.closes != 0 {
+		t.Fatalf("injected Writer was closed %d times; it belongs to the caller", fw.closes)
+	}
+}
+
+// Close closes the readers the transport opened.
+func TestCloseClosesReaders(t *testing.T) {
+	log := &offsetLog{records: []kafkago.Message{{Topic: "orders", Offset: 0, Value: []byte(sampleBody(t, 0))}}}
+	tr, err := New(WithWriter(&fakeWriter{}), WithReaderFactory(func(string) Reader { return log.newReader() }),
+		WithMaxWaitTime(20*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tr.Pop(context.Background(), "orders", 0); err != nil {
+		t.Fatal(err)
+	}
+	if err := tr.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if log.closed != 1 {
+		t.Fatalf("readers closed = %d, want 1", log.closed)
+	}
+}
+
+// A retry whose re-publish fails is now visible (the default Writer waits for the broker): the
+// core App must not acknowledge the record, so nothing is committed and the record is handed
+// back (reader rewound) instead of being lost.
+func TestRetryRepublishFailureDoesNotCommit(t *testing.T) {
+	rec := kafkago.Message{Topic: "orders", Partition: 0, Offset: 0, Value: []byte(sampleBody(t, 0))}
+	log := &offsetLog{records: []kafkago.Message{rec}}
+	w := &failingWriter{}
+
+	tr, err := New(WithWriter(w), WithReaderFactory(func(string) Reader { return log.newReader() }),
+		WithMaxWaitTime(20*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := babelqueue.NewApp(tr, babelqueue.WithMaxAttempts(3), babelqueue.WithRewindPause(0))
+	app.Handle(urn, func(context.Context, babelqueue.Envelope) error { return errors.New("boom") })
+
+	if _, err := app.Drain(context.Background(), "orders", 2); err != nil {
+		t.Fatal(err)
+	}
+	if w.calls == 0 {
+		t.Fatal("the retry re-publish was never attempted")
+	}
+	if len(log.commits) != 0 || log.committed != 0 {
+		t.Fatalf("commits = %v; a record whose retry re-publish failed must not be committed", log.commits)
+	}
+	if log.closed == 0 {
+		t.Fatal("the record was not handed back (reader not rewound)")
+	}
+	for i, off := range log.fetched {
+		if off != 0 {
+			t.Fatalf("fetch #%d returned offset %d; want the same record redelivered", i, off)
+		}
+	}
+}
+
+// failingWriter rejects every write.
+type failingWriter struct{ calls int }
+
+func (w *failingWriter) WriteMessages(context.Context, ...kafkago.Message) error {
+	w.calls++
+	return errors.New("broker unavailable")
+}
+
+// After Close, Pop and Ack fail with ErrClosed and never open a new reader (it would rejoin the
+// consumer group and never be closed); a second Close is a no-op.
+func TestPopAfterCloseDoesNotOpenReader(t *testing.T) {
+	log := &offsetLog{records: []kafkago.Message{{Topic: "orders", Offset: 0, Value: []byte(sampleBody(t, 0))}}}
+	tr, err := New(WithWriter(&fakeWriter{}), WithReaderFactory(func(string) Reader { return log.newReader() }),
+		WithMaxWaitTime(20*time.Millisecond))
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, err := tr.Pop(context.Background(), "orders", 0)
+	if err != nil || msg == nil {
+		t.Fatalf("Pop = %v, %v", msg, err)
+	}
+	if err := tr.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tr.Pop(context.Background(), "orders", 0); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Pop after Close error = %v, want ErrClosed", err)
+	}
+	if err := tr.Ack(context.Background(), msg); !errors.Is(err, ErrClosed) {
+		t.Fatalf("Ack after Close error = %v, want ErrClosed", err)
+	}
+	if log.opened != 1 || log.closed != 1 {
+		t.Fatalf("readers opened = %d, closed = %d; want 1 and 1 (no reader after Close)", log.opened, log.closed)
+	}
+	if err := tr.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+	if log.closed != 1 {
+		t.Fatalf("readers closed = %d after second Close, want 1", log.closed)
+	}
+}

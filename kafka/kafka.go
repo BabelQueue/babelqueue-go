@@ -60,8 +60,39 @@ type Transport struct {
 
 	onRejected OnSchemaVersionRejected
 
+	// owned is closed by Close: the writer and its private kafka-go Transport that New built
+	// itself (nil when the caller injected a Writer via WithWriter, which stays the caller's).
+	owned          *kafkago.Writer
+	ownedTransport *kafkago.Transport
+
 	mu      sync.Mutex
 	readers map[string]Reader
+	closed  bool
+}
+
+// ErrClosed is returned by Pop and Ack once [Transport.Close] has run: a closed transport never
+// opens a new consumer-group reader (it would rejoin the group and never be closed).
+var ErrClosed = errors.New("kafka: transport is closed")
+
+// metadataTTL is the metadata cache lifetime of the Transport New builds for its own Writer.
+// kafka-go's shared default Transport caches metadata for 6s, and a negative answer ("Unknown
+// Topic Or Partition" for a topic created moments ago) is cached too, so the first write to a
+// new topic could fail for several seconds. One second keeps that window short.
+const metadataTTL = time.Second
+
+// newWriter builds the Writer New uses when none is injected: its own kafka-go Transport (short
+// metadata TTL, see [metadataTTL]) and RequireAll, so a write returns only once the in-sync
+// replicas hold the record (the zero value, RequireNone, would not wait for any broker
+// acknowledgement and would hide a failed retry or dead-letter write from the App).
+func newWriter(brokers []string) (*kafkago.Writer, *kafkago.Transport) {
+	tp := &kafkago.Transport{MetadataTTL: metadataTTL}
+	w := &kafkago.Writer{
+		Addr:         kafkago.TCP(brokers...),
+		Balancer:     &kafkago.LeastBytes{},
+		RequiredAcks: kafkago.RequireAll,
+		Transport:    tp,
+	}
+	return w, tp
 }
 
 // Option customizes [New].
@@ -124,7 +155,8 @@ func New(opts ...Option) (*Transport, error) {
 		return nil, errors.New("kafka: provide WithBrokers (+ WithGroupID), or WithWriter + WithReaderFactory")
 	}
 	if t.writer == nil {
-		t.writer = &kafkago.Writer{Addr: kafkago.TCP(c.brokers...), Balancer: &kafkago.LeastBytes{}}
+		t.owned, t.ownedTransport = newWriter(c.brokers)
+		t.writer = t.owned
 	}
 	if t.newReader == nil {
 		if c.groupID == "" {
@@ -138,15 +170,50 @@ func New(opts ...Option) (*Transport, error) {
 	return t, nil
 }
 
-func (t *Transport) reader(queue string) Reader {
+func (t *Transport) reader(queue string) (Reader, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.closed {
+		return nil, ErrClosed
+	}
 	if r, ok := t.readers[queue]; ok {
-		return r
+		return r, nil
 	}
 	r := t.newReader(queue)
 	t.readers[queue] = r
-	return r
+	return r, nil
+}
+
+// Close releases what the transport created: the readers it opened and, when it built its own
+// Writer (no [WithWriter]), that Writer and its private kafka-go Transport. A Writer injected
+// with [WithWriter] is left open; it belongs to the caller. After Close, Pop and Ack return
+// [ErrClosed] and never open a new reader; a second Close is a no-op. It returns the first error.
+func (t *Transport) Close() error {
+	t.mu.Lock()
+	if t.closed {
+		t.mu.Unlock()
+		return nil
+	}
+	t.closed = true
+	readers := t.readers
+	t.readers = make(map[string]Reader)
+	t.mu.Unlock()
+
+	var first error
+	for _, r := range readers {
+		if c, ok := r.(io.Closer); ok {
+			if err := c.Close(); err != nil && first == nil {
+				first = err
+			}
+		}
+	}
+	if t.owned != nil {
+		if err := t.owned.Close(); err != nil && first == nil {
+			first = err
+		}
+		t.ownedTransport.CloseIdleConnections()
+	}
+	return first
 }
 
 // Publish writes body to the queue topic with the §6 header projection.
@@ -168,7 +235,11 @@ func (t *Transport) Pop(ctx context.Context, queue string, timeout time.Duration
 		rctx, cancel = context.WithTimeout(ctx, wait)
 		defer cancel()
 	}
-	msg, err := t.reader(queue).FetchMessage(rctx)
+	r, err := t.reader(queue)
+	if err != nil {
+		return nil, err
+	}
+	msg, err := r.FetchMessage(rctx)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
 			return nil, nil
@@ -201,7 +272,11 @@ func (t *Transport) Ack(ctx context.Context, msg *babelqueue.ReceivedMessage) er
 	if !ok {
 		return nil
 	}
-	return t.reader(msg.Queue).CommitMessages(ctx, km)
+	r, err := t.reader(msg.Queue)
+	if err != nil {
+		return err
+	}
+	return r.CommitMessages(ctx, km)
 }
 
 // Rewind implements [babelqueue.Rewinder]: it puts the consumer back at the reserved record's

@@ -349,3 +349,49 @@ func TestIntegrationVersionGateRejectionReachesDLQ(t *testing.T) {
 		t.Errorf("DLQ holds a second record: %s", extra.Value)
 	}
 }
+
+// The default Writer (no WithWriter) runs on the module's own Transport with a 1s metadata TTL and
+// RequireAll. A topic created right after a failed write to it must accept the next write within
+// the TTL window instead of failing for kafka-go's default 6s, and a write to a fresh topic
+// succeeds at once.
+func TestIntegrationDefaultWriterFirstWriteToNewTopic(t *testing.T) {
+	brokers := integrationBrokers(t)
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 36)
+
+	tr, err := New(WithBrokers(brokers...), WithGroupID("bq-it-group-"+suffix))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = tr.Close() })
+	body := sampleBody(t, 0)
+
+	// First write to a topic created just before: no retry, no warm-up.
+	fresh := "bq-it-fresh-" + suffix
+	createTopics(t, brokers, fresh)
+	start := time.Now()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := tr.Publish(ctx, fresh, body); err != nil {
+		t.Fatalf("first write to a new topic: %v", err)
+	}
+	t.Logf("first write to a new topic took %s", time.Since(start))
+
+	// A write to a missing topic fails (and caches that answer); once the topic exists the same
+	// transport must succeed within a few seconds, well under the 6s default metadata TTL.
+	late := "bq-it-late-" + suffix
+	if err := tr.Publish(ctx, late, body); err == nil {
+		t.Skip("broker auto-created the topic; negative-metadata scenario not reproducible")
+	}
+	createTopics(t, brokers, late)
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		err := tr.Publish(ctx, late, body)
+		if err == nil {
+			break
+		}
+		if !isUnknownTopic(err) || time.Now().After(deadline) {
+			t.Fatalf("write after the topic was created: %v", err)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}

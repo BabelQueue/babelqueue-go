@@ -22,6 +22,26 @@ The envelope wire format is versioned separately by `meta.schema_version`
   recovered). An envelope re-encode failure on the retry path is handled the same way. No
   public API, envelope or `dead_letter` change; core PATCH.
 
+- **`kafka`: the default Writer no longer shares kafka-go's default Transport and now waits for
+  broker acknowledgement.** The Writer `New` builds (when no `WithWriter` is given) used the shared
+  default `kafkago.Transport`, whose 6s metadata cache also holds a negative answer, so the first
+  write to a topic created moments earlier could fail with `Unknown Topic Or Partition`; and its
+  `RequiredAcks` was the zero value (`RequireNone`), so a write was reported successful without
+  waiting for any broker acknowledgement and broker-side produce failures (for example a failed
+  retry or dead-letter re-publish) went unnoticed. It now uses a module-owned
+  `Transport{MetadataTTL: 1s}` and `RequiredAcks: RequireAll`; such a failure is returned and the
+  core `App` does not acknowledge the record (it is handed back). Impact: `Publish` latency now
+  includes the in-sync replicas' acknowledgement. A Writer injected with `WithWriter` is unchanged.
+  No envelope or wire change.
+
+### Added
+
+- **`kafka`: `(*Transport).Close()` and `ErrClosed`.** `Close` closes the readers the transport
+  opened and, when it built its own Writer (no `WithWriter`), that Writer and its private kafka-go
+  Transport; an injected Writer is left to its owner. After `Close`, `Pop` and `Ack` return
+  `ErrClosed` and never open a new reader; a second `Close` is a no-op. New public API, so the
+  `kafka` module is released as a MINOR.
+
 ## [1.11.1] - 2026-10-11
 
 ### Changed
