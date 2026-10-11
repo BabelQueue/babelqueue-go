@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.12.0] - 2026-10-11
+
 ### Added
 
 - **core: optional `KeyedRepublisher` transport capability** (`PublishFrom(ctx, queue, body, from)`).
@@ -17,6 +19,12 @@ The envelope wire format is versioned separately by `meta.schema_version`
   broker-native per-message metadata the plain `Publish` cannot express can be carried over.
   Additive and opt-in (a transport without it behaves exactly as before); this new exported
   interface makes the next core release a MINOR.
+
+- **`kafka`: `(*Transport).Close()` and `ErrClosed`.** `Close` closes the readers the transport
+  opened and, when it built its own Writer (no `WithWriter`), that Writer and its private kafka-go
+  Transport; an injected Writer is left to its owner. After `Close`, `Pop` and `Ack` return
+  `ErrClosed` and never open a new reader; a second `Close` is a no-op. New public API, so the
+  `kafka` module is released as a MINOR.
 
 ### Fixed
 
@@ -51,13 +59,14 @@ The envelope wire format is versioned separately by `meta.schema_version`
   includes the in-sync replicas' acknowledgement. A Writer injected with `WithWriter` is unchanged.
   No envelope or wire change.
 
-### Added
+- **`kafka`: core pin raised to `v1.12.0`.** Key preservation needs the core `KeyedRepublisher`
+  capability and the no-ack-on-failed-republish fix lives in the core `App`; the local
+  `replace => ../` hides a stale pin from the repo's own tests but not from a consumer.
 
-- **`kafka`: `(*Transport).Close()` and `ErrClosed`.** `Close` closes the readers the transport
-  opened and, when it built its own Writer (no `WithWriter`), that Writer and its private kafka-go
-  Transport; an injected Writer is left to its owner. After `Close`, `Pop` and `Ack` return
-  `ErrClosed` and never open a new reader; a second `Close` is a no-op. New public API, so the
-  `kafka` module is released as a MINOR.
+### Release note for the transport modules
+
+Tag the core `v1.12.0` first, then `kafka/v1.2.0` (MINOR: `Close()`/`ErrClosed`, module-owned
+Transport, key preservation). The other transport modules are unchanged and keep their pins.
 
 ## [1.11.1] - 2026-10-11
 
