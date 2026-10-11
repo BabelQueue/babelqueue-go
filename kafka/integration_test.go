@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"strconv"
@@ -21,6 +22,7 @@ import (
 
 	babelqueue "github.com/babelqueue/babelqueue-go"
 	kafkago "github.com/segmentio/kafka-go"
+	"github.com/segmentio/kafka-go/protocol"
 )
 
 const integrationURN = "urn:babel:integration:kafka"
@@ -393,5 +395,222 @@ func TestIntegrationDefaultWriterFirstWriteToNewTopic(t *testing.T) {
 			t.Fatalf("write after the topic was created: %v", err)
 		}
 		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// rawRecord is one broker record read at the protocol level. Key is nil for a null key and a
+// non-nil (possibly zero-length) slice otherwise: the high-level kafka-go Reader cannot make that
+// distinction (it returns a nil Message.Key for both), so the key assertions below read the log
+// with Client.Fetch instead.
+type rawRecord struct {
+	Offset int64
+	Key    []byte
+	Value  []byte
+}
+
+// fetchRecords reads every record currently on partition 0 of topic, from the start.
+func fetchRecords(t *testing.T, brokers []string, topic string) []rawRecord {
+	t.Helper()
+	client := &kafkago.Client{Addr: kafkago.TCP(brokers...), Timeout: 10 * time.Second}
+	var out []rawRecord
+	var next int64
+	for {
+		resp, err := client.Fetch(context.Background(), &kafkago.FetchRequest{
+			Topic: topic, Partition: 0, Offset: next, MinBytes: 1, MaxBytes: 1 << 20, MaxWait: time.Second,
+		})
+		if err != nil {
+			t.Fatalf("fetch %s@%d: %v", topic, next, err)
+		}
+		if resp.Error != nil {
+			t.Fatalf("fetch %s@%d: %v", topic, next, resp.Error)
+		}
+		got := 0
+		for resp.Records != nil {
+			rec, err := resp.Records.ReadRecord()
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Fatalf("read record on %s: %v", topic, err)
+			}
+			if rec.Offset < next {
+				continue // a batch may start before the requested offset
+			}
+			rr := rawRecord{Offset: rec.Offset}
+			if rec.Key != nil {
+				if rr.Key, err = protocol.ReadAll(rec.Key); err != nil {
+					t.Fatalf("read key on %s@%d: %v", topic, rec.Offset, err)
+				}
+			}
+			if rec.Value != nil {
+				if rr.Value, err = protocol.ReadAll(rec.Value); err != nil {
+					t.Fatalf("read value on %s@%d: %v", topic, rec.Offset, err)
+				}
+			}
+			out = append(out, rr)
+			next = rec.Offset + 1
+			got++
+		}
+		if resp.Records != nil {
+			if c, ok := resp.Records.(io.Closer); ok {
+				_ = c.Close()
+			}
+		}
+		if got == 0 {
+			return out
+		}
+	}
+}
+
+// waitForRecords polls topic until it holds at least want records or wait elapses.
+func waitForRecords(t *testing.T, brokers []string, topic string, want int, wait time.Duration) []rawRecord {
+	t.Helper()
+	deadline := time.Now().Add(wait)
+	for {
+		recs := fetchRecords(t, brokers, topic)
+		if len(recs) >= want {
+			return recs
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s holds %d record(s) after %s, want at least %d", topic, len(recs), wait, want)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// keyMismatch describes how got differs from want, or returns "" when they are identical
+// (null vs empty included). A non-null key is therefore always distinct from a null one.
+func keyMismatch(want, got []byte) string {
+	switch {
+	case want == nil && got != nil:
+		return fmt.Sprintf("want null key, got %q", got)
+	case want != nil && got == nil:
+		return fmt.Sprintf("want key %q, got null key", want)
+	case !bytes.Equal(want, got):
+		return fmt.Sprintf("want key %q, got %q", want, got)
+	}
+	return ""
+}
+
+// Live proof of broker-bindings.md §6.5 (record key on republish): a record seeded with a null,
+// non-empty or empty key is taken through the retry republish, the DLQ write, the dry-run restore
+// and the redrive, and every hop is read back from the broker log with a raw Client.Fetch.
+//
+// Null and non-empty keys must survive every hop byte-for-byte. The empty key is a KNOWN LIMIT of
+// the Go SDK, not a pass: the seeded record is verified to carry a genuinely zero-length key, but
+// every record that is then consumed goes through kafka-go (v0.4.51) Reader, whose decoder
+// (readNewBytes) only allocates for n > 0 and so returns a nil Message.Key for a zero-length key.
+// The Go consumer's retry and DLQ writes and the redrive's restore/redrive writes (redrive pops
+// through the same Reader) therefore all write a NULL key. §6.5 only says an SDK SHOULD carry the
+// key byte-for-byte; the other SDKs keep the empty key, Go cannot with the high-level Reader.
+// The empty subtest asserts this observed behaviour (consumed: nil) so the limit is pinned: if a
+// kafka-go upgrade or a protocol-level reader fixes it, the subtest fails and must be flipped to
+// consumed: []byte{} (and the CHANGELOG "Known limitations" note removed).
+func TestIntegrationRecordKeySurvivesRetryDLQAndRedrive(t *testing.T) {
+	brokers := integrationBrokers(t)
+	for _, tc := range []struct {
+		name string
+		key  []byte // the key on the seeded record
+		// consumed is the key expected on every record written after a Reader consume. Equal to key
+		// except for the empty key, which the kafka-go Reader reports as nil (known limit, see above).
+		consumed []byte
+	}{
+		{name: "null", key: nil, consumed: nil},
+		{name: "keyed", key: []byte("order-1042"), consumed: []byte("order-1042")},
+		{name: "empty", key: []byte{}, consumed: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			suffix := strconv.FormatInt(time.Now().UnixNano(), 36)
+			queue := "bq-it-key-" + tc.name + "-" + suffix
+			dlq := queue + ".dlq"
+			sandbox := queue + ".sandbox"
+			createTopics(t, brokers, queue, dlq, sandbox)
+
+			var mismatches []string
+			check := func(hop string, want, got []byte) {
+				if m := keyMismatch(want, got); m != "" {
+					mismatches = append(mismatches, hop+": "+m)
+				}
+			}
+
+			tr, err := New(WithBrokers(brokers...), WithWriter(isolatedWriter(t, brokers)), WithGroupID("bq-it-group-"+suffix))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = tr.Close() })
+			app := babelqueue.NewApp(tr,
+				babelqueue.WithDefaultQueue(queue),
+				babelqueue.WithMaxAttempts(2),
+				babelqueue.WithDeadLetter(true),
+				babelqueue.WithPollTimeout(2*time.Second),
+			)
+			app.Handle(integrationURN, func(context.Context, babelqueue.Envelope) error { return fmt.Errorf("boom") })
+
+			env, err := babelqueue.Make(integrationURN, map[string]any{"marker": suffix}, babelqueue.WithQueue(queue))
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, err := env.Encode()
+			if err != nil {
+				t.Fatal(err)
+			}
+			seedRecord(t, brokers, queue, kafkago.Message{
+				Key:     tc.key,
+				Value:   body,
+				Headers: []kafkago.Header{{Key: "bq-job", Value: []byte(integrationURN)}},
+			})
+			// The seeded record itself must carry the key under test, or the rest proves nothing.
+			if seeded := waitForRecords(t, brokers, queue, 1, 15*time.Second); keyMismatch(tc.key, seeded[0].Key) != "" {
+				t.Fatalf("seeded record: %s", keyMismatch(tc.key, seeded[0].Key))
+			}
+			startApp(t, app, queue)
+
+			// Retry: MaxAttempts=2 republishes the record once onto the work topic, then dead-letters.
+			dlqRecs := waitForRecords(t, brokers, dlq, 1, 90*time.Second)
+			work := waitForRecords(t, brokers, queue, 2, 30*time.Second)
+			for _, r := range work[1:] {
+				check(fmt.Sprintf("retry republish %s@%d", queue, r.Offset), tc.consumed, r.Key)
+			}
+			check("DLQ write "+dlq, tc.consumed, dlqRecs[0].Key)
+			if len(dlqRecs) != 1 {
+				t.Fatalf("DLQ holds %d records after the first dead-letter, want 1", len(dlqRecs))
+			}
+
+			// Dry run: the record is popped and restored verbatim, so the DLQ now holds the
+			// original plus its restore. A real redrive then drains the restore (the group's
+			// committed offset already moved past the original) onto a sandbox topic.
+			ops, err := New(WithBrokers(brokers...), WithWriter(isolatedWriter(t, brokers)), WithGroupID("bq-it-ops-"+suffix))
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = ops.Close() })
+			ctx := context.Background()
+			res, err := babelqueue.Redrive(ctx, ops, dlq, babelqueue.RedriveOptions{DryRun: true, Timeout: 10 * time.Second})
+			if err != nil {
+				t.Fatalf("dry-run redrive: %v", err)
+			}
+			if len(res.Items) != 1 {
+				t.Fatalf("dry-run saw %d messages, want 1", len(res.Items))
+			}
+			dlqRecs = waitForRecords(t, brokers, dlq, 2, 30*time.Second)
+			check("dry-run restore "+dlq, tc.consumed, dlqRecs[1].Key)
+
+			res, err = babelqueue.Redrive(ctx, ops, dlq, babelqueue.RedriveOptions{ToQueue: sandbox, Timeout: 10 * time.Second})
+			if err != nil {
+				t.Fatalf("redrive: %v", err)
+			}
+			if res.Redriven != 1 {
+				t.Fatalf("redriven %d messages, want 1 (%+v)", res.Redriven, res)
+			}
+			redriven := waitForRecords(t, brokers, sandbox, 1, 30*time.Second)
+			if len(redriven) != 1 {
+				t.Fatalf("sandbox holds %d records, want 1", len(redriven))
+			}
+			check("redrive "+sandbox, tc.consumed, redriven[0].Key)
+
+			for _, m := range mismatches {
+				t.Error(m)
+			}
+		})
 	}
 }

@@ -229,7 +229,10 @@ func (t *Transport) Publish(ctx context.Context, queue, body string) error {
 //     the restored copy does not age out of the DLQ early. Nothing is re-projected from the body.
 //   - Republish: any other queue/body (a redrive to the work topic, a retry) is written like
 //     Publish (§6 header projection, created_at timestamp) and carries the key of the reserved
-//     record byte-for-byte — a null key stays null and an empty key stays empty (§6.5).
+//     record byte-for-byte — a null key stays null and a non-empty key is unchanged (§6.5). PublishFrom
+//     writes whatever key bytes the reserved record carries, but a record read through Pop has
+//     already lost an empty key: kafka-go's Reader delivers a zero-length key as nil, so it is
+//     written as null (see the CHANGELOG "Known limitations").
 //
 // A from that carries no Kafka record (not reserved by this transport) yields a keyless record,
 // exactly as Publish does. The key is never synthesised.

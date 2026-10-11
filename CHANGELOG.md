@@ -31,8 +31,19 @@ The envelope wire format is versioned separately by `meta.schema_version`
   the Java and .NET Kafka transports.
 - **`kafka`: a DLQ redrive now keeps the DLQ record's key.** Redrive through the `kafka`
   `Transport` (`KeyedRepublisher`) carries the key byte-for-byte on the redrive write and on the
-  restore write back to the DLQ (a null key stays null, an empty key stays empty; never
-  synthesised), per contract §6.5. Requires the core release containing the `Redrive` change above.
+  restore write back to the DLQ (a null key stays null and a non-empty key is carried
+  byte-for-byte; never synthesised), per contract §6.5. An empty key is the exception: see
+  Known limitations. Requires the core release containing the `Redrive` change above.
+
+### Known limitations
+
+- **`kafka`: an empty (zero-length) record key is written back as a null key.** kafka-go's
+  high-level `Reader` (v0.4.51) cannot tell an empty record key from a null one: it returns a nil
+  `Message.Key` for both. Every record the Go consumer reads therefore loses an empty key, so the
+  consumer's retry and DLQ writes, and a DLQ redrive (which pops through the same `Reader`), write
+  a null key instead. Null and non-empty keys are carried byte-for-byte. The other SDKs preserve
+  an empty key (contract §6.5 SHOULD); a fix would need a protocol-level reader instead of
+  `kafka.Reader`. The live integration test pins this behaviour.
 
 ## [1.12.0] - 2026-10-11
 
