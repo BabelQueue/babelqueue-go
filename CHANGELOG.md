@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.11.1] - 2026-10-11
+
 ### Changed
 
 - **core `App` and the gating transports (`kafka`, `artemis`, `sqs`, `pulsar`, `azureservicebus`):
@@ -55,6 +57,15 @@ The envelope wire format is versioned separately by `meta.schema_version`
   (dead-letter path); it now falls through to the normal decode path, like a missing property and
   like Azure Service Bus (`null` = no version). Locked by a new `null` case in the shared
   conformance `artemis.schema_version_gate`. No wire change.
+
+- **`sqs`, `azureservicebus`, `kafka`, `artemis`, `pulsar`: core pin raised to `v1.11.1`.** The
+  raw gate dead-letter forward and the poison/failed-DLQ-write fixes live in the core `App`; the
+  local `replace => ../` hides a stale pin from the repo's own tests but not from a consumer.
+
+### Release note for the transport modules
+
+Tag the core `v1.11.1` first, then the modules: `artemis/v1.1.1`, `kafka/v1.1.1`, `sqs/v1.10.1`,
+`azureservicebus/v1.1.1` and `pulsar/v1.2.1` (each PATCH: core pin only, plus the `artemis` null fix).
 
 ## [1.11.0] - 2026-10-10
 
