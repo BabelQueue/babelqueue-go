@@ -108,6 +108,13 @@ type Releaser interface {
 // delivery, an undecodable body, or a message whose retries are exhausted) and must not be
 // lost: for an offset-committing broker (Kafka, where a commit is cumulative) it rewinds the
 // consumer to the message's offset; for a lock-based broker it releases or abandons the lock.
+// A DLQ redrive also calls it when it aborts after a publish failure: msg is then already restored
+// and acknowledged, and the call stands for the rest of the drained batch, which was popped but
+// never processed. That batch-wide meaning holds for an offset-committing broker (Kafka); on a
+// lock-based broker (Artemis, Azure Service Bus, Pulsar) the call only touches the message it is
+// given (already acknowledged, so a no-op) and the rest of the batch returns when its lock or
+// ack timeout lapses. An implementation must rewind to what is committed, never past it, so an
+// acknowledged message is not redelivered.
 // A transport whose unacknowledged messages already come back on their own (SQS visibility timeout) need not implement it. It must never delete or acknowledge the message,
 // and must not alter its body or attempt counters.
 type Rewinder interface {

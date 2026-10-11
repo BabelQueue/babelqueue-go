@@ -330,3 +330,176 @@ func TestRedrive_FailedRestoreIsNotAcked(t *testing.T) {
 		})
 	}
 }
+
+// rewindingRestoreTransport refuses every publish (so a restore write fails) and records Rewind
+// and Ack calls, to prove a failed restore rewinds the record instead of acknowledging it.
+type rewindingRestoreTransport struct {
+	*InMemoryTransport
+	acks      int
+	rewound   []*ReceivedMessage
+	rewindErr error
+}
+
+func (r *rewindingRestoreTransport) Publish(context.Context, string, string) error {
+	return errors.New("broker unavailable")
+}
+
+func (r *rewindingRestoreTransport) Ack(context.Context, *ReceivedMessage) error {
+	r.acks++
+	return nil
+}
+
+func (r *rewindingRestoreTransport) Rewind(_ context.Context, msg *ReceivedMessage) error {
+	r.rewound = append(r.rewound, msg)
+	return r.rewindErr
+}
+
+func TestRedrive_FailedRestoreRewinds(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		opts RedriveOptions
+	}{
+		{"dry-run", RedriveOptions{DryRun: true}},
+		{"not-selected", RedriveOptions{Select: func(Envelope) bool { return false }}},
+		{"redrive-then-restore", RedriveOptions{}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			base := NewInMemoryTransport()
+			deadLettered(t, base, "dlq", "urn:babel:orders:created", "orders", nil)
+			tr := &rewindingRestoreTransport{InMemoryTransport: base}
+
+			if _, err := Redrive(context.Background(), tr, "dlq", tc.opts); err == nil {
+				t.Fatal("expected the failed write to surface")
+			}
+			if len(tr.rewound) != 1 {
+				t.Fatalf("Rewind calls = %d, want 1", len(tr.rewound))
+			}
+			if tr.acks != 0 {
+				t.Errorf("a message whose restore failed must not be acknowledged, got %d ack(s)", tr.acks)
+			}
+		})
+	}
+}
+
+func TestRedrive_UndecodableFailedRestoreRewinds(t *testing.T) {
+	base := NewInMemoryTransport()
+	if err := base.Publish(context.Background(), "dlq", "not json"); err != nil {
+		t.Fatal(err)
+	}
+	tr := &rewindingRestoreTransport{InMemoryTransport: base}
+	if _, err := Redrive(context.Background(), tr, "dlq", RedriveOptions{}); err == nil {
+		t.Fatal("expected the failed write to surface")
+	}
+	if len(tr.rewound) != 1 || tr.acks != 0 {
+		t.Errorf("rewound=%d acks=%d, want 1 and 0", len(tr.rewound), tr.acks)
+	}
+}
+
+func TestRedrive_RewindFailureIsReportedWithTheRestoreError(t *testing.T) {
+	base := NewInMemoryTransport()
+	deadLettered(t, base, "dlq", "urn:babel:orders:created", "orders", nil)
+	rewindErr := errors.New("rewind failed")
+	tr := &rewindingRestoreTransport{InMemoryTransport: base, rewindErr: rewindErr}
+
+	_, err := Redrive(context.Background(), tr, "dlq", RedriveOptions{DryRun: true})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !errors.Is(err, rewindErr) {
+		t.Errorf("rewind error missing from %v", err)
+	}
+	if err.Error() == rewindErr.Error() {
+		t.Errorf("restore error missing from %v", err)
+	}
+	if tr.acks != 0 {
+		t.Errorf("acks = %d, want 0", tr.acks)
+	}
+}
+
+// A failed redrive publish whose restore also fails reports both errors and rewinds.
+func TestRedrive_PublishAndRestoreFailureReportBoth(t *testing.T) {
+	base := NewInMemoryTransport()
+	deadLettered(t, base, "dlq", "urn:babel:orders:created", "orders", nil)
+	tr := &rewindingRestoreTransport{InMemoryTransport: base}
+
+	_, err := Redrive(context.Background(), tr, "dlq", RedriveOptions{})
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if len(tr.rewound) != 1 || tr.acks != 0 {
+		t.Errorf("rewound=%d acks=%d, want 1 and 0", len(tr.rewound), tr.acks)
+	}
+}
+
+// workQueueDownTransport refuses publishes to every queue but the DLQ, so a redrive publish fails
+// while the restore write back to the DLQ succeeds. It records Rewind calls.
+type workQueueDownTransport struct {
+	*InMemoryTransport
+	dlq       string
+	acks      int
+	rewound   []*ReceivedMessage
+	rewindErr error
+}
+
+func (w *workQueueDownTransport) Publish(ctx context.Context, queue, body string) error {
+	if queue != w.dlq {
+		return errors.New("work queue unavailable")
+	}
+	return w.InMemoryTransport.Publish(ctx, queue, body)
+}
+
+func (w *workQueueDownTransport) Ack(context.Context, *ReceivedMessage) error {
+	w.acks++
+	return nil
+}
+
+func (w *workQueueDownTransport) Rewind(_ context.Context, msg *ReceivedMessage) error {
+	w.rewound = append(w.rewound, msg)
+	return w.rewindErr
+}
+
+// A failed redrive publish whose restore succeeds still aborts the run, leaving the rest of the
+// drained batch popped but unprocessed: the transport is rewound so a later cumulative commit
+// cannot skip those records, and the publish error is returned unchanged.
+func TestRedrive_PublishFailureRestoredThenRewindsRemainingBatch(t *testing.T) {
+	base := NewInMemoryTransport()
+	deadLettered(t, base, "dlq", "urn:babel:orders:created", "orders", nil)
+	deadLettered(t, base, "dlq", "urn:babel:orders:created", "orders", nil)
+	tr := &workQueueDownTransport{InMemoryTransport: base, dlq: "dlq"}
+
+	_, err := Redrive(context.Background(), tr, "dlq", RedriveOptions{})
+	if err == nil || err.Error() != "work queue unavailable" {
+		t.Fatalf("err = %v, want the bare publish error", err)
+	}
+	if len(tr.rewound) != 1 {
+		t.Errorf("Rewind calls = %d, want 1", len(tr.rewound))
+	}
+	if tr.acks != 1 {
+		t.Errorf("acks = %d, want 1 (the restored record only)", tr.acks)
+	}
+}
+
+func TestRedrive_PublishFailureRewindErrorIsJoined(t *testing.T) {
+	base := NewInMemoryTransport()
+	deadLettered(t, base, "dlq", "urn:babel:orders:created", "orders", nil)
+	rewindErr := errors.New("rewind failed")
+	tr := &workQueueDownTransport{InMemoryTransport: base, dlq: "dlq", rewindErr: rewindErr}
+
+	_, err := Redrive(context.Background(), tr, "dlq", RedriveOptions{})
+	if !errors.Is(err, rewindErr) || err.Error() == rewindErr.Error() {
+		t.Errorf("err = %v, want publish and rewind errors together", err)
+	}
+}
+
+// A transport that cannot rewind still returns the restore error and never acks.
+func TestRedrive_FailedRestoreWithoutRewinderStillNoAck(t *testing.T) {
+	base := NewInMemoryTransport()
+	deadLettered(t, base, "dlq", "urn:babel:orders:created", "orders", nil)
+	tr := &failAllPublishAck{InMemoryTransport: base}
+	if _, err := Redrive(context.Background(), tr, "dlq", RedriveOptions{DryRun: true}); err == nil {
+		t.Fatal("expected an error")
+	}
+	if tr.acks != 0 {
+		t.Errorf("acks = %d, want 0", tr.acks)
+	}
+}

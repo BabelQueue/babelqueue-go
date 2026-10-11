@@ -204,3 +204,121 @@ func TestRedriveToWorkTopicStillProjectsHeaders(t *testing.T) {
 		t.Fatalf("want 1 commit, got %d", len(fr.committed))
 	}
 }
+
+// A redrive whose restore write back to the DLQ fails must not commit (a Kafka commit is
+// cumulative, so a later commit would move the group past the unrestored record): the transport
+// rewinds, nothing is committed, and the next run sees the same record again.
+func TestRedriveFailedRestoreRewindsAndNeverCommitsPastTheRecord(t *testing.T) {
+	log := &offsetLog{records: []kafkago.Message{dlqRecord(t, []byte("k0")), dlqRecord(t, []byte("k1"))}}
+	for i := range log.records {
+		log.records[i].Offset = int64(i)
+	}
+	w := &dlqWriter{failDLQ: true}
+	tr, err := New(WithWriter(w), WithReaderFactory(func(string) Reader { return log.newReader() }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := babelqueue.RedriveOptions{DryRun: true, Timeout: 20 * time.Millisecond}
+
+	if _, err := babelqueue.Redrive(context.Background(), tr, "orders.dlq", opts); err == nil {
+		t.Fatal("expected the failed restore write to surface")
+	}
+	if log.closed != 1 {
+		t.Fatalf("readers closed = %d, want 1 (the failed restore must rewind)", log.closed)
+	}
+	if len(log.commits) != 0 || log.committed != 0 {
+		t.Fatalf("commits = %v, committed = %d; nothing may be committed after a failed restore", log.commits, log.committed)
+	}
+
+	// The DLQ recovers: the very same records come back, and are now restored and committed.
+	w.failDLQ = false
+	log.fetched = nil
+	res, err := babelqueue.Redrive(context.Background(), tr, "orders.dlq", opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Skipped != 2 {
+		t.Fatalf("res = %+v, want 2 restored", res)
+	}
+	if len(log.fetched) < 2 || log.fetched[0] != 0 || log.fetched[1] != 1 {
+		t.Fatalf("fetched = %v, want to start again at [0 1]", log.fetched)
+	}
+	if log.committed != 2 {
+		t.Fatalf("committed = %d, want 2", log.committed)
+	}
+}
+
+// workTopicWriter records writes and rejects those to the work topic while failWork is set.
+type workTopicWriter struct {
+	failWork bool
+	sent     []kafkago.Message
+}
+
+func (w *workTopicWriter) WriteMessages(_ context.Context, msgs ...kafkago.Message) error {
+	for _, m := range msgs {
+		if m.Topic == "orders" && w.failWork {
+			return errors.New("work topic unavailable")
+		}
+		w.sent = append(w.sent, m)
+	}
+	return nil
+}
+
+// A failed redrive publish whose restore succeeds aborts the run: the record is restored and
+// committed, then the transport rewinds so the rest of the drained batch (never processed) is
+// redelivered. The rewind lands on the committed offset, i.e. just past the restored record, so
+// the record is not seen (and restored) a second time.
+func TestRedrivePublishFailureRewindsRemainingBatchWithoutDuplicatingTheRestoredRecord(t *testing.T) {
+	log := &offsetLog{records: []kafkago.Message{dlqRecord(t, []byte("k0")), dlqRecord(t, []byte("k1"))}}
+	for i := range log.records {
+		log.records[i].Offset = int64(i)
+	}
+	w := &workTopicWriter{failWork: true}
+	tr, err := New(WithWriter(w), WithReaderFactory(func(string) Reader { return log.newReader() }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := babelqueue.RedriveOptions{Timeout: 20 * time.Millisecond}
+
+	if _, err := babelqueue.Redrive(context.Background(), tr, "orders.dlq", opts); err == nil {
+		t.Fatal("expected the failed publish to surface")
+	}
+	if len(w.sent) != 1 || w.sent[0].Topic != "orders.dlq" {
+		t.Fatalf("writes = %+v, want exactly one restore write to the DLQ", w.sent)
+	}
+	if len(log.commits) != 1 || log.commits[0] != 0 {
+		t.Fatalf("commits = %v, want only the restored record (offset 0)", log.commits)
+	}
+	if log.closed != 1 {
+		t.Fatalf("readers closed = %d, want 1 (the remaining batch must be rewound)", log.closed)
+	}
+
+	// The work topic recovers: the group resumes just past the restored record, so offset 0 is
+	// not seen again and only offset 1 is redriven.
+	w.failWork = false
+	log.fetched = nil
+	res, err := babelqueue.Redrive(context.Background(), tr, "orders.dlq", opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(log.fetched) == 0 || log.fetched[0] != 1 {
+		t.Fatalf("fetched = %v, want to resume at offset 1", log.fetched)
+	}
+	for _, off := range log.fetched {
+		if off == 0 {
+			t.Fatalf("fetched = %v, the restored record must not come back", log.fetched)
+		}
+	}
+	if res.Redriven != 1 {
+		t.Fatalf("res = %+v, want 1 redriven", res)
+	}
+	var dlqWrites int
+	for _, m := range w.sent {
+		if m.Topic == "orders.dlq" {
+			dlqWrites++
+		}
+	}
+	if dlqWrites != 1 {
+		t.Fatalf("DLQ writes = %d, want 1 (no duplicate of the restored record)", dlqWrites)
+	}
+}

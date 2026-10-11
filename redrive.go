@@ -2,6 +2,7 @@ package babelqueue
 
 import (
 	"context"
+	"errors"
 	"time"
 )
 
@@ -129,13 +130,13 @@ func Redrive(ctx context.Context, t Transport, dlq string, opts RedriveOptions) 
 		reset.Attempts = 0
 		body, err := reset.Encode()
 		if err != nil {
-			_ = restoreToDLQ(ctx, t, dlq, p.msg) // restore on a re-encode failure; no ack if it fails
-			return res, err
+			// restore on a re-encode failure; no ack (and a rewind) if that fails
+			return res, abortRedrive(ctx, t, dlq, p.msg, err)
 		}
 		bypassed, err := publishRedriven(ctx, t, target, string(body), opts.Bypass, p.msg)
 		if err != nil {
-			_ = restoreToDLQ(ctx, t, dlq, p.msg) // restore on a publish failure; no ack if it fails
-			return res, err
+			// restore on a publish failure; no ack (and a rewind) if that fails
+			return res, abortRedrive(ctx, t, dlq, p.msg, err)
 		}
 		_ = t.Ack(ctx, p.msg)
 		item.Redriven = true
@@ -169,14 +170,40 @@ func publishRedriven(ctx context.Context, t Transport, queue, body string, bypas
 }
 
 // restoreToDLQ writes the reserved DLQ message back to the DLQ unchanged and acknowledges it only
-// when that write succeeded. A failed restore leaves the message unacknowledged (so the broker
-// redelivers it) and returns the write error: the original is never dropped.
+// when that write succeeded. A failed restore leaves the message unacknowledged and returns the
+// write error: the original is never dropped. When the transport implements [Rewinder] the
+// message is also handed back to the broker, because on an offset-committing broker (Kafka) a
+// later commit is cumulative and would otherwise move the group past the unacknowledged record
+// and lose it. If the rewind fails too, both errors are returned together.
 func restoreToDLQ(ctx context.Context, t Transport, dlq string, msg *ReceivedMessage) error {
 	if err := republishFrom(ctx, t, dlq, msg.Body, msg); err != nil {
+		if rw, ok := t.(Rewinder); ok {
+			if rerr := rw.Rewind(ctx, msg); rerr != nil {
+				return errors.Join(err, rerr)
+			}
+		}
 		return err
 	}
 	_ = t.Ack(ctx, msg)
 	return nil
+}
+
+// abortRedrive ends a run on cause (a re-encode or publish failure for msg). msg is restored to
+// the DLQ unchanged. The run stops here, so the rest of the drained batch is never processed or
+// acknowledged: when the transport implements [Rewinder] it is handed back to the broker too,
+// otherwise a later cumulative commit by the same consumer could skip those records. cause is
+// returned as-is when the restore and the rewind both succeed; any restore or rewind error is
+// joined to it.
+func abortRedrive(ctx context.Context, t Transport, dlq string, msg *ReceivedMessage, cause error) error {
+	if rerr := restoreToDLQ(ctx, t, dlq, msg); rerr != nil {
+		return errors.Join(cause, rerr) // restoreToDLQ already rewound
+	}
+	if rw, ok := t.(Rewinder); ok {
+		if rerr := rw.Rewind(ctx, msg); rerr != nil {
+			return errors.Join(cause, rerr)
+		}
+	}
+	return cause
 }
 
 // republishFrom re-publishes body to queue on behalf of the reserved message from. A transport

@@ -9,6 +9,22 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Fixed
+
+- **core `Redrive`: a failed restore write now rewinds the DLQ record.** When writing a DLQ
+  message back to the DLQ fails (dry run, unselected, undecodable body, failed redrive write) and
+  the transport implements the optional `Rewinder` capability, `Redrive` calls `Rewind` so the
+  record is redelivered and a later cumulative commit (Kafka) cannot move the group past it; it is
+  still never acknowledged. If the rewind fails too, both errors are returned together
+  (`errors.Join`); a failed redrive publish and its failed restore are likewise reported together
+  instead of dropping the restore error. A failed redrive publish (or re-encode) whose restore
+  succeeds also aborts the run, so it rewinds too: the rest of the drained batch was popped but
+  never processed or acknowledged and must be redelivered (the restored record is already
+  acknowledged, so the rewind lands past it and does not duplicate it); the original error is then returned
+  unchanged. Transports without `Rewinder` behave as before; every transport that implements
+  `Rewinder` (Kafka, and the Artemis, Pulsar and Azure Service Bus transports) now sees these
+  `Rewind` calls. No new exported API; envelope unchanged.
+
 ## [1.13.0] - 2026-10-11
 
 ### Added
