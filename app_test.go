@@ -520,7 +520,6 @@ type flakyDLQTransport struct {
 	rewinds        int
 	rewindErr      error
 	polls          int
-	withRewinder   bool
 	deadLettered   int
 	deadLetterBody string
 }

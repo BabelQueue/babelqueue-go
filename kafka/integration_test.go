@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -60,6 +61,33 @@ func createTopics(t *testing.T, brokers []string, topics ...string) {
 	if err := cc.CreateTopics(cfgs...); err != nil {
 		t.Fatalf("create topics: %v", err)
 	}
+	// CreateTopics returns once the controller accepted the request, not once every broker's
+	// metadata (and the partition leader) is visible; a write issued in that window fails with
+	// "[3] Unknown Topic Or Partition". Wait until each topic reports a partition with a leader.
+	for _, topic := range topics {
+		waitTopicReady(t, brokers[0], topic)
+	}
+}
+
+// waitTopicReady blocks (bounded) until topic has at least one partition with an elected leader.
+func waitTopicReady(t *testing.T, broker, topic string) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		conn, err := kafkago.Dial("tcp", broker)
+		if err == nil {
+			parts, perr := conn.ReadPartitions(topic)
+			_ = conn.Close()
+			if perr == nil && len(parts) > 0 && parts[0].Leader.ID >= 0 && parts[0].Leader.Host != "" {
+				return
+			}
+			err = perr
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("topic %s not ready within 30s: %v", topic, err)
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
 }
 
 // readDLQ returns the first record on topic (read without a consumer group, from the start).
@@ -77,6 +105,73 @@ func readDLQ(t *testing.T, brokers []string, topic string, wait time.Duration) k
 		t.Fatalf("no record on %s within %s: %v", topic, wait, err)
 	}
 	return m
+}
+
+// isolatedWriter returns a Writer (the one the transport would build) on a private Transport.
+// kafka-go caches topic metadata in the Transport for several seconds, and the package-level
+// default Transport is shared by every Writer/Reader in the process: a metadata response cached
+// by an earlier test (before this test's topics existed) makes a later writer fail with "[3]
+// Unknown Topic Or Partition" - and the writer does not retry that partition lookup. A private
+// Transport starts with a cold cache, so each test sees the topics it created itself.
+func isolatedWriter(t *testing.T, brokers []string) *kafkago.Writer {
+	t.Helper()
+	w, closeWriter := newIsolatedWriter(brokers)
+	t.Cleanup(closeWriter)
+	return w
+}
+
+// newIsolatedWriter builds the writer on a private Transport with a short metadata TTL (so a
+// cached "topic not found" answer cannot outlive a retry loop by seconds) and returns it with
+// its close function.
+func newIsolatedWriter(brokers []string) (*kafkago.Writer, func()) {
+	tp := &kafkago.Transport{MetadataTTL: time.Second}
+	w := &kafkago.Writer{Addr: kafkago.TCP(brokers...), Balancer: &kafkago.LeastBytes{}, Transport: tp}
+	return w, func() {
+		_ = w.Close()
+		tp.CloseIdleConnections()
+	}
+}
+
+// isUnknownTopic reports whether err is "[3] Unknown Topic Or Partition", whether it came from
+// the partition lookup (a bare kafkago.Error) or from the produce response (wrapped per message
+// in kafkago.WriteErrors, which has no Unwrap).
+func isUnknownTopic(err error) bool {
+	if errors.Is(err, kafkago.UnknownTopicOrPartition) {
+		return true
+	}
+	var we kafkago.WriteErrors
+	if errors.As(err, &we) {
+		for _, e := range we {
+			if errors.Is(e, kafkago.UnknownTopicOrPartition) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// seedRecord writes msg to topic with an isolated writer, retrying a transient
+// "Unknown Topic Or Partition" for a bounded time in case metadata is still propagating. Each
+// attempt uses a fresh writer (cold metadata cache), so a negative answer cached by one attempt
+// is never replayed to the next.
+func seedRecord(t *testing.T, brokers []string, topic string, msg kafkago.Message) {
+	t.Helper()
+	msg.Topic = topic
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		w, closeWriter := newIsolatedWriter(brokers)
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		err := w.WriteMessages(ctx, msg)
+		cancel()
+		closeWriter()
+		if err == nil {
+			return
+		}
+		if !isUnknownTopic(err) || time.Now().After(deadline) {
+			t.Fatalf("seed record: %v", err)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 }
 
 func decodeObject(t *testing.T, raw []byte) map[string]any {
@@ -114,7 +209,7 @@ func TestIntegrationHandlerErrorDeadLettersAfterMaxTries(t *testing.T) {
 	dlq := queue + ".dlq"
 	createTopics(t, brokers, queue, dlq)
 
-	tr, err := New(WithBrokers(brokers...), WithGroupID("bq-it-group-"+suffix))
+	tr, err := New(WithBrokers(brokers...), WithWriter(isolatedWriter(t, brokers)), WithGroupID("bq-it-group-"+suffix))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +283,7 @@ func TestIntegrationVersionGateRejectionReachesDLQ(t *testing.T) {
 
 	var rejected atomic.Value
 	var rejections atomic.Int32
-	tr, err := New(WithBrokers(brokers...), WithGroupID(group),
+	tr, err := New(WithBrokers(brokers...), WithWriter(isolatedWriter(t, brokers)), WithGroupID(group),
 		WithOnSchemaVersionRejected(func(version, _ string) {
 			rejected.Store(version)
 			rejections.Add(1)
@@ -207,14 +302,10 @@ func TestIntegrationVersionGateRejectionReachesDLQ(t *testing.T) {
 		return nil
 	})
 
-	w := &kafkago.Writer{Addr: kafkago.TCP(brokers...), Topic: queue}
-	defer w.Close()
-	if err := w.WriteMessages(context.Background(), kafkago.Message{
+	seedRecord(t, brokers, queue, kafkago.Message{
 		Value:   []byte("future-format-" + suffix), // not JSON: cannot be decoded as a v1 envelope
 		Headers: []kafkago.Header{{Key: "bq-job", Value: []byte(integrationURN)}, {Key: "bq-schema-version", Value: []byte("2")}},
-	}); err != nil {
-		t.Fatalf("seed record: %v", err)
-	}
+	})
 	startApp(t, app, queue)
 
 	raw := readDLQ(t, brokers, dlq, 60*time.Second).Value
