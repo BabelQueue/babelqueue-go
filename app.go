@@ -108,7 +108,12 @@ func WithAckErrorHandler(fn func(ctx context.Context, msg *ReceivedMessage, err 
 // broker redelivers it once its reservation lapses — so the retry waits for the
 // queue's visibility timeout instead of [WithRetryBackoff]. [ErrReleaseUnsupported]
 // is not reported (it is a capability signal, answered by re-publish + ack).
-// Without a handler the error is ignored.
+// It also observes the re-publish that answers that signal (a retry or an unknown-URN release
+// on a transport without in-place release): when the re-publish fails the message is not
+// acknowledged but handed back to the broker (see [Rewinder]; without it the message stays
+// reserved and is redelivered per the transport's reservation semantics, e.g. a Redis message
+// stays in its processing list until recovered), and the failure is reported here. Without a
+// handler a release error is ignored and a re-publish error is only logged.
 func WithReleaseErrorHandler(fn func(ctx context.Context, msg *ReceivedMessage, err error)) AppOption {
 	return func(a *App) { a.onReleaseError = fn }
 }
@@ -376,19 +381,39 @@ func (a *App) settleVersionGated(ctx context.Context, msg *ReceivedMessage) {
 // afterwards, so a misbehaving hook can never keep the message from being handed back; a panic
 // in the hook is recovered and logged.
 func (a *App) leaveDeadLetterUnsettled(ctx context.Context, msg *ReceivedMessage, err error, subject string) {
-	slog.ErrorContext(ctx, "babelqueue: dead-lettering "+subject+" failed; it was not acknowledged and will be redelivered",
-		"queue", msg.Queue, "route", msg.RouteURN, "error", err)
+	a.leaveUnsettled(ctx, msg, err,
+		"babelqueue: dead-lettering "+subject+" failed; it was not acknowledged and will be redelivered",
+		"babelqueue: rewinding an unsettled dead-letter candidate failed",
+		a.reportDeadLetterError)
+}
+
+// leaveRepublishUnsettled is the retry/release counterpart of leaveDeadLetterUnsettled: the
+// re-publish that was to replace msg failed, so acknowledging it would lose the message. It is
+// not acknowledged, handed back to the broker and the failure is reported to the
+// [WithReleaseErrorHandler] hook.
+func (a *App) leaveRepublishUnsettled(ctx context.Context, msg *ReceivedMessage, err error, subject string) {
+	a.leaveUnsettled(ctx, msg, err,
+		"babelqueue: re-publishing "+subject+" failed; it was not acknowledged and will be redelivered",
+		"babelqueue: rewinding an unsettled re-publish candidate failed",
+		a.reportReleaseError)
+}
+
+// leaveUnsettled logs err, hands the unacknowledged msg back to the broker ([Rewinder] when the
+// transport has it; otherwise it stays reserved and is redelivered when the reservation lapses)
+// and then reports err (and a failed rewind) through report.
+func (a *App) leaveUnsettled(ctx context.Context, msg *ReceivedMessage, err error, failMsg, rewindFailMsg string,
+	report func(context.Context, *ReceivedMessage, error)) {
+	slog.ErrorContext(ctx, failMsg, "queue", msg.Queue, "route", msg.RouteURN, "error", err)
 	var rewindErr error
 	rw, canRewind := a.transport.(Rewinder)
 	if canRewind {
 		if rewindErr = rw.Rewind(ctx, msg); rewindErr != nil {
-			slog.ErrorContext(ctx, "babelqueue: rewinding an unsettled dead-letter candidate failed",
-				"queue", msg.Queue, "error", rewindErr)
+			slog.ErrorContext(ctx, rewindFailMsg, "queue", msg.Queue, "error", rewindErr)
 		}
 	}
-	a.reportDeadLetterError(ctx, msg, err)
+	report(ctx, msg, err)
 	if rewindErr != nil {
-		a.reportDeadLetterError(ctx, msg, rewindErr)
+		report(ctx, msg, rewindErr)
 		return
 	}
 	if canRewind && a.rewindPause > 0 {
@@ -397,6 +422,21 @@ func (a *App) leaveDeadLetterUnsettled(ctx context.Context, msg *ReceivedMessage
 		case <-time.After(a.rewindPause):
 		}
 	}
+}
+
+// reportReleaseError calls the [WithReleaseErrorHandler] hook, recovering and logging a panic so
+// the consume loop carries on.
+func (a *App) reportReleaseError(ctx context.Context, msg *ReceivedMessage, err error) {
+	if a.onReleaseError == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			slog.ErrorContext(ctx, "babelqueue: release error handler panicked; ignored",
+				"queue", msg.Queue, "panic", fmt.Sprint(r))
+		}
+	}()
+	a.onReleaseError(ctx, msg, err)
 }
 
 // reportDeadLetterError calls the [WithDeadLetterErrorHandler] hook, recovering and logging a
@@ -505,7 +545,10 @@ func (a *App) routeUnknown(ctx context.Context, urn string, msg *ReceivedMessage
 		if a.release(ctx, msg, a.unknownURNDelay) {
 			return
 		}
-		_ = a.republish(ctx, msg, msg.Queue, msg.Body)
+		if err := a.republish(ctx, msg, msg.Queue, msg.Body); err != nil {
+			a.leaveRepublishUnsettled(ctx, msg, err, "an unknown-URN message")
+			return
+		}
 		a.ack(ctx, msg)
 	case StrategyDeadLetter:
 		a.deadLetterMessage(ctx, msg, env, "unknown_urn", nil)
@@ -523,8 +566,13 @@ func (a *App) retryOrDeadLetter(ctx context.Context, msg *ReceivedMessage, env E
 		if a.release(ctx, msg, a.retryBackoff) {
 			return
 		}
-		if body, err := env.Encode(); err == nil {
-			_ = a.republish(ctx, msg, msg.Queue, string(body))
+		body, err := env.Encode()
+		if err == nil {
+			err = a.republish(ctx, msg, msg.Queue, string(body))
+		}
+		if err != nil {
+			a.leaveRepublishUnsettled(ctx, msg, err, "a message for retry")
+			return
 		}
 		a.ack(ctx, msg)
 		return

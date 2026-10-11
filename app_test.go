@@ -509,7 +509,8 @@ func TestAppUnknownRouteURNStillReleasesVerbatim(t *testing.T) {
 }
 
 // flakyDLQTransport redelivers its one message until it is acknowledged, and fails the first
-// failPublishes publishes (the dead-letter writes), recording every publish, ack and rewind.
+// failPublishes publishes (dead-letter writes, or retry/release re-publishes), recording every
+// publish, ack and rewind.
 type flakyDLQTransport struct {
 	*babelqueue.InMemoryTransport
 	msg            *babelqueue.ReceivedMessage

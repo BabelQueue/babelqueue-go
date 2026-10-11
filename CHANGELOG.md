@@ -9,6 +9,19 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Fixed
+
+- **core `App`: a failed re-publish on the retry and unknown-URN release paths no longer loses the
+  message.** When a transport has no in-place `Releaser` (or reports `ErrReleaseUnsupported`), a
+  retry (handler error / `StrategyFail`) and a `StrategyRelease` unknown URN fall back to
+  re-publish + ack; the re-publish error was discarded and the message acknowledged anyway. It is
+  now treated like a failed dead-letter write: the message is not acknowledged, the failure is
+  logged and reported to `WithReleaseErrorHandler`, and the message is handed back to the broker
+  (`Rewinder` when the transport has it, otherwise it stays reserved and is redelivered per the
+  transport's reservation semantics, e.g. a Redis message stays in its processing list until
+  recovered). An envelope re-encode failure on the retry path is handled the same way. No
+  public API, envelope or `dead_letter` change; core PATCH.
+
 ## [1.11.1] - 2026-10-11
 
 ### Changed
