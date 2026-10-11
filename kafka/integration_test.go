@@ -418,11 +418,17 @@ func fetchRecords(t *testing.T, brokers []string, topic string) []rawRecord {
 		resp, err := client.Fetch(context.Background(), &kafkago.FetchRequest{
 			Topic: topic, Partition: 0, Offset: next, MinBytes: 1, MaxBytes: 1 << 20, MaxWait: time.Second,
 		})
-		if err != nil {
-			t.Fatalf("fetch %s@%d: %v", topic, next, err)
+		if err == nil {
+			err = resp.Error
 		}
-		if resp.Error != nil {
-			t.Fatalf("fetch %s@%d: %v", topic, next, resp.Error)
+		if err != nil {
+			// A freshly created topic can briefly be unknown to the broker serving the fetch
+			// while its metadata propagates; report what is readable so far and let the
+			// caller's poll loop try again.
+			if isUnknownTopic(err) || strings.Contains(err.Error(), "topic not found") {
+				return out
+			}
+			t.Fatalf("fetch %s@%d: %v", topic, next, err)
 		}
 		got := 0
 		for resp.Records != nil {
