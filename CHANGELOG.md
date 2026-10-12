@@ -9,6 +9,20 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Changed
+
+- **core `Decode`: envelope keys are matched with their exact, case-sensitive spelling.** Go's
+  `encoding/json` folds key case, so a body such as `{"JOB": "urn:..."}`, `"Data"` or `"META"` used to
+  be accepted here while the PHP, Python, Node, Java and .NET cores treated it as unknown. A wrongly
+  cased key is now an unknown key: it is preserved and re-emitted unchanged (GR-5) and never fills a
+  canonical field, so a body whose only job key is `JOB` decodes with an empty `job`
+  (`Accepts()` is false and a consumer routes it down the unknown-URN path, i.e. dead-letters it when
+  that strategy is on) instead of being processed. A duplicate key is last-wins and never merged
+  (`data` objects are not combined; a later `meta`/`dead_letter` block replaces the earlier one), and
+  a wrong JSON type in any duplicate of a typed member is a decode error, i.e. poison. The `urn`
+  alias is kept, with its exact spelling only. The encode output is byte-identical and
+  `meta.schema_version` stays 1. Conformance suite 1.3.0 locks the behaviour in all six cores.
+
 ### Fixed
 
 - **core `Redrive`: a failed restore write now rewinds the DLQ record.** When writing a DLQ

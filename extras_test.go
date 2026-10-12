@@ -19,6 +19,17 @@ const extrasBody = `{"job":"urn:babel:orders:created","trace_id":"7b3f9c2a-e41d-
 	`"lang":"php","schema_version":1,"created_at":1749132727000,"vendor_flag":true,` +
 	`"vendor_ctx":{"region":"eu-west-1","hops":[1,2]},"ts":5},"attempts":0,"extra_top":{"k":"<v&>"},"timestamp":1}`
 
+// envelopeFields mirrors Envelope's wire fields without its methods. It is a
+// test-only reference shape; production decode and encode do not use it.
+type envelopeFields struct {
+	Job        string         `json:"job"`
+	TraceID    string         `json:"trace_id"`
+	Data       map[string]any `json:"data"`
+	Meta       Meta           `json:"meta"`
+	Attempts   int            `json:"attempts"`
+	DeadLetter *DeadLetter    `json:"dead_letter,omitempty"`
+}
+
 // assertExtras checks that the unknown keys of extrasBody survived into body and
 // that no forbidden key was re-emitted.
 func assertExtras(t *testing.T, body []byte) {
@@ -292,21 +303,34 @@ func TestAppUnknownURNReleaseDefaultsToZeroDelay(t *testing.T) {
 	}
 }
 
-func TestDecodeCaseVariantKnownKeysAreNotExtras(t *testing.T) {
+func TestDecodeCaseVariantKeysAreUnknownExtras(t *testing.T) {
+	// Envelope keys are exact, case-sensitive: a wrongly cased key is never the
+	// canonical field, a forbidden key's case variant is not forbidden, and both are
+	// carried along like any other unknown key.
 	raw := `{"JOB":"urn:babel:orders:created","trace_id":"t","data":{},` +
 		`"meta":{"Queue":"orders","schema_version":1,"TS":5},"Attempts":2,"Timestamp":1}`
 	env, err := Decode([]byte(raw))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if env.Job != "urn:babel:orders:created" || env.Meta.Queue != "orders" || env.Attempts != 2 {
-		t.Fatalf("case-folded fields not decoded: %+v", env)
+	if env.Job != "" || env.Meta.Queue != "" || env.Attempts != 0 {
+		t.Fatalf("case variants were read as canonical fields: %+v", env)
 	}
-	if len(env.extras) != 0 || len(env.metaExtras) != 0 {
-		t.Errorf("case variants leaked into extras: top=%v meta=%v", env.extras, env.metaExtras)
+	if env.Accepts() {
+		t.Error("an envelope with only a JOB key must not be accepted")
 	}
-	if w := env.Warnings(); len(w) != 2 {
-		t.Errorf("warnings = %v, want 2 (Timestamp, meta.TS)", w)
+	for _, k := range []string{"JOB", "Attempts", "Timestamp"} {
+		if _, ok := env.extras[k]; !ok {
+			t.Errorf("top-level extras lack %q: %v", k, env.extras)
+		}
+	}
+	for _, k := range []string{"Queue", "TS"} {
+		if _, ok := env.metaExtras[k]; !ok {
+			t.Errorf("meta extras lack %q: %v", k, env.metaExtras)
+		}
+	}
+	if w := env.Warnings(); len(w) != 0 {
+		t.Errorf("warnings = %v, want none (case variants of forbidden keys are unknown keys)", w)
 	}
 	body, err := env.Encode()
 	if err != nil {
@@ -317,8 +341,8 @@ func TestDecodeCaseVariantKnownKeysAreNotExtras(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, k := range []string{"JOB", "Attempts", "Timestamp"} {
-		if _, ok := doc[k]; ok {
-			t.Errorf("re-encoded body carries %q: %s", k, body)
+		if _, ok := doc[k]; !ok {
+			t.Errorf("re-encoded body dropped %q: %s", k, body)
 		}
 	}
 }

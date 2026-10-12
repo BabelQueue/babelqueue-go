@@ -116,18 +116,20 @@ func (e Envelope) Encode() ([]byte, error) {
 // dropped with a warning (see [Envelope.Warnings]). It does not validate the
 // contents — use Accepts for consumer-side validation. A non-object data block
 // (e.g. a JSON array) is rejected with an error.
+//
+// Envelope keys are matched by exact, case-sensitive spelling, like the canonical
+// schema and every other SDK core: a wrongly cased key ("JOB", "Data", "META",
+// "URN") is an unknown key — preserved and re-emitted, never read as the canonical
+// field — so {"JOB":"urn:x"} decodes to an empty Job and fails [Accepts]. A key
+// that occurs more than once resolves to its last occurrence (data is replaced,
+// never merged).
 func Decode(raw []byte) (Envelope, error) {
-	var e Envelope
-	if err := json.Unmarshal(raw, &e); err != nil {
+	e, alias, err := decodeEnvelope(raw)
+	if err != nil {
 		return Envelope{}, err
 	}
 	if e.Job == "" {
-		var alias struct {
-			URN string `json:"urn"`
-		}
-		if json.Unmarshal(raw, &alias) == nil {
-			e.Job = strings.TrimSpace(alias.URN)
-		}
+		e.Job = strings.TrimSpace(alias)
 	}
 	return e, nil
 }
