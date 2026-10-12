@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.14.0] - 2026-10-12
+
 ### Changed
 
 - **core `Decode`: envelope keys are matched with their exact, case-sensitive spelling.** Go's
@@ -38,6 +40,12 @@ The envelope wire format is versioned separately by `meta.schema_version`
   unchanged. Transports without `Rewinder` behave as before; every transport that implements
   `Rewinder` (Kafka, and the Artemis, Pulsar and Azure Service Bus transports) now sees these
   `Rewind` calls. No new exported API; envelope unchanged.
+
+### Release note for the transport modules
+
+Tag the core `v1.14.0` first, then `kafka/v1.3.0` (MINOR: pinned to core 1.14.0, so exact-case keys
+decide poison and a failed restore rewinds the partition; poison parity with the shared trigger
+table is tested). The other transport modules are unchanged and keep their pins.
 
 ## [1.13.0] - 2026-10-11
 
