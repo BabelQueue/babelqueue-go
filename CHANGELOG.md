@@ -9,6 +9,11 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Changed
+
+- CI only: `scripts/check-coverage.sh` now prints the `go test` output when the suite fails, so a
+  failing test in the coverage job is named in the log instead of surfacing as a bare exit code.
+
 ## [1.14.0] - 2026-10-12
 
 ### Changed
