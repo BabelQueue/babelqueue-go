@@ -35,6 +35,13 @@ Target version: **1.15.0** (minor; the envelope stays at `schema_version: 1`) â€
   dropped with a warning naming `/urn`.
   The `urn` alias is copied into `job` verbatim (not trimmed), like the other SDK cores. A `urn` that is
   not a string is dropped with the same `/urn` warning.
+- **`json.Unmarshal` into an `Envelope` now resolves the `urn` alias like `Decode`.** `Envelope.UnmarshalJSON`
+  used to leave the alias unresolved; it now shares one code path with `Decode`, so a blank-ASCII or missing
+  `job` takes the string `urn`, and `job` next to `urn` keeps `job` and reports the dropped `/urn` through
+  `Warnings()`. Both entry points return identical envelopes.
+- **`Redrive` logs decode warnings.** A DLQ body that decodes with warnings (a dropped forbidden key) is
+  still redriven, and each warning is now logged with `slog.Warn` (`babelqueue: decode warning`, the finding
+  as `warning`, the DLQ name as `queue`), as the `App` consumer does.
 - **Behaviour note:** a message whose `job` is blank and has no `urn` is now routed down the poison
   path (unknown URN with an empty name) instead of the unknown-URN path with the whitespace as its name.
 - **Behaviour note:** `Accepts()` now returns false for a `job` made only of ASCII whitespace with no

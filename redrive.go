@@ -3,6 +3,7 @@ package babelqueue
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"time"
 )
 
@@ -77,6 +78,13 @@ func Redrive(ctx context.Context, t Transport, dlq string, opts RedriveOptions) 
 			break
 		}
 		env, derr := Decode([]byte(msg.Body))
+		if derr == nil {
+			// Non-fatal decode findings (a dropped forbidden key, ADR-0031 (c)) are logged,
+			// never fatal: the message is still redriven.
+			for _, w := range env.Warnings() {
+				slog.WarnContext(ctx, "babelqueue: decode warning", "warning", w, "queue", dlq)
+			}
+		}
 		batch = append(batch, pending{msg: msg, env: env, decoded: derr == nil})
 	}
 

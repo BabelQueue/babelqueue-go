@@ -113,7 +113,8 @@ env, err := babelqueue.Make(
 envelope through carried-over unknown keys, so such a key is never put on the wire. On the consumer
 side, `Decode` stays lenient: a forbidden key (or a `urn` next to a non-blank `job`) is dropped and
 reported through `Envelope.Warnings()`, which the `App` consumer logs with `slog.Warn`. A `job` that
-is empty or only ASCII whitespace falls back to the `urn` alias.
+is empty or only ASCII whitespace falls back to the `urn` alias — in `json.Unmarshal` into an
+`Envelope` as well as in `Decode`. `Redrive` logs the same warnings for the DLQ bodies it reads.
 
 ### Dead-letter
 

@@ -99,9 +99,14 @@ func sortedKeys(m map[string]json.RawMessage) []string {
 // schema and every other SDK core do: "JOB", "Data" or "META" are unknown keys,
 // not the canonical fields. A key that occurs more than once resolves to its last
 // occurrence (objects are replaced, never merged), though every occurrence is still
-// type-checked. The "urn" inbound alias is resolved by [Decode], not here.
+// type-checked.
+//
+// The "urn" inbound alias is resolved here exactly as [Decode] resolves it, so
+// json.Unmarshal and Decode produce the same Envelope: a "job" that is missing,
+// empty or only ASCII whitespace takes the value of a string "urn"; next to a job
+// that is not blank, "job" wins and "urn" is dropped with a "/urn" warning.
 func (e *Envelope) UnmarshalJSON(raw []byte) error {
-	env, _, _, err := decodeEnvelope(raw)
+	env, err := decodeEnvelope(raw)
 	if err != nil {
 		return err
 	}
@@ -110,20 +115,20 @@ func (e *Envelope) UnmarshalJSON(raw []byte) error {
 }
 
 // decodeEnvelope is the single decode path behind [Decode] and
-// [Envelope.UnmarshalJSON]. It also returns the value of the (exact-case) "urn"
-// alias member and whether that member was a JSON string (only a string can be an
-// alias), for Decode to resolve.
-func decodeEnvelope(raw []byte) (Envelope, string, bool, error) {
+// [Envelope.UnmarshalJSON], and the one place the (exact-case) "urn" inbound alias
+// is resolved: only a JSON string can be an alias, and it is taken verbatim (no
+// trimming, GR-5) when "job" is missing, empty or only ASCII whitespace.
+func decodeEnvelope(raw []byte) (Envelope, error) {
 	if !json.Valid(raw) {
 		// Let encoding/json produce the precise syntax error.
 		var skip json.RawMessage
 		if err := json.Unmarshal(raw, &skip); err != nil {
-			return Envelope{}, "", false, err
+			return Envelope{}, err
 		}
-		return Envelope{}, "", false, errInvalidJSON
+		return Envelope{}, errInvalidJSON
 	}
 	if isJSONNull(raw) {
-		return Envelope{}, "", false, nil
+		return Envelope{}, nil
 	}
 
 	var (
@@ -197,10 +202,10 @@ func decodeEnvelope(raw []byte) (Envelope, string, bool, error) {
 		}
 	})
 	if err != nil {
-		return Envelope{}, "", false, err
+		return Envelope{}, err
 	}
 
-	// The urn key itself is never kept. It is silent only when Decode will use it as
+	// The urn key itself is never kept. It is silent only when it is used as
 	// the identity (blank job and a string alias); in every other case it is dropped
 	// with a warning (ADR-0031 (c)): next to a job that is not blank, job wins, and a
 	// non-string alias is no alias at all.
@@ -208,11 +213,18 @@ func decodeEnvelope(raw []byte) (Envelope, string, bool, error) {
 		forbidden["urn"] = true
 	}
 
+	// A missing, empty or ASCII-blank job counts as absent: the URN then comes from
+	// the alias, which is copied verbatim (a padded alias stays padded and is then
+	// judged by the consumer, exactly as in every other SDK core).
+	if aliasIsString && isBlankASCII(env.Job) {
+		env.Job = alias
+	}
+
 	env.extras = extras
 	env.metaExtras = decodedMetaExtras
 	env.warnings = forbiddenWarnings(forbidden, "/")
 	env.warnings = append(env.warnings, forbiddenWarnings(metaForbidden, "/meta/")...)
-	return env, alias, aliasIsString, nil
+	return env, nil
 }
 
 // decodeMeta decodes one meta object by exact member name. It returns the typed

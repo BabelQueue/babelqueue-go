@@ -2,6 +2,7 @@ package babelqueue
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -356,5 +357,64 @@ func TestDecodeNonStringAliasWarns(t *testing.T) {
 				t.Errorf("job %s urn %s: warnings %q, want one naming /urn", job, urn, w)
 			}
 		}
+	}
+}
+
+// json.Unmarshal must agree with Decode on the urn alias (ADR-0031 (c)).
+func TestUnmarshalJSONResolvesURNAlias(t *testing.T) {
+	cases := []struct {
+		name, job, urn string
+		wantJob        string
+		wantWarning    bool
+	}{
+		{"blank ascii job falls back", `"  "`, `"urn:a:b"`, "urn:a:b", false},
+		{"tab and newline job falls back", `"\t\n"`, `"urn:a:b"`, "urn:a:b", false},
+		{"empty job falls back", `""`, `"urn:a:b"`, "urn:a:b", false},
+		{"job and urn: job wins", `"urn:x:y"`, `"urn:a:b"`, "urn:x:y", true},
+		{"unicode blank job does not fall back", `"\u00a0"`, `"urn:a:b"`, "\u00a0", true},
+		{"non-string urn is no alias", `""`, `42`, "", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			body := []byte(`{"job":` + tc.job + `,"urn":` + tc.urn + `,` + blankJobTail)
+			var viaJSON Envelope
+			if err := json.Unmarshal(body, &viaJSON); err != nil {
+				t.Fatal(err)
+			}
+			viaDecode, err := Decode(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if viaJSON.Job != tc.wantJob {
+				t.Errorf("Unmarshal job = %q, want %q", viaJSON.Job, tc.wantJob)
+			}
+			if !reflect.DeepEqual(viaJSON, viaDecode) {
+				t.Errorf("Unmarshal and Decode differ:\n%+v\n%+v", viaJSON, viaDecode)
+			}
+			hasWarning := false
+			for _, w := range viaJSON.Warnings() {
+				if strings.Contains(w, " /urn ") {
+					hasWarning = true
+				}
+			}
+			if hasWarning != tc.wantWarning {
+				t.Errorf("warnings = %v, want /urn warning = %v", viaJSON.Warnings(), tc.wantWarning)
+			}
+		})
+	}
+}
+
+func TestUnmarshalJSONURNOnly(t *testing.T) {
+	body := []byte(`{"urn":"urn:acme:b",` + blankJobTail)
+	var env Envelope
+	if err := json.Unmarshal(body, &env); err != nil {
+		t.Fatal(err)
+	}
+	want, err := Decode(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env.Job != "urn:acme:b" || len(env.Warnings()) != 0 || !reflect.DeepEqual(env, want) {
+		t.Errorf("urn-only: %+v want %+v", env, want)
 	}
 }

@@ -1,8 +1,11 @@
 package babelqueue
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
+	"strings"
 	"testing"
 	"time"
 )
@@ -501,5 +504,41 @@ func TestRedrive_FailedRestoreWithoutRewinderStillNoAck(t *testing.T) {
 	}
 	if tr.acks != 0 {
 		t.Errorf("acks = %d, want 0", tr.acks)
+	}
+}
+
+func TestRedrive_LogsDecodeWarnings(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	defer slog.SetDefault(prev)
+
+	tr := NewInMemoryTransport()
+	env, err := Make("urn:babel:orders:created", map[string]any{"order_id": 1}, WithQueue("orders"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	enc, err := env.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Inject a forbidden top-level key, as a foreign producer might have written it.
+	body := strings.TrimSuffix(string(enc), "}") + `,"timestamp":123}`
+	if err := tr.Publish(context.Background(), "orders.dlq", body); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := Redrive(context.Background(), tr, "orders.dlq", RedriveOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Redriven != 1 {
+		t.Fatalf("res = %+v", res)
+	}
+	out := buf.String()
+	for _, want := range []string{"babelqueue: decode warning", "/timestamp", "queue=orders.dlq"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("log output missing %q:\n%s", want, out)
+		}
 	}
 }

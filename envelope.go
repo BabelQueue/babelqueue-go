@@ -205,19 +205,8 @@ func (e Envelope) Encode() ([]byte, error) {
 // that occurs more than once resolves to its last occurrence (data is replaced,
 // never merged).
 func Decode(raw []byte) (Envelope, error) {
-	e, alias, aliasIsString, err := decodeEnvelope(raw)
-	if err != nil {
-		return Envelope{}, err
-	}
-	// A missing, empty or ASCII-blank job counts as absent: the URN then comes from
-	// the "urn" alias, and the alias key itself is never kept (ADR-0031 (c)). A job
-	// that is not blank wins; decodeEnvelope has already warned about a dropped urn.
-	// The alias is taken verbatim, exactly as every other SDK core does (GR-5): no
-	// trimming, so a padded alias stays padded and is then judged by the consumer.
-	if aliasIsString && isBlankASCII(e.Job) {
-		e.Job = alias
-	}
-	return e, nil
+	// decodeEnvelope also resolves the urn alias, so Decode and json.Unmarshal agree.
+	return decodeEnvelope(raw)
 }
 
 // Warnings returns the non-fatal problems [Decode] found, such as a forbidden
