@@ -1,13 +1,16 @@
 package babelqueue
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -537,5 +540,180 @@ func TestAppReleaseStrategyStillReleasesUnknownURN(t *testing.T) {
 	}
 	if tr.releases != 1 || tr.Size("orders.dlq") != 0 {
 		t.Errorf("releases=%d dlq=%d, want 1 release and no dead letter", tr.releases, tr.Size("orders.dlq"))
+	}
+}
+
+// SetExtrasForTest returns a copy of env whose preserved unknown-key containers are
+// replaced by the given top-level and meta entries, standing for extras carried over
+// from an inbound message. It is the in-package test access the cross-SDK
+// encode_reject conformance cases need (the write API offers no top-level keys).
+func SetExtrasForTest(env Envelope, top, meta map[string]any) Envelope {
+	conv := func(in map[string]any) map[string]json.RawMessage {
+		if len(in) == 0 {
+			return nil
+		}
+		out := make(map[string]json.RawMessage, len(in))
+		for k, v := range in {
+			b, err := json.Marshal(v)
+			if err != nil {
+				panic(err)
+			}
+			out[k] = b
+		}
+		return out
+	}
+	env.extras = conv(top)
+	env.metaExtras = conv(meta)
+	return env
+}
+
+// --- ADR-0031 (b): producer meta write API and encode-reject ---
+
+func TestWithMetaSurvivesEncodeDecode(t *testing.T) {
+	env, err := Make("urn:acme:orders:created", map[string]any{"order_id": 1},
+		WithQueue("orders"), WithMeta("ext", map[string]any{"acme": 1}), WithMeta("vendor_flag", true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := env.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	back, err := Decode(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if w := back.Warnings(); len(w) != 0 {
+		t.Fatalf("unexpected decode warnings: %q", w)
+	}
+	back.Attempts++
+	out, err := back.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc struct {
+		Meta struct {
+			Ext        map[string]any `json:"ext"`
+			VendorFlag bool           `json:"vendor_flag"`
+			Queue      string         `json:"queue"`
+		} `json:"meta"`
+	}
+	if err := json.Unmarshal(out, &doc); err != nil {
+		t.Fatal(err)
+	}
+	if doc.Meta.Ext["acme"] != float64(1) || !doc.Meta.VendorFlag || doc.Meta.Queue != "orders" {
+		t.Errorf("meta after retry hop = %+v (body %s)", doc.Meta, out)
+	}
+}
+
+func TestWithMetaRejectsReservedAndForbiddenKeys(t *testing.T) {
+	cases := []struct {
+		key  string
+		want error
+	}{
+		{"id", ErrReservedMetaKey}, {"queue", ErrReservedMetaKey}, {"lang", ErrReservedMetaKey},
+		{"schema_version", ErrReservedMetaKey}, {"created_at", ErrReservedMetaKey},
+		{"ts", ErrForbiddenKey}, {"max_retries", ErrForbiddenKey},
+		{"attempts", ErrForbiddenKey}, {"source", ErrForbiddenKey},
+		{"", ErrEmptyMetaKey},
+	}
+	for _, c := range cases {
+		_, err := Make("urn:acme:a", map[string]any{}, WithMeta(c.key, 1))
+		if !errors.Is(err, c.want) {
+			t.Errorf("WithMeta(%q) error = %v, want %v", c.key, err, c.want)
+		}
+	}
+	if _, err := Make("urn:acme:a", map[string]any{}, WithMeta("ext", 1), WithMeta("ext", 2)); !errors.Is(err, ErrDuplicateMetaKey) {
+		t.Errorf("repeated key error = %v, want ErrDuplicateMetaKey", err)
+	}
+	if _, err := Make("urn:acme:a", map[string]any{}, WithMeta("ext", make(chan int))); err == nil {
+		t.Error("an unencodable value must be rejected")
+	}
+}
+
+func TestEncodeRejectsForbiddenExtras(t *testing.T) {
+	base, err := Make("urn:acme:a", map[string]any{}, WithQueue("q"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct {
+		name      string
+		top, meta map[string]any
+		want      error
+		key       string
+	}{
+		{"top timestamp", map[string]any{"timestamp": 1}, nil, ErrForbiddenKey, "/timestamp"},
+		{"top urn", map[string]any{"urn": "x"}, nil, ErrForbiddenKey, "/urn"},
+		{"meta max_retries", nil, map[string]any{"max_retries": 3}, ErrForbiddenKey, "/meta/max_retries"},
+		{"meta id", nil, map[string]any{"id": "x"}, ErrReservedMetaKey, "/meta/id"},
+	}
+	for _, c := range cases {
+		out, err := SetExtrasForTest(base, c.top, c.meta).Encode()
+		if !errors.Is(err, c.want) {
+			t.Errorf("%s: error = %v, want %v", c.name, err, c.want)
+			continue
+		}
+		if !strings.Contains(err.Error(), c.key) || len(out) != 0 {
+			t.Errorf("%s: error %q must name %s and produce no bytes (got %q)", c.name, err, c.key, out)
+		}
+	}
+	// A clean extras container still encodes.
+	if _, err := SetExtrasForTest(base, map[string]any{"extra_top": 1}, map[string]any{"vendor": 1}).Encode(); err != nil {
+		t.Errorf("benign extras rejected: %v", err)
+	}
+}
+
+// slogCapture swaps the default logger for a text handler writing into a buffer.
+func slogCapture(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+	return &buf
+}
+
+func TestAppLogsDecodeWarnings(t *testing.T) {
+	buf := slogCapture(t)
+	tr := NewInMemoryTransport()
+	app := NewApp(tr, WithDefaultQueue("orders"))
+	handled := 0
+	app.Handle("urn:acme:a", func(context.Context, Envelope) error { handled++; return nil })
+	body := `{"job":"urn:acme:a","urn":"urn:acme:a","trace_id":"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",` +
+		`"data":{},"meta":{"id":"f1e2d3c4-b5a6-4789-90ab-cdef01234567","queue":"orders","lang":"php",` +
+		`"schema_version":1,"created_at":1,"ts":5},"attempts":0,"timestamp":1}`
+	if err := tr.Publish(context.Background(), "orders", body); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.Drain(context.Background(), "orders", 1); err != nil {
+		t.Fatal(err)
+	}
+	if handled != 1 {
+		t.Fatalf("handler ran %d times, want 1 (warnings are not fatal)", handled)
+	}
+	logged := buf.String()
+	for _, key := range []string{"/urn", "/timestamp", "/meta/ts"} {
+		if !strings.Contains(logged, key) {
+			t.Errorf("slog output does not name %s:\n%s", key, logged)
+		}
+	}
+	if !strings.Contains(logged, "level=WARN") {
+		t.Errorf("warnings must be logged at WARN:\n%s", logged)
+	}
+}
+
+func TestAppCleanMessageLogsNoWarning(t *testing.T) {
+	buf := slogCapture(t)
+	tr := NewInMemoryTransport()
+	app := NewApp(tr, WithDefaultQueue("orders"))
+	app.Handle("urn:acme:a", func(context.Context, Envelope) error { return nil })
+	if _, err := app.Publish(context.Background(), "urn:acme:a", map[string]any{}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.Drain(context.Background(), "orders", 1); err != nil {
+		t.Fatal(err)
+	}
+	if buf.Len() != 0 {
+		t.Errorf("unexpected log output:\n%s", buf.String())
 	}
 }

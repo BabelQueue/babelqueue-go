@@ -91,6 +91,30 @@ next, _ := babelqueue.Make(
 )
 ```
 
+### Vendor metadata (`WithMeta`)
+
+Attach your own keys to `meta` with `WithMeta`. Keep vendor data under a single `ext` block
+(`meta.ext.<vendor>`, ADR-0031); the entries sit next to the core meta keys and survive every
+retry, dead-letter and redrive hop:
+
+```go
+env, err := babelqueue.Make(
+	"urn:acme:orders:created",
+	map[string]any{"order_id": 1042},
+	babelqueue.WithQueue("orders"),
+	babelqueue.WithMeta("ext", map[string]any{"acme": map[string]any{"tier": "gold"}}),
+)
+// err wraps ErrReservedMetaKey for id/queue/lang/schema_version/created_at,
+// ErrForbiddenKey for ts/max_retries/attempts/source, ErrDuplicateMetaKey for a
+// repeated key and ErrEmptyMetaKey for "".
+```
+
+`Encode` also fails (with the same sentinels) when a forbidden or core-colliding key reaches the
+envelope through carried-over unknown keys, so such a key is never put on the wire. On the consumer
+side, `Decode` stays lenient: a forbidden key (or a `urn` next to a non-blank `job`) is dropped and
+reported through `Envelope.Warnings()`, which the `App` consumer logs with `slog.Warn`. A `job` that
+is empty or only ASCII whitespace falls back to the `urn` alias.
+
 ### Dead-letter
 
 ```go

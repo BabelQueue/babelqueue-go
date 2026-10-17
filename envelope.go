@@ -3,9 +3,39 @@ package babelqueue
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"strings"
 	"time"
 )
+
+// Sentinel errors for the extension-key rules of ADR-0031. They are returned by
+// [Make] (through [WithMeta]) and by [Envelope.Encode] / [Envelope.MarshalJSON];
+// test with errors.Is. The wrapped message names the offending key as a JSON
+// pointer (e.g. "/meta/ts").
+var (
+	// ErrReservedMetaKey: a meta entry collides with a core meta key (id, queue,
+	// lang, schema_version, created_at). The core never overwrites its own keys.
+	ErrReservedMetaKey = errors.New("babelqueue: meta key collides with a core meta key")
+	// ErrForbiddenKey: a forbidden non-canonical key (message-envelope.md §10) was
+	// supplied — through [WithMeta] or through extras carried by the envelope.
+	ErrForbiddenKey = errors.New("babelqueue: forbidden non-canonical envelope key (message-envelope.md §10)")
+	// ErrDuplicateMetaKey: [WithMeta] was given the same key more than once. A
+	// repeat is rejected, never merged and never last-write-wins.
+	ErrDuplicateMetaKey = errors.New("babelqueue: meta key supplied more than once")
+	// ErrEmptyMetaKey: [WithMeta] was given an empty key.
+	ErrEmptyMetaKey = errors.New("babelqueue: meta key must not be empty")
+)
+
+// coreMetaKeys are the keys of [Meta]; extension entries may not reuse them.
+var coreMetaKeys = map[string]bool{
+	"id": true, "queue": true, "lang": true, "schema_version": true, "created_at": true,
+}
+
+// isBlankASCII reports whether s is empty or only ASCII whitespace (space, \t, \n,
+// \v, \f, \r) — the closed "blank" set of the conformance suite. It deliberately
+// does not use strings.TrimSpace, which also trims Unicode spaces (GR-5).
+func isBlankASCII(s string) bool { return strings.Trim(s, " \t\n\v\f\r") == "" }
 
 // Envelope is the canonical BabelQueue wire message: a strict, language-neutral
 // JSON shape ({job, trace_id, data, meta, attempts}) that every SDK produces and
@@ -47,6 +77,8 @@ type Option func(*makeConfig)
 type makeConfig struct {
 	queue   string
 	traceID string
+	meta    map[string]json.RawMessage
+	metaErr error // first WithMeta violation; surfaced by Make
 }
 
 // WithQueue sets the logical queue name recorded in meta.queue (default "default").
@@ -56,10 +88,53 @@ func WithQueue(queue string) Option { return func(c *makeConfig) { c.queue = que
 // a fresh one. A blank value is ignored.
 func WithTraceID(traceID string) Option { return func(c *makeConfig) { c.traceID = traceID } }
 
+// WithMeta adds one extension entry to the message's meta object, next to the core
+// meta keys (ADR-0031 (b)). Each call supplies one flat meta key; a vendor block is
+// supplied as the whole value of "ext" (snake_case, under meta.ext.<vendor>, is the
+// recommended shape). The value is JSON-encoded immediately.
+//
+// The entry is rejected — [Make] returns the error — when the key is empty
+// ([ErrEmptyMetaKey]), collides with a core meta key ([ErrReservedMetaKey]), is a
+// forbidden key of message-envelope.md §10 ([ErrForbiddenKey]), was already given to
+// an earlier WithMeta ([ErrDuplicateMetaKey]), or its value cannot be encoded as
+// JSON. Key matching is exact and case-sensitive: "TS" is not "ts".
+func WithMeta(key string, value any) Option {
+	return func(c *makeConfig) {
+		if c.metaErr != nil {
+			return // the first violation wins
+		}
+		switch {
+		case key == "":
+			c.metaErr = ErrEmptyMetaKey
+			return
+		case coreMetaKeys[key]:
+			c.metaErr = fmt.Errorf("%w: /meta/%s", ErrReservedMetaKey, key)
+			return
+		case forbiddenMetaKeys[key]:
+			c.metaErr = fmt.Errorf("%w: /meta/%s", ErrForbiddenKey, key)
+			return
+		}
+		if _, dup := c.meta[key]; dup {
+			c.metaErr = fmt.Errorf("%w: /meta/%s", ErrDuplicateMetaKey, key)
+			return
+		}
+		raw, err := marshalCompact(value)
+		if err != nil {
+			c.metaErr = fmt.Errorf("babelqueue: meta key /meta/%s: %w", key, err)
+			return
+		}
+		if c.meta == nil {
+			c.meta = make(map[string]json.RawMessage)
+		}
+		c.meta[key] = raw
+	}
+}
+
 // Make builds the canonical envelope for a (urn, data) pair. It mints a fresh
 // trace id unless WithTraceID is given, starts attempts at 0, and stamps meta
 // with a unique id, the source language ("go"), the schema version and a
-// millisecond timestamp. It returns ErrEmptyURN when urn is blank.
+// millisecond timestamp. It returns ErrEmptyURN when urn is blank, and the
+// [WithMeta] error when an extension entry is rejected.
 func Make(urn string, data map[string]any, opts ...Option) (Envelope, error) {
 	urn = strings.TrimSpace(urn)
 	if urn == "" {
@@ -69,6 +144,9 @@ func Make(urn string, data map[string]any, opts ...Option) (Envelope, error) {
 	cfg := makeConfig{queue: "default"}
 	for _, o := range opts {
 		o(&cfg)
+	}
+	if cfg.metaErr != nil {
+		return Envelope{}, cfg.metaErr
 	}
 
 	traceID := strings.TrimSpace(cfg.traceID)
@@ -90,7 +168,8 @@ func Make(urn string, data map[string]any, opts ...Option) (Envelope, error) {
 			SchemaVersion: SchemaVersion,
 			CreatedAt:     time.Now().UnixMilli(),
 		},
-		Attempts: 0,
+		Attempts:   0,
+		metaExtras: cfg.meta,
 	}, nil
 }
 
@@ -111,7 +190,8 @@ func (e Envelope) Encode() ([]byte, error) {
 }
 
 // Decode parses a raw JSON body into an Envelope. It accepts "urn" as an inbound
-// alias for "job" (resolving it into Job). Unknown top-level and meta keys are
+// alias for "job" (resolving it into Job) when "job" is missing, empty or only ASCII
+// whitespace; when both are present "job" wins and "urn" is dropped with a warning. Unknown top-level and meta keys are
 // kept and re-emitted by Encode; forbidden keys (message-envelope.md §10) are
 // dropped with a warning (see [Envelope.Warnings]). It does not validate the
 // contents — use Accepts for consumer-side validation. A non-object data block
@@ -128,8 +208,13 @@ func Decode(raw []byte) (Envelope, error) {
 	if err != nil {
 		return Envelope{}, err
 	}
-	if e.Job == "" {
-		e.Job = strings.TrimSpace(alias)
+	// A missing, empty or ASCII-blank job counts as absent: the URN then comes from
+	// the "urn" alias, and the alias key itself is never kept (ADR-0031 (c)). A job
+	// that is not blank wins; decodeEnvelope has already warned about a dropped urn.
+	if isBlankASCII(e.Job) {
+		if urn := strings.TrimSpace(alias); urn != "" {
+			e.Job = urn
+		}
 	}
 	return e, nil
 }
@@ -159,7 +244,7 @@ func (e Envelope) URN() string { return e.Job }
 // data — the consumer-side counterpart to the producer JSON Schema. (It accepts
 // the urn alias, unlike the stricter producer schema.)
 func (e Envelope) Accepts() bool {
-	if e.Job == "" {
+	if isBlankASCII(e.Job) {
 		return false
 	}
 	if e.Meta.SchemaVersion != SchemaVersion {

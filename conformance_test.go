@@ -3,9 +3,12 @@ package babelqueue_test
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -186,16 +189,112 @@ func parseGeneric(t *testing.T, b []byte) any {
 	return doc
 }
 
+// pointerViolation returns a message when the value at ptr in doc does not
+// deep-equal want, distinguishing JSON types ({} != [], true != 1); "" when it does.
+func pointerViolation(doc any, ptr string, want any) string {
+	got, ok := jsonPointer(doc, ptr)
+	if !ok {
+		return ptr + " missing after re-encode"
+	}
+	if !reflect.DeepEqual(got, want) {
+		return fmt.Sprintf("%s = %#v, want %#v", ptr, got, want)
+	}
+	return ""
+}
+
+// checkPreservedAbsent evaluates expect_preserved and expect_absent_after_reencode
+// against one parsed document and returns every violation.
+func checkPreservedAbsent(doc any, preserved map[string]any, absent []string) []string {
+	var v []string
+	for _, ptr := range sortedPointers(preserved) {
+		if msg := pointerViolation(doc, ptr, preserved[ptr]); msg != "" {
+			v = append(v, msg)
+		}
+	}
+	for _, ptr := range absent {
+		if _, ok := jsonPointer(doc, ptr); ok {
+			v = append(v, ptr+" present after re-encode, must be absent")
+		}
+	}
+	return v
+}
+
+func sortedPointers(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+type roundtripCase struct {
+	Name                      string         `json:"name"`
+	File                      string         `json:"file"`
+	ExpectAttempts            int            `json:"expect_attempts"`
+	ExpectPreserved           map[string]any `json:"expect_preserved"`
+	ExpectAbsentAfterReencode []string       `json:"expect_absent_after_reencode"`
+	ApplyDeadLetter           *struct {
+		Reason        string `json:"reason"`
+		OriginalQueue string `json:"original_queue"`
+	} `json:"apply_dead_letter"`
+	ExpectDeadLetter map[string]any `json:"expect_dead_letter"`
+}
+
+// checkRoundtrip runs one roundtrip case against body and returns the violations
+// (empty = conformant): decode (accepted, no warnings) -> attempts+1 -> encode, or
+// -> the SDK's own dead-letter helper when apply_dead_letter is set; every check is
+// evaluated on that final document.
+func checkRoundtrip(c roundtripCase, body []byte) []string {
+	env, err := babelqueue.Decode(body)
+	if err != nil {
+		return []string{"decode: " + err.Error()}
+	}
+	var v []string
+	if !env.Accepts() {
+		v = append(v, "roundtrip fixture must be accepted")
+	}
+	if w := env.Warnings(); len(w) != 0 {
+		v = append(v, fmt.Sprintf("decode must emit no warning, got %q", w))
+	}
+	env.Attempts++
+	if c.ApplyDeadLetter != nil {
+		env = babelqueue.Annotate(env, c.ApplyDeadLetter.Reason, c.ApplyDeadLetter.OriginalQueue,
+			env.Attempts, errors.New("conformance runner failure"))
+	}
+	out, err := env.Encode()
+	if err != nil {
+		return append(v, "encode: "+err.Error())
+	}
+	var doc any
+	if err := json.Unmarshal(out, &doc); err != nil {
+		return append(v, "emitted bytes are not JSON: "+err.Error())
+	}
+	if got, _ := jsonPointer(doc, "/attempts"); got != float64(c.ExpectAttempts) {
+		v = append(v, fmt.Sprintf("attempts = %v, want %d", got, c.ExpectAttempts))
+	}
+	v = append(v, checkPreservedAbsent(doc, c.ExpectPreserved, c.ExpectAbsentAfterReencode)...)
+	if c.ApplyDeadLetter != nil && len(c.ExpectDeadLetter) > 0 {
+		dl, ok := jsonPointer(doc, "/dead_letter")
+		if !ok {
+			return append(v, "dead_letter block missing")
+		}
+		for _, k := range sortedPointers(c.ExpectDeadLetter) {
+			got, _ := dl.(map[string]any)[k]
+			if !reflect.DeepEqual(got, c.ExpectDeadLetter[k]) {
+				v = append(v, fmt.Sprintf("dead_letter.%s = %#v, want %#v", k, got, c.ExpectDeadLetter[k]))
+			}
+		}
+	}
+	return v
+}
+
 // TestConformanceRoundtrip runs the `roundtrip` section: decode -> attempts+1 ->
-// encode must preserve every unknown key with the same JSON type and value.
+// encode (or dead-letter) must preserve every unknown key with the same JSON type
+// and value, drop what the case says is absent, and emit no decode warning.
 func TestConformanceRoundtrip(t *testing.T) {
 	var sec struct {
-		Cases []struct {
-			Name            string         `json:"name"`
-			File            string         `json:"file"`
-			ExpectAttempts  int            `json:"expect_attempts"`
-			ExpectPreserved map[string]any `json:"expect_preserved"`
-		} `json:"cases"`
+		Cases []roundtripCase `json:"cases"`
 	}
 	loadManifestSection(t, "roundtrip", &sec)
 	if len(sec.Cases) == 0 {
@@ -204,31 +303,8 @@ func TestConformanceRoundtrip(t *testing.T) {
 	for _, c := range sec.Cases {
 		c := c
 		t.Run(c.Name, func(t *testing.T) {
-			env, err := babelqueue.Decode(readFixture(t, c.File))
-			if err != nil {
-				t.Fatalf("decode: %v", err)
-			}
-			if !env.Accepts() {
-				t.Fatal("roundtrip fixture must be accepted")
-			}
-			env.Attempts++
-			out, err := env.Encode()
-			if err != nil {
-				t.Fatalf("encode: %v", err)
-			}
-			doc := parseGeneric(t, out)
-			if got, _ := jsonPointer(doc, "/attempts"); got != float64(c.ExpectAttempts) {
-				t.Errorf("attempts = %v, want %d", got, c.ExpectAttempts)
-			}
-			for ptr, want := range c.ExpectPreserved {
-				got, ok := jsonPointer(doc, ptr)
-				if !ok {
-					t.Errorf("%s missing after re-encode", ptr)
-					continue
-				}
-				if !reflect.DeepEqual(got, want) {
-					t.Errorf("%s = %#v, want %#v", ptr, got, want)
-				}
+			for _, msg := range checkRoundtrip(c, readFixture(t, c.File)) {
+				t.Error(msg)
 			}
 		})
 	}
@@ -291,17 +367,52 @@ func TestConformanceDataShape(t *testing.T) {
 	}
 }
 
+type forbiddenKeyCase struct {
+	Name                      string         `json:"name"`
+	File                      string         `json:"file"`
+	ForbiddenKey              string         `json:"forbidden_key"`
+	Expect                    string         `json:"expect"`
+	ExpectAbsentAfterReencode []string       `json:"expect_absent_after_reencode"`
+	ExpectPreserved           map[string]any `json:"expect_preserved"`
+}
+
+// checkForbiddenKey runs one forbidden_keys case against body and returns the
+// violations: decode succeeds with a warning naming the key, and the re-encode
+// keeps expect_preserved and drops expect_absent_after_reencode.
+func checkForbiddenKey(c forbiddenKeyCase, body []byte) []string {
+	if c.Expect != "warn" {
+		return []string{fmt.Sprintf("unsupported expect %q", c.Expect)}
+	}
+	env, err := babelqueue.Decode(body)
+	if err != nil {
+		return []string{"decode must succeed (warn, not reject): " + err.Error()}
+	}
+	var v []string
+	named := false
+	for _, w := range env.Warnings() {
+		if strings.Contains(w, c.ForbiddenKey) {
+			named = true
+		}
+	}
+	if !named {
+		v = append(v, fmt.Sprintf("no warning names %s; warnings = %q", c.ForbiddenKey, env.Warnings()))
+	}
+	out, err := env.Encode()
+	if err != nil {
+		return append(v, "encode: "+err.Error())
+	}
+	var doc any
+	if err := json.Unmarshal(out, &doc); err != nil {
+		return append(v, "emitted bytes are not JSON: "+err.Error())
+	}
+	return append(v, checkPreservedAbsent(doc, c.ExpectPreserved, c.ExpectAbsentAfterReencode)...)
+}
+
 // TestConformanceForbiddenKeys runs the `forbidden_keys` section (K-15): decode
 // succeeds with a warning naming the key, and re-encoding never emits it.
 func TestConformanceForbiddenKeys(t *testing.T) {
 	var sec struct {
-		Cases []struct {
-			Name                      string   `json:"name"`
-			File                      string   `json:"file"`
-			ForbiddenKey              string   `json:"forbidden_key"`
-			Expect                    string   `json:"expect"`
-			ExpectAbsentAfterReencode []string `json:"expect_absent_after_reencode"`
-		} `json:"cases"`
+		Cases []forbiddenKeyCase `json:"cases"`
 	}
 	loadManifestSection(t, "forbidden_keys", &sec)
 	if len(sec.Cases) == 0 {
@@ -310,31 +421,190 @@ func TestConformanceForbiddenKeys(t *testing.T) {
 	for _, c := range sec.Cases {
 		c := c
 		t.Run(c.Name, func(t *testing.T) {
-			if c.Expect != "warn" {
-				t.Fatalf("unsupported expect %q", c.Expect)
+			for _, msg := range checkForbiddenKey(c, readFixture(t, c.File)) {
+				t.Error(msg)
 			}
-			env, err := babelqueue.Decode(readFixture(t, c.File))
+		})
+	}
+}
+
+// TestConformanceRunnerReportsViolations proves the optional runner fields are
+// actually evaluated: on synthetic cases that break each one the runner must report
+// a violation (a runner that ignored the field would stay green on the same input).
+func TestConformanceRunnerReportsViolations(t *testing.T) {
+	const body = `{"job":"urn:acme:a","trace_id":"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",` +
+		`"data":{"order_id":1},"meta":{"id":"f1e2d3c4-b5a6-4789-90ab-cdef01234567","queue":"orders",` +
+		`"lang":"php","schema_version":1,"created_at":1749132727000},"attempts":0,"extra_top":1}`
+	const withURN = `{"job":"urn:acme:a","urn":"urn:acme:a","trace_id":"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b",` +
+		`"data":{},"meta":{"id":"f1e2d3c4-b5a6-4789-90ab-cdef01234567","queue":"orders",` +
+		`"lang":"php","schema_version":1,"created_at":1749132727000},"attempts":0}`
+
+	t.Run("roundtrip baseline is clean", func(t *testing.T) {
+		c := roundtripCase{ExpectAttempts: 1, ExpectPreserved: map[string]any{"/extra_top": float64(1)}}
+		if v := checkRoundtrip(c, []byte(body)); len(v) != 0 {
+			t.Fatalf("unexpected violations: %q", v)
+		}
+	})
+	t.Run("roundtrip expect_absent_after_reencode", func(t *testing.T) {
+		c := roundtripCase{ExpectAttempts: 1, ExpectAbsentAfterReencode: []string{"/extra_top"}}
+		if v := checkRoundtrip(c, []byte(body)); len(v) != 1 || !strings.Contains(v[0], "/extra_top present") {
+			t.Fatalf("want one /extra_top violation, got %q", v)
+		}
+	})
+	t.Run("roundtrip expect_preserved wrong value", func(t *testing.T) {
+		c := roundtripCase{ExpectAttempts: 1, ExpectPreserved: map[string]any{"/extra_top": float64(2)}}
+		if v := checkRoundtrip(c, []byte(body)); len(v) != 1 || !strings.Contains(v[0], "/extra_top") {
+			t.Fatalf("want one /extra_top violation, got %q", v)
+		}
+	})
+	t.Run("roundtrip expect_dead_letter wrong value", func(t *testing.T) {
+		c := roundtripCase{ExpectAttempts: 1, ExpectDeadLetter: map[string]any{"reason": "poison"}}
+		c.ApplyDeadLetter = &struct {
+			Reason        string `json:"reason"`
+			OriginalQueue string `json:"original_queue"`
+		}{"failed", "orders"}
+		if v := checkRoundtrip(c, []byte(body)); len(v) != 1 || !strings.Contains(v[0], "dead_letter.reason") {
+			t.Fatalf("want one dead_letter.reason violation, got %q", v)
+		}
+	})
+	t.Run("roundtrip warning is a violation", func(t *testing.T) {
+		if v := checkRoundtrip(roundtripCase{ExpectAttempts: 1}, []byte(withURN)); len(v) != 1 || !strings.Contains(v[0], "no warning") {
+			t.Fatalf("want a decode-warning violation, got %q", v)
+		}
+	})
+	t.Run("forbidden_keys expect_preserved", func(t *testing.T) {
+		c := forbiddenKeyCase{Expect: "warn", ForbiddenKey: "/urn",
+			ExpectAbsentAfterReencode: []string{"/urn"},
+			ExpectPreserved:           map[string]any{"/job": "urn:acme:other"}}
+		if v := checkForbiddenKey(c, []byte(withURN)); len(v) != 1 || !strings.Contains(v[0], "/job") {
+			t.Fatalf("want one /job violation, got %q", v)
+		}
+	})
+	t.Run("forbidden_keys expect_absent_after_reencode", func(t *testing.T) {
+		c := forbiddenKeyCase{Expect: "warn", ForbiddenKey: "/urn", ExpectAbsentAfterReencode: []string{"/job"}}
+		if v := checkForbiddenKey(c, []byte(withURN)); len(v) != 1 || !strings.Contains(v[0], "/job present") {
+			t.Fatalf("want one /job violation, got %q", v)
+		}
+	})
+	t.Run("forbidden_keys baseline is clean", func(t *testing.T) {
+		c := forbiddenKeyCase{Expect: "warn", ForbiddenKey: "/urn",
+			ExpectAbsentAfterReencode: []string{"/urn"},
+			ExpectPreserved:           map[string]any{"/job": "urn:acme:a"}}
+		if v := checkForbiddenKey(c, []byte(withURN)); len(v) != 0 {
+			t.Fatalf("unexpected violations: %q", v)
+		}
+	})
+}
+
+// TestConformanceExtensionWrite runs the `extension_write` section: the producer
+// meta write API lands each entry in meta, and the entries survive a decode ->
+// attempts+1 -> encode retry hop.
+func TestConformanceExtensionWrite(t *testing.T) {
+	var sec struct {
+		Cases []struct {
+			Name           string         `json:"name"`
+			URN            string         `json:"urn"`
+			Queue          string         `json:"queue"`
+			Data           map[string]any `json:"data"`
+			Meta           map[string]any `json:"meta"`
+			ExpectEnvelope map[string]any `json:"expect_envelope"`
+		} `json:"cases"`
+	}
+	loadManifestSection(t, "extension_write", &sec)
+	if len(sec.Cases) == 0 {
+		t.Fatal("extension_write section has no cases")
+	}
+	for _, c := range sec.Cases {
+		c := c
+		t.Run(c.Name, func(t *testing.T) {
+			opts := []babelqueue.Option{babelqueue.WithQueue(c.Queue)}
+			for _, k := range sortedPointers(c.Meta) {
+				opts = append(opts, babelqueue.WithMeta(k, c.Meta[k]))
+			}
+			env, err := babelqueue.Make(c.URN, c.Data, opts...)
 			if err != nil {
-				t.Fatalf("decode must succeed (warn, not reject): %v", err)
-			}
-			named := false
-			for _, w := range env.Warnings() {
-				if strings.Contains(w, c.ForbiddenKey) {
-					named = true
-				}
-			}
-			if !named {
-				t.Errorf("no warning names %s; warnings = %q", c.ForbiddenKey, env.Warnings())
+				t.Fatalf("make: %v", err)
 			}
 			out, err := env.Encode()
 			if err != nil {
 				t.Fatalf("encode: %v", err)
 			}
 			doc := parseGeneric(t, out)
-			for _, ptr := range c.ExpectAbsentAfterReencode {
-				if _, ok := jsonPointer(doc, ptr); ok {
-					t.Errorf("%s re-emitted after decode; forbidden keys must be dropped", ptr)
+			for _, msg := range checkPreservedAbsent(doc, c.ExpectEnvelope, nil) {
+				t.Errorf("first emit: %s", msg)
+			}
+			// Re-emit chain: decode, attempts+1, encode again.
+			back, err := babelqueue.Decode(out)
+			if err != nil {
+				t.Fatalf("decode: %v", err)
+			}
+			back.Attempts++
+			out2, err := back.Encode()
+			if err != nil {
+				t.Fatalf("re-encode: %v", err)
+			}
+			doc2 := parseGeneric(t, out2)
+			for _, msg := range checkPreservedAbsent(doc2, c.ExpectEnvelope, nil) {
+				t.Errorf("after retry hop: %s", msg)
+			}
+			if got, _ := jsonPointer(doc2, "/attempts"); got != float64(1) {
+				t.Errorf("attempts = %v, want 1", got)
+			}
+		})
+	}
+}
+
+// TestConformanceEncodeReject runs the `encode_reject` section: a forbidden or
+// core-colliding key MUST fail the producer/encode path with an error, and no
+// envelope JSON may be produced.
+func TestConformanceEncodeReject(t *testing.T) {
+	var sec struct {
+		Cases []struct {
+			Name         string         `json:"name"`
+			URN          string         `json:"urn"`
+			Queue        string         `json:"queue"`
+			Data         map[string]any `json:"data"`
+			Meta         map[string]any `json:"meta"`
+			MetaEntries  [][2]any       `json:"meta_entries"`
+			ExtrasTop    map[string]any `json:"extras_top"`
+			ExtrasMeta   map[string]any `json:"extras_meta"`
+			OffendingKey string         `json:"offending_key"`
+			Expect       string         `json:"expect"`
+		} `json:"cases"`
+	}
+	loadManifestSection(t, "encode_reject", &sec)
+	if len(sec.Cases) == 0 {
+		t.Fatal("encode_reject section has no cases")
+	}
+	for _, c := range sec.Cases {
+		c := c
+		t.Run(c.Name, func(t *testing.T) {
+			if c.Expect != "reject" {
+				t.Fatalf("unsupported expect %q", c.Expect)
+			}
+			opts := []babelqueue.Option{babelqueue.WithQueue(c.Queue)}
+			for _, k := range sortedPointers(c.Meta) {
+				opts = append(opts, babelqueue.WithMeta(k, c.Meta[k]))
+			}
+			for _, e := range c.MetaEntries {
+				opts = append(opts, babelqueue.WithMeta(e[0].(string), e[1]))
+			}
+			env, err := babelqueue.Make(c.URN, c.Data, opts...)
+			var out []byte
+			if err == nil {
+				if len(c.ExtrasTop) > 0 || len(c.ExtrasMeta) > 0 {
+					env = babelqueue.SetExtrasForTest(env, c.ExtrasTop, c.ExtrasMeta)
 				}
+				out, err = env.Encode()
+			}
+			if err == nil {
+				t.Fatalf("expected a rejection for %s, got envelope %s", c.OffendingKey, out)
+			}
+			if len(out) != 0 {
+				t.Errorf("rejected path produced bytes: %s", out)
+			}
+			if !strings.Contains(err.Error(), c.OffendingKey) {
+				t.Errorf("error %q does not name %s", err, c.OffendingKey)
 			}
 		})
 	}

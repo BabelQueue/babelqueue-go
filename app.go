@@ -291,9 +291,14 @@ func (a *App) dispatch(ctx context.Context, msg *ReceivedMessage) {
 		urn = msg.RouteURN // transport-supplied routing override; the body is not rewritten
 	}
 
-	if decodeErr != nil || urn == "" {
+	if decodeErr != nil || isBlankASCII(urn) {
 		a.routePoison(ctx, msg, env, decodeErr)
 		return
+	}
+	// Non-fatal decode findings (a dropped forbidden key, ADR-0031 (c)) are logged,
+	// never fatal: the message is still delivered.
+	for _, w := range env.Warnings() {
+		slog.WarnContext(ctx, w, "queue", msg.Queue, "route", msg.RouteURN)
 	}
 	handler, ok := a.handlers[urn]
 	if !ok {

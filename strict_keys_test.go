@@ -202,3 +202,100 @@ func TestDecodeDisplacedMetaBlockDropsItsForbiddenWarnings(t *testing.T) {
 		})
 	}
 }
+
+// --- ADR-0031 (c): blank job falls back to urn; job+urn drops urn with a warning ---
+
+const blankJobTail = `"trace_id":"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b","data":{},` +
+	`"meta":{"id":"f1e2d3c4-b5a6-4789-90ab-cdef01234567","queue":"orders","lang":"php",` +
+	`"schema_version":1,"created_at":1749132727000},"attempts":0}`
+
+func TestDecodeBlankASCIIJobFallsBackToURN(t *testing.T) {
+	for _, job := range []string{`""`, `" "`, `"\t"`, `"\n"`, `"\u000b"`, `"\f"`, `"\r"`, `" \t\r\n "`} {
+		body := `{"job":` + job + `,"urn":"urn:acme:b",` + blankJobTail
+		env, err := Decode([]byte(body))
+		if err != nil {
+			t.Fatalf("job %s: %v", job, err)
+		}
+		if env.Job != "urn:acme:b" || !env.Accepts() {
+			t.Errorf("job %s: Job=%q Accepts=%v, want urn:acme:b/true", job, env.Job, env.Accepts())
+		}
+		if w := env.Warnings(); len(w) != 0 {
+			t.Errorf("job %s: unexpected warnings %q", job, w)
+		}
+		out, err := env.Encode()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var doc map[string]json.RawMessage
+		_ = json.Unmarshal(out, &doc)
+		if _, ok := doc["urn"]; ok {
+			t.Errorf("job %s: urn key retained: %s", job, out)
+		}
+	}
+}
+
+func TestDecodeURNOnlyAndMissingJob(t *testing.T) {
+	env, err := Decode([]byte(`{"urn":"urn:acme:b",` + blankJobTail))
+	if err != nil || env.Job != "urn:acme:b" || !env.Accepts() || len(env.Warnings()) != 0 {
+		t.Errorf("urn-only: %+v err=%v", env, err)
+	}
+	// A blank job with no usable urn is not accepted.
+	for _, body := range []string{`{"job":" ",` + blankJobTail, `{"job":"","urn":"  ",` + blankJobTail} {
+		env, err := Decode([]byte(body))
+		if err == nil && env.Accepts() {
+			t.Errorf("blank job without urn accepted: %s", body)
+		}
+	}
+}
+
+func TestDecodeNonASCIIWhitespaceJobIsNotBlank(t *testing.T) {
+	// U+2003 EM SPACE is not in the closed ASCII blank set: job wins, urn is dropped.
+	body := `{"job":"\u2003","urn":"urn:acme:b",` + blankJobTail
+	env, err := Decode([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env.Job != "\u2003" {
+		t.Errorf("Job = %q, want the U+2003 value untouched", env.Job)
+	}
+	warned := false
+	for _, w := range env.Warnings() {
+		warned = warned || strings.Contains(w, "/urn")
+	}
+	if !warned {
+		t.Errorf("no warning names /urn: %q", env.Warnings())
+	}
+}
+
+func TestDecodeJobAndURNJobWinsURNDroppedWithWarning(t *testing.T) {
+	body := `{"job":"urn:acme:a","urn":"urn:acme:other",` + blankJobTail
+	env, err := Decode([]byte(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env.Job != "urn:acme:a" {
+		t.Errorf("Job = %q, want urn:acme:a", env.Job)
+	}
+	warned := false
+	for _, w := range env.Warnings() {
+		warned = warned || strings.Contains(w, "/urn")
+	}
+	if !warned {
+		t.Errorf("no warning names /urn: %q", env.Warnings())
+	}
+	out, err := env.Encode()
+	if err != nil {
+		t.Fatalf("re-encode must succeed (urn was dropped, not retained): %v", err)
+	}
+	if strings.Contains(string(out), `"urn"`) {
+		t.Errorf("urn re-emitted: %s", out)
+	}
+	// The same rule holds on the json.Unmarshal path.
+	var viaUnmarshal Envelope
+	if err := json.Unmarshal([]byte(body), &viaUnmarshal); err != nil {
+		t.Fatal(err)
+	}
+	if len(viaUnmarshal.Warnings()) == 0 {
+		t.Error("json.Unmarshal path lost the /urn warning")
+	}
+}

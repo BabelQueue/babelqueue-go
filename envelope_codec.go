@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"reflect"
 	"sort"
 )
@@ -33,7 +34,15 @@ type envelopeWire struct {
 // MarshalJSON renders the known fields in canonical order, then any unknown keys
 // captured by Decode (sorted, verbatim). An envelope without unknown keys encodes
 // byte-for-byte as the plain struct would.
+//
+// It rejects, with [ErrForbiddenKey] or [ErrReservedMetaKey], an envelope whose
+// extras hold a forbidden key (message-envelope.md §10, including a leftover
+// top-level "urn") or a core meta key (ADR-0031 (c)); nothing is written. Decode
+// never leaves such a key behind, so a decoded envelope always re-encodes.
 func (e Envelope) MarshalJSON() ([]byte, error) {
+	if err := e.checkExtras(); err != nil {
+		return nil, err
+	}
 	meta, err := marshalCompact(e.Meta)
 	if err != nil {
 		return nil, err
@@ -52,6 +61,35 @@ func (e Envelope) MarshalJSON() ([]byte, error) {
 		return nil, err
 	}
 	return appendRawFields(body, e.extras), nil
+}
+
+// checkExtras is the encode-reject guard: it inspects the extras the envelope
+// carries, whatever their origin (WithMeta, a decoded inbound message), in sorted
+// key order so the reported key is deterministic.
+func (e Envelope) checkExtras() error {
+	for _, k := range sortedKeys(e.extras) {
+		if forbiddenTopLevelKeys[k] || k == "urn" {
+			return fmt.Errorf("%w: /%s", ErrForbiddenKey, k)
+		}
+	}
+	for _, k := range sortedKeys(e.metaExtras) {
+		if forbiddenMetaKeys[k] {
+			return fmt.Errorf("%w: /meta/%s", ErrForbiddenKey, k)
+		}
+		if coreMetaKeys[k] {
+			return fmt.Errorf("%w: /meta/%s", ErrReservedMetaKey, k)
+		}
+	}
+	return nil
+}
+
+func sortedKeys(m map[string]json.RawMessage) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // UnmarshalJSON decodes the known fields and captures unknown top-level and meta
@@ -90,6 +128,7 @@ func decodeEnvelope(raw []byte) (Envelope, string, error) {
 	var (
 		env               Envelope
 		alias             string
+		urnSeen           bool
 		forbidden         = map[string]bool{}
 		metaForbidden     = map[string]bool{}
 		extras            map[string]json.RawMessage
@@ -140,6 +179,7 @@ func decodeEnvelope(raw []byte) (Envelope, string, error) {
 				s = ""
 			}
 			alias = s
+			urnSeen = true
 			return nil
 		default:
 			if forbiddenTopLevelKeys[name] {
@@ -155,6 +195,13 @@ func decodeEnvelope(raw []byte) (Envelope, string, error) {
 	})
 	if err != nil {
 		return Envelope{}, "", err
+	}
+
+	// "urn" next to a job that is not blank: job wins, urn is dropped with a warning
+	// (ADR-0031 (c)). With a blank job the urn is the source of the identity and
+	// Decode resolves it without a warning.
+	if urnSeen && !isBlankASCII(env.Job) {
+		forbidden["urn"] = true
 	}
 
 	env.extras = extras

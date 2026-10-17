@@ -9,8 +9,31 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+Target version: **1.15.0** (minor; the envelope stays at `schema_version: 1`) — ADR-0031.
+
+### Added
+
+- **`WithMeta(key, value)` producer option** writes a custom key into `meta` (vendor data belongs under
+  `meta.ext.<vendor>`). It is rejected, from `Make`, when the key collides with a core meta key
+  (`ErrReservedMetaKey`), is a forbidden key (`ErrForbiddenKey`), is empty (`ErrEmptyMetaKey`) or is
+  repeated (`ErrDuplicateMetaKey`).
+- **`Encode` rejects forbidden keys.** A top-level `timestamp`/`urn`, a forbidden `meta` key or a core
+  meta key found in the preserved unknown keys now fails with `ErrForbiddenKey` / `ErrReservedMetaKey`
+  instead of being written to the wire. Keys dropped on decode never reach this path.
+- The `App` consumer logs every decode warning (`Envelope.Warnings()`) with `slog.Warn`; the message is
+  still processed.
+- Conformance runner: the `extension_write` and `encode_reject` sections, and the optional 1.4.0 fields
+  (`expect_absent_after_reencode`, `apply_dead_letter` via `Annotate`, `expect_dead_letter`,
+  `expect_preserved` for `forbidden_keys`).
+
 ### Changed
 
+- **Decode: a blank `job` falls back to `urn`.** `job` that is missing, empty or only ASCII whitespace
+  (space, `\t`, `\n`, `\v`, `\f`, `\r`) is treated as absent and the identity is read from `urn`; the
+  `urn` key is not retained. When `job` is not blank and `urn` is also present, `job` wins and `urn` is
+  dropped with a warning naming `/urn`.
+- **Behaviour note:** `Accepts()` now returns false for a `job` made only of ASCII whitespace with no
+  usable `urn` (it used to accept it).
 - CI only: `scripts/check-coverage.sh` now prints the `go test` output when the suite fails, so a
   failing test in the coverage job is named in the log instead of surfacing as a bare exit code.
 
