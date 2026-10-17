@@ -9,7 +9,10 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
-Target version: **1.15.0** (minor; the envelope stays at `schema_version: 1`) — ADR-0031.
+## [1.15.0] - 2026-10-17
+
+Minor; the envelope stays at `schema_version: 1` — ADR-0031. Only the core module is tagged; the
+transport and helper modules are unchanged and keep their pins.
 
 ### Added
 
