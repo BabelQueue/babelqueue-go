@@ -192,10 +192,11 @@ func (e Envelope) Encode() ([]byte, error) {
 // Decode parses a raw JSON body into an Envelope. It accepts "urn" as an inbound
 // alias for "job" (resolving it into Job) when "job" is missing, empty or only ASCII
 // whitespace; when both are present "job" wins and "urn" is dropped with a warning.
-// Unknown top-level and meta keys are kept and re-emitted by Encode; forbidden keys (message-envelope.md §10) are
-// dropped with a warning (see [Envelope.Warnings]). It does not validate the
-// contents — use Accepts for consumer-side validation. A non-object data block
-// (e.g. a JSON array) is rejected with an error.
+// Unknown top-level and meta keys are kept and re-emitted by Encode; forbidden
+// keys (message-envelope.md §10) are dropped with a warning (see
+// [Envelope.Warnings]). It does not validate the contents — use Accepts for
+// consumer-side validation. A non-object data block (e.g. a JSON array) is
+// rejected with an error.
 //
 // Envelope keys are matched by exact, case-sensitive spelling, like the canonical
 // schema and every other SDK core: a wrongly cased key ("JOB", "Data", "META",
