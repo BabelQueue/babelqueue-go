@@ -191,8 +191,8 @@ func (e Envelope) Encode() ([]byte, error) {
 
 // Decode parses a raw JSON body into an Envelope. It accepts "urn" as an inbound
 // alias for "job" (resolving it into Job) when "job" is missing, empty or only ASCII
-// whitespace; when both are present "job" wins and "urn" is dropped with a warning. Unknown top-level and meta keys are
-// kept and re-emitted by Encode; forbidden keys (message-envelope.md §10) are
+// whitespace; when both are present "job" wins and "urn" is dropped with a warning.
+// Unknown top-level and meta keys are kept and re-emitted by Encode; forbidden keys (message-envelope.md §10) are
 // dropped with a warning (see [Envelope.Warnings]). It does not validate the
 // contents — use Accepts for consumer-side validation. A non-object data block
 // (e.g. a JSON array) is rejected with an error.
@@ -204,17 +204,17 @@ func (e Envelope) Encode() ([]byte, error) {
 // that occurs more than once resolves to its last occurrence (data is replaced,
 // never merged).
 func Decode(raw []byte) (Envelope, error) {
-	e, alias, err := decodeEnvelope(raw)
+	e, alias, aliasIsString, err := decodeEnvelope(raw)
 	if err != nil {
 		return Envelope{}, err
 	}
 	// A missing, empty or ASCII-blank job counts as absent: the URN then comes from
 	// the "urn" alias, and the alias key itself is never kept (ADR-0031 (c)). A job
 	// that is not blank wins; decodeEnvelope has already warned about a dropped urn.
-	if isBlankASCII(e.Job) {
-		if urn := strings.TrimSpace(alias); urn != "" {
-			e.Job = urn
-		}
+	// The alias is taken verbatim, exactly as every other SDK core does (GR-5): no
+	// trimming, so a padded alias stays padded and is then judged by the consumer.
+	if aliasIsString && isBlankASCII(e.Job) {
+		e.Job = alias
 	}
 	return e, nil
 }

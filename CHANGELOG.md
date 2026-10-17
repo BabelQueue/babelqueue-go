@@ -20,8 +20,9 @@ Target version: **1.15.0** (minor; the envelope stays at `schema_version: 1`) â€
 - **`Encode` rejects forbidden keys.** A top-level `timestamp`/`urn`, a forbidden `meta` key or a core
   meta key found in the preserved unknown keys now fails with `ErrForbiddenKey` / `ErrReservedMetaKey`
   instead of being written to the wire. Keys dropped on decode never reach this path.
-- The `App` consumer logs every decode warning (`Envelope.Warnings()`) with `slog.Warn`; the message is
-  still processed.
+- The `App` consumer logs every decode warning (`Envelope.Warnings()`) with `slog.Warn` (constant message
+  `babelqueue: decode warning`, the finding as the `warning` attribute), including for a message that is
+  about to be dead-lettered as poison; the message is still processed.
 - Conformance runner: the `extension_write` and `encode_reject` sections, and the optional 1.4.0 fields
   (`expect_absent_after_reencode`, `apply_dead_letter` via `Annotate`, `expect_dead_letter`,
   `expect_preserved` for `forbidden_keys`).
@@ -32,6 +33,10 @@ Target version: **1.15.0** (minor; the envelope stays at `schema_version: 1`) â€
   (space, `\t`, `\n`, `\v`, `\f`, `\r`) is treated as absent and the identity is read from `urn`; the
   `urn` key is not retained. When `job` is not blank and `urn` is also present, `job` wins and `urn` is
   dropped with a warning naming `/urn`.
+  The `urn` alias is copied into `job` verbatim (not trimmed), like the other SDK cores. A `urn` that is
+  not a string is dropped with the same `/urn` warning.
+- **Behaviour note:** a message whose `job` is blank and has no `urn` is now routed down the poison
+  path (unknown URN with an empty name) instead of the unknown-URN path with the whitespace as its name.
 - **Behaviour note:** `Accepts()` now returns false for a `job` made only of ASCII whitespace with no
   usable `urn` (it used to accept it).
 - CI only: `scripts/check-coverage.sh` now prints the `go test` output when the suite fails, so a

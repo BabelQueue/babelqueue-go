@@ -717,3 +717,59 @@ func TestAppCleanMessageLogsNoWarning(t *testing.T) {
 		t.Errorf("unexpected log output:\n%s", buf.String())
 	}
 }
+
+// --- Review round 1: warnings reach the log on the poison path; blank job at App level ---
+
+func TestAppBlankJobIsPoisonAndStillLogsWarnings(t *testing.T) {
+	for _, job := range []string{`""`, `" "`, `"\t\r\n"`} {
+		buf := slogCapture(t)
+		tr := NewInMemoryTransport()
+		app := NewApp(tr, WithDefaultQueue("orders"), WithDeadLetter(true),
+			WithUnknownURNStrategy(StrategyDeadLetter))
+		handled := 0
+		app.Handle("", func(context.Context, Envelope) error { handled++; return nil })
+		app.Handle(" ", func(context.Context, Envelope) error { handled++; return nil })
+		body := `{"job":` + job + `,"trace_id":"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b","data":{},` +
+			`"meta":{"id":"f1e2d3c4-b5a6-4789-90ab-cdef01234567","queue":"orders","lang":"php",` +
+			`"schema_version":1,"created_at":1,"ts":5},"attempts":0,"timestamp":1}`
+		if err := tr.Publish(context.Background(), "orders", body); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := app.Drain(context.Background(), "orders", 1); err != nil {
+			t.Fatal(err)
+		}
+		if handled != 0 {
+			t.Errorf("job %s: a handler ran for a blank identity", job)
+		}
+		if got := tr.Size("orders.dlq"); got != 1 {
+			t.Errorf("job %s: dead-letter queue holds %d messages, want 1", job, got)
+		}
+		logged := buf.String()
+		for _, key := range []string{"/timestamp", "/meta/ts"} {
+			if !strings.Contains(logged, key) {
+				t.Errorf("job %s: poison-path log does not name %s:\n%s", job, key, logged)
+			}
+		}
+	}
+}
+
+func TestAppDecodeWarningLogHasConstantMessage(t *testing.T) {
+	buf := slogCapture(t)
+	tr := NewInMemoryTransport()
+	app := NewApp(tr, WithDefaultQueue("orders"))
+	app.Handle("urn:acme:a", func(context.Context, Envelope) error { return nil })
+	body := `{"job":"urn:acme:a","trace_id":"7b3f9c2a-e41d-4f88-9b2a-1c0d5e6f7a8b","data":{},` +
+		`"meta":{"id":"f1e2d3c4-b5a6-4789-90ab-cdef01234567","queue":"orders","lang":"php",` +
+		`"schema_version":1,"created_at":1},"attempts":0,"timestamp":1}`
+	if err := tr.Publish(context.Background(), "orders", body); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.Drain(context.Background(), "orders", 1); err != nil {
+		t.Fatal(err)
+	}
+	logged := buf.String()
+	// The message is constant (groupable in log aggregators); the finding is an attribute.
+	if !strings.Contains(logged, `msg="babelqueue: decode warning"`) || !strings.Contains(logged, "warning=") {
+		t.Errorf("want constant message plus a warning attribute:\n%s", logged)
+	}
+}

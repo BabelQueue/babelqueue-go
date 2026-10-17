@@ -299,3 +299,62 @@ func TestDecodeJobAndURNJobWinsURNDroppedWithWarning(t *testing.T) {
 		t.Error("json.Unmarshal path lost the /urn warning")
 	}
 }
+
+// --- Review round 1: the alias is taken verbatim and warned about when unused ---
+
+func TestDecodeAliasIsTakenVerbatim(t *testing.T) {
+	// GR-5: Java, .NET and Node write the alias into Job as-is; Go must not trim it.
+	for _, alias := range []string{" urn:acme:b ", "\turn:acme:b", "urn:acme:b\n", "\u2003urn:acme:b"} {
+		quoted, _ := json.Marshal(alias)
+		env, err := Decode([]byte(`{"job":"","urn":` + string(quoted) + `,` + blankJobTail))
+		if err != nil {
+			t.Fatalf("alias %q: %v", alias, err)
+		}
+		if env.Job != alias {
+			t.Errorf("alias %q: Job=%q, want the alias verbatim", alias, env.Job)
+		}
+		if w := env.Warnings(); len(w) != 0 {
+			t.Errorf("alias %q: unexpected warnings %q", alias, w)
+		}
+		out, err := env.Encode()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var doc map[string]json.RawMessage
+		_ = json.Unmarshal(out, &doc)
+		if string(doc["job"]) != string(quoted) {
+			t.Errorf("alias %q: re-emitted job %s, want %s", alias, doc["job"], quoted)
+		}
+	}
+}
+
+func TestDecodeWhitespaceAliasBecomesBlankJob(t *testing.T) {
+	// A whitespace-only string alias still replaces the blank job (verbatim) and is
+	// then rejected by the consumer as a blank identity, with no spurious warning.
+	env, err := Decode([]byte(`{"job":"","urn":" ",` + blankJobTail))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if env.Job != " " || env.Accepts() || len(env.Warnings()) != 0 {
+		t.Errorf("Job=%q Accepts=%v Warnings=%q", env.Job, env.Accepts(), env.Warnings())
+	}
+}
+
+func TestDecodeNonStringAliasWarns(t *testing.T) {
+	// A non-string urn is no alias: it is dropped, and (like Java/.NET) with a warning.
+	for _, urn := range []string{`123`, `null`, `true`, `{"a":1}`, `["x"]`} {
+		for _, job := range []string{`""`, `" "`} {
+			env, err := Decode([]byte(`{"job":` + job + `,"urn":` + urn + `,` + blankJobTail))
+			if err != nil {
+				t.Fatalf("urn %s: %v", urn, err)
+			}
+			if env.Accepts() {
+				t.Errorf("job %s urn %s: accepted with Job=%q", job, urn, env.Job)
+			}
+			w := env.Warnings()
+			if len(w) != 1 || !strings.Contains(w[0], "/urn") {
+				t.Errorf("job %s urn %s: warnings %q, want one naming /urn", job, urn, w)
+			}
+		}
+	}
+}

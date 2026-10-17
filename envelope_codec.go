@@ -101,7 +101,7 @@ func sortedKeys(m map[string]json.RawMessage) []string {
 // occurrence (objects are replaced, never merged), though every occurrence is still
 // type-checked. The "urn" inbound alias is resolved by [Decode], not here.
 func (e *Envelope) UnmarshalJSON(raw []byte) error {
-	env, _, err := decodeEnvelope(raw)
+	env, _, _, err := decodeEnvelope(raw)
 	if err != nil {
 		return err
 	}
@@ -111,23 +111,25 @@ func (e *Envelope) UnmarshalJSON(raw []byte) error {
 
 // decodeEnvelope is the single decode path behind [Decode] and
 // [Envelope.UnmarshalJSON]. It also returns the value of the (exact-case) "urn"
-// alias member, if any, for Decode to resolve.
-func decodeEnvelope(raw []byte) (Envelope, string, error) {
+// alias member and whether that member was a JSON string (only a string can be an
+// alias), for Decode to resolve.
+func decodeEnvelope(raw []byte) (Envelope, string, bool, error) {
 	if !json.Valid(raw) {
 		// Let encoding/json produce the precise syntax error.
 		var skip json.RawMessage
 		if err := json.Unmarshal(raw, &skip); err != nil {
-			return Envelope{}, "", err
+			return Envelope{}, "", false, err
 		}
-		return Envelope{}, "", errInvalidJSON
+		return Envelope{}, "", false, errInvalidJSON
 	}
 	if isJSONNull(raw) {
-		return Envelope{}, "", nil
+		return Envelope{}, "", false, nil
 	}
 
 	var (
 		env               Envelope
 		alias             string
+		aliasIsString     bool
 		urnSeen           bool
 		forbidden         = map[string]bool{}
 		metaForbidden     = map[string]bool{}
@@ -175,7 +177,8 @@ func decodeEnvelope(raw []byte) (Envelope, string, error) {
 		case "urn":
 			// Inbound alias for job: only a string is an alias; any other type is ignored.
 			var s string
-			if json.Unmarshal(value, &s) != nil {
+			aliasIsString = json.Unmarshal(value, &s) == nil && !isJSONNull(value)
+			if !aliasIsString {
 				s = ""
 			}
 			alias = s
@@ -194,13 +197,14 @@ func decodeEnvelope(raw []byte) (Envelope, string, error) {
 		}
 	})
 	if err != nil {
-		return Envelope{}, "", err
+		return Envelope{}, "", false, err
 	}
 
-	// "urn" next to a job that is not blank: job wins, urn is dropped with a warning
-	// (ADR-0031 (c)). With a blank job the urn is the source of the identity and
-	// Decode resolves it without a warning.
-	if urnSeen && !isBlankASCII(env.Job) {
+	// The urn key itself is never kept. It is silent only when Decode will use it as
+	// the identity (blank job and a string alias); in every other case it is dropped
+	// with a warning (ADR-0031 (c)): next to a job that is not blank, job wins, and a
+	// non-string alias is no alias at all.
+	if urnSeen && !(isBlankASCII(env.Job) && aliasIsString) {
 		forbidden["urn"] = true
 	}
 
@@ -208,7 +212,7 @@ func decodeEnvelope(raw []byte) (Envelope, string, error) {
 	env.metaExtras = decodedMetaExtras
 	env.warnings = forbiddenWarnings(forbidden, "/")
 	env.warnings = append(env.warnings, forbiddenWarnings(metaForbidden, "/meta/")...)
-	return env, alias, nil
+	return env, alias, aliasIsString, nil
 }
 
 // decodeMeta decodes one meta object by exact member name. It returns the typed
