@@ -209,7 +209,7 @@ func Decode(raw []byte) (Envelope, error) {
 	return decodeEnvelope(raw)
 }
 
-// Warnings returns the non-fatal problems [Decode] found, such as a forbidden
+// Warnings returns the non-fatal problems [Decode] (or json.Unmarshal) found, such as a forbidden
 // non-canonical key (message-envelope.md §10) that was dropped. Each warning names
 // the offending key as a JSON pointer (e.g. "/meta/max_retries"). It is empty for a
 // clean envelope and for envelopes built with [Make].
@@ -226,7 +226,7 @@ func (e Envelope) Warnings() []string {
 }
 
 // URN returns the message URN — the canonical job, with the urn alias already
-// resolved by Decode.
+// resolved by [Decode] (or json.Unmarshal).
 func (e Envelope) URN() string { return e.Job }
 
 // Accepts reports whether a consumer should accept this envelope. It rejects a

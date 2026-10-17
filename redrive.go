@@ -16,6 +16,7 @@ type RedriveOptions struct {
 	Max int
 	// DryRun inspects without redriving: every message is read, reported, and returned to the
 	// DLQ unchanged — nothing is re-published to a source/sandbox queue.
+	// Decode warnings are logged for every message read, including dry-run and unselected ones.
 	DryRun bool
 	// Select, when non-nil, picks which messages to redrive (e.g. by reason or URN).
 	// Unselected messages are returned to the DLQ unchanged.
