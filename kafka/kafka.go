@@ -60,6 +60,9 @@ type Transport struct {
 
 	onRejected OnSchemaVersionRejected
 
+	// retryTiers are the configured `<topic>.retry.<n>` delay tiers, ascending (see retry.go).
+	retryTiers []time.Duration
+
 	// owned is closed by Close: the writer and its private kafka-go Transport that New built
 	// itself (nil when the caller injected a Writer via WithWriter, which stays the caller's).
 	owned          *kafkago.Writer
@@ -106,6 +109,7 @@ type config struct {
 	maxWait   time.Duration
 
 	onRejected OnSchemaVersionRejected
+	retryTiers []time.Duration
 }
 
 // WithBrokers sets the bootstrap broker list (host:port).
@@ -147,7 +151,7 @@ func New(opts ...Option) (*Transport, error) {
 		o(c)
 	}
 
-	t := &Transport{writer: c.writer, newReader: c.newReader, maxWait: c.maxWait, onRejected: c.onRejected, readers: make(map[string]Reader)}
+	t := &Transport{writer: c.writer, newReader: c.newReader, maxWait: c.maxWait, onRejected: c.onRejected, retryTiers: c.retryTiers, readers: make(map[string]Reader)}
 	if t.writer != nil && t.newReader != nil {
 		return t, nil
 	}

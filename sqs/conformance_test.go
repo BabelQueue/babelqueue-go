@@ -3,10 +3,12 @@ package sqs
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	babelqueue "github.com/babelqueue/babelqueue-go"
@@ -87,7 +89,7 @@ func TestSqsConformance(t *testing.T) {
 	})
 
 	for _, c := range m.SQS.AttemptsReconciliation.Cases {
-		t.Run("attempts/"+c.Name, func(t *testing.T) {
+		t.Run("attempts_reconciliation/"+c.Name, func(t *testing.T) {
 			env, _ := babelqueue.Make("urn:babel:orders:created", map[string]any{"x": 1})
 			env.Attempts = c.BodyAttempts
 			body, _ := env.Encode()
@@ -113,29 +115,124 @@ func TestSqsConformance(t *testing.T) {
 			t.Fatalf("fixture: %v", err)
 		}
 		for i, c := range gate.Cases {
-			fake := newFakeSQS()
-			tr := NewWithClient(fake, WithQueueURLPrefix("http://fake"))
-			fake.seedWithVersion("http://fake/orders", string(body), c.Value, 1)
-			if c.Absent {
-				fake.visible["http://fake/orders"][0].MessageAttributes = nil
-			}
-			label := "absent"
-			if !c.Absent && c.Value != nil {
-				label = strconv.Quote(*c.Value)
-			}
-			msg, err := tr.Pop(context.Background(), "orders", 0)
-			if err != nil || msg == nil {
-				t.Fatalf("case %d (%s): Pop: msg=%v err=%v", i, label, msg, err)
-			}
-			rejected := msg.RouteURN != ""
-			if rejected != (c.Expect == "reject") {
-				t.Errorf("case %d (%s): rejected=%v, want expect=%s", i, label, rejected, c.Expect)
-			}
-			if !rejected {
-				if _, err := babelqueue.Decode([]byte(msg.Body)); err != nil {
-					t.Errorf("case %d (%s): decode: %v", i, label, err)
+			i, c := i, c
+			t.Run(strconv.Itoa(i), func(t *testing.T) {
+				fake := newFakeSQS()
+				tr := NewWithClient(fake, WithQueueURLPrefix("http://fake"))
+				fake.seedWithVersion("http://fake/orders", string(body), c.Value, 1)
+				if c.Absent {
+					fake.visible["http://fake/orders"][0].MessageAttributes = nil
 				}
+				label := "absent"
+				if !c.Absent && c.Value != nil {
+					label = strconv.Quote(*c.Value)
+				}
+				msg, err := tr.Pop(context.Background(), "orders", 0)
+				if err != nil || msg == nil {
+					t.Fatalf("case %d (%s): Pop: msg=%v err=%v", i, label, msg, err)
+				}
+				rejected := msg.RouteURN != ""
+				if rejected != (c.Expect == "reject") {
+					t.Errorf("case %d (%s): rejected=%v, want expect=%s", i, label, rejected, c.Expect)
+				}
+				if !rejected {
+					if _, err := babelqueue.Decode([]byte(msg.Body)); err != nil {
+						t.Errorf("case %d (%s): decode: %v", i, label, err)
+					}
+				}
+			})
+		}
+	})
+}
+
+type sqsDelayManifest struct {
+	Delay struct {
+		Cases []struct {
+			Name         string          `json:"name"`
+			QueueType    string          `json:"queue_type"`
+			DelaySeconds int             `json:"delay_seconds"`
+			Expect       json.RawMessage `json:"expect"`
+		} `json:"cases"`
+		ReleaseVisibility struct {
+			Cases []struct {
+				Name         string `json:"name"`
+				DelaySeconds int    `json:"delay_seconds"`
+				Expect       struct {
+					VisibilityTimeout int32 `json:"visibility_timeout"`
+				} `json:"expect"`
+			} `json:"cases"`
+		} `json:"release_visibility"`
+	} `json:"delay"`
+}
+
+// TestSqsDelayConformance locks broker-bindings.md §3.4 (per-message DelaySeconds, 900 s cap,
+// no FIFO per-message delay, never a silent truncate) and §3.5 (release visibility timeout).
+func TestSqsDelayConformance(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join(conformanceDir, "manifest.json"))
+	if err != nil {
+		t.Skipf("vendored conformance manifest not found: %v", err)
+	}
+	var m sqsDelayManifest
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("manifest: %v", err)
+	}
+
+	env, err := babelqueue.Make("urn:babel:test:delay", map[string]any{"n": 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := env.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, c := range m.Delay.Cases {
+		t.Run(c.Name, func(t *testing.T) {
+			fake := newFakeSQS()
+			opts := []Option{}
+			if c.QueueType == "fifo" {
+				opts = append(opts, WithFIFO(true))
 			}
+			tr := NewWithClient(fake, opts...)
+			err := tr.PublishDelayed(context.Background(), "q", string(body), time.Duration(c.DelaySeconds)*time.Second)
+
+			if string(c.Expect) == `"reject"` {
+				if !errors.Is(err, ErrInvalidDelay) {
+					t.Fatalf("err = %v, want ErrInvalidDelay", err)
+				}
+				if len(fake.sent) != 0 {
+					t.Fatalf("a rejected delay must not send, sent %d", len(fake.sent))
+				}
+				return
+			}
+			var want struct {
+				DelaySecondsAttribute int32 `json:"delay_seconds_attribute"`
+			}
+			if err := json.Unmarshal(c.Expect, &want); err != nil {
+				t.Fatalf("expect: %v", err)
+			}
+			if err != nil {
+				t.Fatalf("publish: %v", err)
+			}
+			if len(fake.sent) != 1 || fake.sent[0].DelaySeconds != want.DelaySecondsAttribute {
+				t.Fatalf("sent = %v, want one message with DelaySeconds %d", fake.sent, want.DelaySecondsAttribute)
+			}
+		})
+	}
+
+	t.Run("release_visibility", func(t *testing.T) {
+		for _, c := range m.Delay.ReleaseVisibility.Cases {
+			t.Run(c.Name, func(t *testing.T) {
+				fake := newFakeSQS()
+				tr := NewWithClient(fake)
+				msg := &babelqueue.ReceivedMessage{Queue: "q", Handle: "rh-1"}
+				if err := tr.Release(context.Background(), msg, time.Duration(c.DelaySeconds)*time.Second); err != nil {
+					t.Fatal(err)
+				}
+				if len(fake.visibility) != 1 || fake.visibility[0].VisibilityTimeout != c.Expect.VisibilityTimeout {
+					t.Fatalf("visibility = %v, want timeout %d", fake.visibility, c.Expect.VisibilityTimeout)
+				}
+			})
 		}
 	})
 }

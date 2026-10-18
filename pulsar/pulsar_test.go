@@ -215,7 +215,8 @@ func popMessage(t *testing.T, payload string, props map[string]string, redeliver
 		t.Fatalf("Pop = (%v, %v)", got, err)
 	}
 	env, err := babelqueue.Decode([]byte(got.Body))
-	if err != nil {
+	// A body without identity decodes to ErrNoIdentity (ADR-0032 §6) next to the envelope.
+	if err != nil && !errors.Is(err, babelqueue.ErrNoIdentity) {
 		t.Fatal(err)
 	}
 	return env, got

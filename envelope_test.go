@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	babelqueue "github.com/babelqueue/babelqueue-go"
 )
@@ -198,3 +199,63 @@ func TestAnnotateAttachesDeadLetter(t *testing.T) {
 type errExample struct{}
 
 func (errExample) Error() string { return "boom" }
+
+// ADR-0032 §5 brief: trimming must stay linear. 200k ASCII whitespace bytes on each side of
+// the URN and the trace id are stripped well inside a second; a hand-rolled quadratic loop
+// would take far longer and fail this.
+func TestTrimLargePaddingIsLinear(t *testing.T) {
+	pad := strings.Repeat(" \t\n\v\f\r", 200_000/6+1)[:200_000]
+	start := time.Now()
+	env, err := babelqueue.Make(pad+"urn:a:b"+pad, nil, babelqueue.WithTraceID(pad+"trace-1"+pad))
+	elapsed := time.Since(start)
+	if err != nil {
+		t.Fatalf("Make: %v", err)
+	}
+	if env.Job != "urn:a:b" || env.TraceID != "trace-1" {
+		t.Errorf("job=%q trace_id=%q, want padding trimmed", env.Job, env.TraceID)
+	}
+	if elapsed > time.Second {
+		t.Errorf("trimming 200k padding took %s, want < 1s", elapsed)
+	}
+}
+
+// ADR-0032 §5: trimming is ASCII-only (space, \t, \n, \v, \f, \r). Unicode spaces
+// such as U+00A0, U+2003 and U+3000 are content, not whitespace.
+func TestTrimIsASCIIOnly(t *testing.T) {
+	// ASCII padding is stripped from the URN and the trace id.
+	env, err := babelqueue.Make(" \t\n\v\f\rurn:a:b \r\f\v\n\t ", nil, babelqueue.WithTraceID("\v trace-1 \f"))
+	if err != nil {
+		t.Fatalf("Make: %v", err)
+	}
+	if env.Job != "urn:a:b" || env.TraceID != "trace-1" {
+		t.Errorf("job=%q trace_id=%q, want ASCII padding trimmed", env.Job, env.TraceID)
+	}
+
+	// Unicode spaces are preserved on both.
+	for _, sp := range []string{"\u00a0", "\u2003", "\u3000"} {
+		env, err := babelqueue.Make(sp+"urn:a:b"+sp, nil, babelqueue.WithTraceID(sp+"t"+sp))
+		if err != nil {
+			t.Fatalf("Make with %U: %v", []rune(sp)[0], err)
+		}
+		if env.Job != sp+"urn:a:b"+sp {
+			t.Errorf("job = %q, want %U preserved", env.Job, []rune(sp)[0])
+		}
+		if env.TraceID != sp+"t"+sp {
+			t.Errorf("trace_id = %q, want %U preserved", env.TraceID, []rune(sp)[0])
+		}
+	}
+
+	// A trace id that is only a Unicode space is not blank: Accepts is true.
+	env, err = babelqueue.Make("urn:a:b", map[string]any{})
+	if err != nil {
+		t.Fatalf("Make: %v", err)
+	}
+	env.TraceID = "\u00a0"
+	if !env.Accepts() {
+		t.Error("a U+00A0-only trace_id must be accepted (not ASCII-blank)")
+	}
+	env.TraceID = " \t\n"
+	if env.Accepts() {
+		t.Error("an ASCII-blank trace_id must be rejected")
+	}
+}

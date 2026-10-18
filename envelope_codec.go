@@ -99,7 +99,10 @@ func sortedKeys(m map[string]json.RawMessage) []string {
 // schema and every other SDK core do: "JOB", "Data" or "META" are unknown keys,
 // not the canonical fields. A key that occurs more than once resolves to its last
 // occurrence (objects are replaced, never merged), though every occurrence is still
-// type-checked.
+// type-checked, except "job": a "job" that is not a string is ignored with a warning
+// and the identity falls back to a string "urn" (ADR-0032 §6). If that leaves no
+// identity at all, decode fails with [ErrNoIdentity] (returning the envelope decoded
+// so far beside it).
 //
 // The "urn" inbound alias is resolved here exactly as [Decode] resolves it, so
 // json.Unmarshal and Decode produce the same Envelope: a "job" that is missing,
@@ -107,11 +110,11 @@ func sortedKeys(m map[string]json.RawMessage) []string {
 // that is not blank, "job" wins and "urn" is dropped with a "/urn" warning.
 func (e *Envelope) UnmarshalJSON(raw []byte) error {
 	env, err := decodeEnvelope(raw)
-	if err != nil {
+	if err != nil && !errors.Is(err, ErrNoIdentity) {
 		return err
 	}
 	*e = env
-	return nil
+	return err
 }
 
 // decodeEnvelope is the single decode path behind [Decode] and
@@ -136,6 +139,7 @@ func decodeEnvelope(raw []byte) (Envelope, error) {
 		alias             string
 		aliasIsString     bool
 		urnSeen           bool
+		jobIgnored        bool
 		forbidden         = map[string]bool{}
 		metaForbidden     = map[string]bool{}
 		extras            map[string]json.RawMessage
@@ -144,7 +148,17 @@ func decodeEnvelope(raw []byte) (Envelope, error) {
 	err := forEachMember(raw, func(name string, value json.RawMessage) error {
 		switch name {
 		case "job":
-			return assignValue(&env.Job, value)
+			// ADR-0032 §6: a job that is not a string (null included) is ignored
+			// and reported; the identity then has to come from a string urn alias.
+			// The last duplicate wins, like every other key.
+			var s string
+			ok := json.Unmarshal(value, &s) == nil && !isJSONNull(value)
+			if !ok {
+				s = ""
+			}
+			env.Job = s
+			jobIgnored = !ok
+			return nil
 		case "trace_id":
 			return assignValue(&env.TraceID, value)
 		case "data":
@@ -222,8 +236,19 @@ func decodeEnvelope(raw []byte) (Envelope, error) {
 
 	env.extras = extras
 	env.metaExtras = decodedMetaExtras
-	env.warnings = forbiddenWarnings(forbidden, "/")
+	if jobIgnored {
+		env.warnings = append(env.warnings, "babelqueue: ignored non-string envelope key /job (ADR-0032 §6)")
+	}
+	env.warnings = append(env.warnings, forbiddenWarnings(forbidden, "/")...)
 	env.warnings = append(env.warnings, forbiddenWarnings(metaForbidden, "/meta/")...)
+
+	// ADR-0032 §6: neither a valid string "job" nor a valid string "urn" alias means
+	// the message has no identity, and decode raises. The decoded envelope (attempts,
+	// warnings) still comes back beside the error, so the App can keep logging the
+	// warnings of a message it is about to dead-letter.
+	if isBlankASCII(env.Job) {
+		return env, ErrNoIdentity
+	}
 	return env, nil
 }
 

@@ -2,6 +2,8 @@ package otel
 
 import (
 	"context"
+	"fmt"
+	"strings"
 
 	babelqueue "github.com/babelqueue/babelqueue-go"
 	"go.opentelemetry.io/otel/propagation"
@@ -69,7 +71,14 @@ func injectTraceparent(ctx context.Context, headers map[string]string) map[strin
 // correlation. When no traceparent header is present it returns (ctx, false) so the
 // caller can fall back to the v0.1 trace_id-derived parent (ADR-0025 Option 1).
 func remoteParentFromHeaders(ctx context.Context) (context.Context, bool) {
-	headers := babelqueue.HeadersFromContext(ctx)
+	return extractRemoteParent(ctx, babelqueue.HeadersFromContext(ctx))
+}
+
+// extractRemoteParent is the single extraction decision shared by the runtime
+// ([remoteParentFromHeaders], used by [WrapHandler]) and [ExtractTraceparent]: the W3C
+// propagator extracts the header and the result counts only when it is a valid span
+// context. There is no second, hand-written parser to drift from the runtime.
+func extractRemoteParent(ctx context.Context, headers map[string]string) (context.Context, bool) {
 	if headers[HeaderTraceparent] == "" {
 		return ctx, false
 	}
@@ -78,4 +87,40 @@ func remoteParentFromHeaders(ctx context.Context) (context.Context, bool) {
 		return ctx, false
 	}
 	return extracted, true
+}
+
+// Extracted describes where a consumer's trace identity came from and its raw hex
+// parts. It is the pure, header-level view of the ADR-0028 extraction contract that the
+// cross-SDK conformance section `traceparent` pins; [WrapHandler] performs the same
+// decision with the OTel propagator and live span contexts.
+type Extracted struct {
+	// Source is "traceparent" when a structurally valid header was delivered, else
+	// "trace_id" (the v0.1 fallback of ADR-0025).
+	Source string
+	// TraceIDHex is the header's 32-hex trace id, or the envelope trace_id without hyphens.
+	TraceIDHex string
+	// ParentSpanID (16 hex) and Flags (2 hex) are set only when Source is "traceparent".
+	ParentSpanID string
+	Flags        string
+}
+
+// ExtractTraceparent resolves the trace identity for a delivered message from the
+// out-of-band traceparent header value (empty when none was delivered) and the
+// envelope trace_id. It is a thin wrapper over [remoteParentFromHeaders], the exact
+// extraction [WrapHandler] performs at runtime, so what it reports is what a consumer
+// span really gets: a header the W3C propagator rejects (malformed, all-zero ids,
+// uppercase hex, ...) is ignored — it never fails — and behaves exactly like no header.
+// The envelope trace_id is never modified (GR-4).
+func ExtractTraceparent(traceparent, envelopeTraceID string) Extracted {
+	headers := map[string]string{HeaderTraceparent: traceparent}
+	if remote, ok := extractRemoteParent(context.Background(), headers); ok {
+		sc := trace.SpanContextFromContext(remote)
+		return Extracted{
+			Source:       "traceparent",
+			TraceIDHex:   sc.TraceID().String(),
+			ParentSpanID: sc.SpanID().String(),
+			Flags:        fmt.Sprintf("%02x", byte(sc.TraceFlags())),
+		}
+	}
+	return Extracted{Source: "trace_id", TraceIDHex: strings.ReplaceAll(envelopeTraceID, "-", "")}
 }

@@ -356,6 +356,49 @@ func TestAppUndecodableBodyWithRouteURNIsPoison(t *testing.T) {
 	}
 }
 
+// A transport-supplied RouteURN names the handler for a body that carries no identity of its
+// own (ADR-0032 §6 leaves the identity to the transport, e.g. the pulsar bq-job property).
+func TestAppRouteURNHandlesAnIdentitylessBody(t *testing.T) {
+	const routeURN = "urn:babel:orders:refunded"
+	for _, body := range []string{`{"trace_id":"t","data":{"order_id":1}}`, `{}`, `{"job":5}`} {
+		tr := &routeTransport{
+			InMemoryTransport: babelqueue.NewInMemoryTransport(),
+			next:              &babelqueue.ReceivedMessage{Body: body, Queue: "orders", RouteURN: routeURN},
+		}
+		app := babelqueue.NewApp(tr, babelqueue.WithMaxAttempts(3), babelqueue.WithDeadLetter(true))
+		calls := 0
+		app.Handle(routeURN, func(context.Context, babelqueue.Envelope) error { calls++; return nil })
+		if _, err := app.Drain(context.Background(), "orders", 1); err != nil {
+			t.Fatal(err)
+		}
+		if calls != 1 {
+			t.Errorf("%s: handler ran %d times, want 1", body, calls)
+		}
+	}
+}
+
+// Without a RouteURN the same bodies have no identity and are dead-lettered raw, never handled.
+func TestAppIdentitylessBodiesArePoisonOnTheConsumePath(t *testing.T) {
+	for _, body := range []string{`{}`, `{"job":null}`, `{"job":5}`, `{"urn":5}`, `null`, `{"job":" ","urn":"\t"}`} {
+		tr := babelqueue.NewInMemoryTransport()
+		app := babelqueue.NewApp(tr, babelqueue.WithDefaultQueue("orders"), babelqueue.WithDeadLetter(true))
+		calls := 0
+		app.Handle("", func(context.Context, babelqueue.Envelope) error { calls++; return nil })
+		if err := tr.Publish(context.Background(), "orders", body); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := app.Drain(context.Background(), "orders", 1); err != nil {
+			t.Fatal(err)
+		}
+		if calls != 0 {
+			t.Errorf("%s: a handler ran for a body without identity", body)
+		}
+		if tr.Size("orders") != 0 || tr.Size("orders.dlq") != 1 {
+			t.Errorf("%s: orders=%d dlq=%d, want 0/1", body, tr.Size("orders"), tr.Size("orders.dlq"))
+		}
+	}
+}
+
 // queueRecordingTransport hands the App one message and records every (queue, body) it
 // re-publishes, so a test can tell a retry (original queue) from a dead-letter (the DLQ).
 type queueRecordingTransport struct {

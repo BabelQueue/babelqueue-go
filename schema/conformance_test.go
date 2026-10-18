@@ -41,10 +41,12 @@ func TestPayloadConformance(t *testing.T) {
 		t.Fatal("payload_schema has no cases")
 	}
 	for _, c := range manifest.PayloadSchema.Cases {
-		got := len(s.Validate(c.Data)) == 0
-		if got != c.Valid {
-			t.Errorf("case %q: got valid=%v, want %v", c.Name, got, c.Valid)
-		}
+		c := c
+		t.Run(c.Name, func(t *testing.T) {
+			if got := len(s.Validate(c.Data)) == 0; got != c.Valid {
+				t.Errorf("got valid=%v, want %v", got, c.Valid)
+			}
+		})
 	}
 }
 

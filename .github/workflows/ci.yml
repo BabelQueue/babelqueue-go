@@ -9,9 +9,23 @@ on:
 permissions:
   contents: read
 
+env:
+  # The conformance suite release this repo is vendored from and must report against.
+  BQ_CONFORMANCE_VERSION: "1.5.0"
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    # A Redis broker for the conformance-results leg: the redis `live/*` conformance subtests
+    # must run (BQ_REQUIRE_REDIS makes a missing broker fail), not pass on the static check alone.
+    services:
+      redis:
+        image: redis:7
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 3s --health-retries 5
     strategy:
       fail-fast: false
       matrix:
@@ -104,6 +118,32 @@ jobs:
         # conformance tests are network-free (fake Sender/Registrar seams — no broker).
         run: |
           (cd machinery && go build ./... && go vet ./... && go test -race -count=1 ./...)
+
+      # The core's TestConformanceResults runs every section's tests (core and the transport
+      # modules) and writes results.json (ADR-0032) when BQ_CONFORMANCE_RESULTS is set. It runs
+      # on the Go 1.25 leg because the otel, pulsar, artemis and azureservicebus modules floor
+      # at Go 1.25.
+      - name: Conformance results (results.json)
+        if: ${{ matrix.go == '1.25' }}
+        run: go test -count=1 -run '^TestConformanceResults$' -v .
+        env:
+          BQ_CONFORMANCE_RESULTS: ${{ runner.temp }}/results.json
+          BQ_REQUIRE_REDIS: "1"
+          REDIS_URL: redis://localhost:6379/0
+
+      - uses: actions/setup-python@v6
+        if: ${{ matrix.go == '1.25' }}
+        with:
+          python-version: "3.12"
+
+      # Schema-valid, no `fail`, bindings derived from the Go modules in the tree, and every
+      # in-scope section and case present (an absent transport or section breaks CI).
+      - name: Validate results.json
+        if: ${{ matrix.go == '1.25' }}
+        run: |
+          python -m pip install --quiet jsonschema==4.23.0
+          python -I scripts/check-conformance-results.py "$RUNNER_TEMP/results.json" \
+            testdata/conformance "$BQ_CONFORMANCE_VERSION"
 
   lint:
     name: Static analysis (staticcheck)
@@ -295,14 +335,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Verify vendored conformance matches the canonical suite
+      # fetch.sh downloads the release asset, verifies it against the release's SHA256SUMS and,
+      # with --check, fails if the vendored copy differs. It is taken from the same pinned tag.
+      - name: Verify vendored conformance matches the pinned release
         run: |
-          git clone --depth 1 --branch v1.4.0 https://github.com/BabelQueue/conformance.git "$RUNNER_TEMP/conformance"
-          diff -u "$RUNNER_TEMP/conformance/CONFORMANCE_VERSION" "testdata/conformance/CONFORMANCE_VERSION"
-          diff -ru "$RUNNER_TEMP/conformance/manifest.json" "testdata/conformance/manifest.json"
-          diff -ru "$RUNNER_TEMP/conformance/fixtures"      "testdata/conformance/fixtures"
-          diff -ru "$RUNNER_TEMP/conformance/schema"        "testdata/conformance/schema"
-          echo "Vendored conformance is in sync with the canonical suite."
+          curl -fsSL -o "$RUNNER_TEMP/fetch.sh" \
+            "https://raw.githubusercontent.com/BabelQueue/conformance/v${BQ_CONFORMANCE_VERSION}/fetch.sh"
+          bash "$RUNNER_TEMP/fetch.sh" --check "$BQ_CONFORMANCE_VERSION" testdata/conformance
 
   ci-green:
     name: CI green

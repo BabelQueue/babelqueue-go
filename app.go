@@ -280,6 +280,14 @@ func (a *App) dispatch(ctx context.Context, msg *ReceivedMessage) {
 		return
 	}
 	env, decodeErr := Decode([]byte(msg.Body))
+	// ADR-0032 §6: a body with no valid job or urn alias fails decode and is poison. The one
+	// exception is a delivery whose transport supplied the identity out of band (RouteURN, e.g.
+	// the pulsar bq-job property): the body is not rewritten and the routing override names
+	// the handler, so only that identity-less case is let through.
+	noIdentity := errors.Is(decodeErr, ErrNoIdentity)
+	if noIdentity && msg.RouteURN != "" {
+		decodeErr = nil
+	}
 	// The broker's own delivery count is a floor for attempts: an in-place release
 	// does not rewrite the body, and an undecodable body carries no counter at all,
 	// so without it such a message would never reach WithMaxAttempts.
@@ -294,7 +302,7 @@ func (a *App) dispatch(ctx context.Context, msg *ReceivedMessage) {
 	// Non-fatal decode findings (a dropped forbidden key, ADR-0031 (c)) are logged,
 	// never fatal, and before the poison check: a message about to be dead-lettered
 	// is the one whose producer most needs to hear about them.
-	if decodeErr == nil {
+	if decodeErr == nil || noIdentity {
 		for _, w := range env.Warnings() {
 			slog.WarnContext(ctx, "babelqueue: decode warning", "warning", w, "queue", msg.Queue, "route", msg.RouteURN)
 		}

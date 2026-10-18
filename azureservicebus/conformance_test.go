@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	"github.com/Azure/azure-sdk-for-go/sdk/messaging/azservicebus"
@@ -97,7 +98,7 @@ func TestAsbConformance(t *testing.T) {
 	})
 
 	for _, c := range m.ASB.AttemptsReconciliation.Cases {
-		t.Run("attempts/"+c.Name, func(t *testing.T) {
+		t.Run("attempts_reconciliation/"+c.Name, func(t *testing.T) {
 			env, _ := babelqueue.Make("urn:babel:orders:created", map[string]any{"x": 1})
 			env.Attempts = c.BodyAttempts
 			body, _ := env.Encode()
@@ -120,38 +121,41 @@ func TestAsbConformance(t *testing.T) {
 			t.Fatalf("fixture: %v", err)
 		}
 		for i, c := range gate.Cases {
-			// A JSON number carries no width, so a native AMQP integer is exercised at every
-			// width the SDK can hand over; a string or an absent property has exactly one form.
-			if c.ValueType != "" && c.ValueType != "float" {
-				t.Fatalf("case %d: unknown value_type %q (this reader only understands \"float\")", i, c.ValueType)
-			}
-			values := []any{c.Value}
-			if f, ok := c.Value.(float64); ok && c.ValueType == "float" {
-				// An explicit floating-point case (e.g. 1.0): hand over real floats, never integers.
-				values = []any{f, float32(f)}
-			} else if ok && f == float64(int64(f)) {
-				values = []any{int(f), int32(f), int64(f), uint8(f), uint32(f), uint64(f)}
-			}
-			for _, v := range values {
-				receiver := &fakeReceiver{messages: []*azservicebus.ReceivedMessage{gatedMessage(string(body), v, !c.Absent)}}
-				tr, err := New(WithClient(&fakeClient{sender: &fakeSender{}, receiver: receiver}))
-				if err != nil {
-					t.Fatal(err)
+			i, c := i, c
+			t.Run(strconv.Itoa(i), func(t *testing.T) {
+				// A JSON number carries no width, so a native AMQP integer is exercised at every
+				// width the SDK can hand over; a string or an absent property has exactly one form.
+				if c.ValueType != "" && c.ValueType != "float" {
+					t.Fatalf("case %d: unknown value_type %q (this reader only understands \"float\")", i, c.ValueType)
 				}
-				msg, err := tr.Pop(context.Background(), "orders", 0)
-				if err != nil || msg == nil {
-					t.Fatalf("case %d (%#v): Pop: msg=%v err=%v", i, v, msg, err)
+				values := []any{c.Value}
+				if f, ok := c.Value.(float64); ok && c.ValueType == "float" {
+					// An explicit floating-point case (e.g. 1.0): hand over real floats, never integers.
+					values = []any{f, float32(f)}
+				} else if ok && f == float64(int64(f)) {
+					values = []any{int(f), int32(f), int64(f), uint8(f), uint32(f), uint64(f)}
 				}
-				rejected := msg.RouteURN != ""
-				if rejected != (c.Expect == "reject") {
-					t.Errorf("case %d (%#v): rejected=%v, want expect=%s", i, v, rejected, c.Expect)
-				}
-				if !rejected {
-					if _, err := babelqueue.Decode([]byte(msg.Body)); err != nil {
-						t.Errorf("case %d (%#v): decode: %v", i, v, err)
+				for _, v := range values {
+					receiver := &fakeReceiver{messages: []*azservicebus.ReceivedMessage{gatedMessage(string(body), v, !c.Absent)}}
+					tr, err := New(WithClient(&fakeClient{sender: &fakeSender{}, receiver: receiver}))
+					if err != nil {
+						t.Fatal(err)
+					}
+					msg, err := tr.Pop(context.Background(), "orders", 0)
+					if err != nil || msg == nil {
+						t.Fatalf("case %d (%#v): Pop: msg=%v err=%v", i, v, msg, err)
+					}
+					rejected := msg.RouteURN != ""
+					if rejected != (c.Expect == "reject") {
+						t.Errorf("case %d (%#v): rejected=%v, want expect=%s", i, v, rejected, c.Expect)
+					}
+					if !rejected {
+						if _, err := babelqueue.Decode([]byte(msg.Body)); err != nil {
+							t.Errorf("case %d (%#v): decode: %v", i, v, err)
+						}
 					}
 				}
-			}
+			})
 		}
 	})
 }

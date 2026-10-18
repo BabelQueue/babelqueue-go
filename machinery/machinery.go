@@ -147,7 +147,8 @@ func (p *Producer) Send(ctx context.Context, env babelqueue.Envelope) (*result.A
 // machinery invokes it with the injected context and the envelope-JSON argument;
 // it decodes the envelope, rejects it with [ErrNotAccepted] when it fails
 // [babelqueue.Envelope.Accepts] (so machinery applies its own retry policy), and
-// otherwise invokes handler. Use [Register] to wire it under the URN.
+// otherwise invokes handler. A body with no valid job or urn identity fails decode with
+// [babelqueue.ErrNoIdentity] (ADR-0032 §6). Use [Register] to wire it under the URN.
 func Bind(handler babelqueue.Handler) func(ctx context.Context, body string) error {
 	return func(ctx context.Context, body string) error {
 		env, err := babelqueue.Decode([]byte(body))

@@ -2,6 +2,7 @@ package babelqueue
 
 import (
 	"encoding/json"
+	"errors"
 	"reflect"
 	"strings"
 	"testing"
@@ -55,7 +56,11 @@ func TestDecodeExactCaseAndLastWins(t *testing.T) {
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			env, err := Decode([]byte(c.body))
-			if err != nil {
+			if c.job == "" {
+				if !errors.Is(err, ErrNoIdentity) { // ADR-0032 §6
+					t.Fatalf("decode: %v, want ErrNoIdentity", err)
+				}
+			} else if err != nil {
 				t.Fatalf("decode: %v", err)
 			}
 			if env.Job != c.job {
@@ -117,17 +122,28 @@ func TestDecodeDuplicateDeadLetterLastWins(t *testing.T) {
 func TestDecodeWrongTypeInAnyDuplicateIsPoison(t *testing.T) {
 	for _, body := range []string{
 		`{"job":"urn:a","job":5}`,
-		`{"job":5,"job":"urn:a"}`,
 		`{"job":"urn:a","attempts":1,"attempts":"x"}`,
 	} {
 		if _, err := Decode([]byte(body)); err == nil {
 			t.Errorf("%s decoded without error, want a type error", body)
 		}
 	}
+	// ADR-0032 §6: a non-string job is ignored, not a type error: the last duplicate
+	// wins, and the identity falls back to a string urn.
+	if env, err := Decode([]byte(`{"job":5,"job":"urn:a"}`)); err != nil || env.Job != "urn:a" {
+		t.Errorf(`{"job":5,"job":"urn:a"}: job=%q err=%v, want urn:a`, env.Job, err)
+	}
+	if env, err := Decode([]byte(`{"job":5,"urn":"urn:b"}`)); err != nil || env.Job != "urn:b" || len(env.Warnings()) == 0 {
+		t.Errorf(`{"job":5,"urn":"urn:b"}: job=%q err=%v warnings=%v, want urn:b + warning`, env.Job, err, env.Warnings())
+	}
+	if _, err := Decode([]byte(`{"job":5}`)); !errors.Is(err, ErrNoIdentity) {
+		t.Errorf(`{"job":5}: err=%v, want ErrNoIdentity`, err)
+	}
 	// A wrongly cased key never has its type checked: it is an unknown key.
 	for _, body := range []string{`{"JOB":5}`, `{"Meta":{"ID":5}}`, `{"ATTEMPTS":"x"}`} {
-		if _, err := Decode([]byte(body)); err != nil {
-			t.Errorf("%s: %v, want no error (unknown key)", body, err)
+		// Only the missing identity (ADR-0032 §6) may fail it, never a type error.
+		if _, err := Decode([]byte(body)); err != nil && !errors.Is(err, ErrNoIdentity) {
+			t.Errorf("%s: %v, want no type error (unknown key)", body, err)
 		}
 	}
 }
@@ -333,8 +349,8 @@ func TestDecodeWhitespaceAliasBecomesBlankJob(t *testing.T) {
 	// A whitespace-only string alias still replaces the blank job (verbatim) and is
 	// then rejected by the consumer as a blank identity, with no spurious warning.
 	env, err := Decode([]byte(`{"job":"","urn":" ",` + blankJobTail))
-	if err != nil {
-		t.Fatal(err)
+	if !errors.Is(err, ErrNoIdentity) { // ADR-0032 §6: a blank alias is no identity
+		t.Fatalf("err = %v, want ErrNoIdentity", err)
 	}
 	if env.Job != " " || env.Accepts() || len(env.Warnings()) != 0 {
 		t.Errorf("Job=%q Accepts=%v Warnings=%q", env.Job, env.Accepts(), env.Warnings())
@@ -346,8 +362,8 @@ func TestDecodeNonStringAliasWarns(t *testing.T) {
 	for _, urn := range []string{`123`, `null`, `true`, `{"a":1}`, `["x"]`} {
 		for _, job := range []string{`""`, `" "`} {
 			env, err := Decode([]byte(`{"job":` + job + `,"urn":` + urn + `,` + blankJobTail))
-			if err != nil {
-				t.Fatalf("urn %s: %v", urn, err)
+			if !errors.Is(err, ErrNoIdentity) { // ADR-0032 §6
+				t.Fatalf("urn %s: err = %v, want ErrNoIdentity", urn, err)
 			}
 			if env.Accepts() {
 				t.Errorf("job %s urn %s: accepted with Job=%q", job, urn, env.Job)
@@ -366,24 +382,27 @@ func TestUnmarshalJSONResolvesURNAlias(t *testing.T) {
 		name, job, urn string
 		wantJob        string
 		wantWarning    bool
+		noIdentity     bool
 	}{
-		{"blank ascii job falls back", `"  "`, `"urn:a:b"`, "urn:a:b", false},
-		{"tab and newline job falls back", `"\t\n"`, `"urn:a:b"`, "urn:a:b", false},
-		{"empty job falls back", `""`, `"urn:a:b"`, "urn:a:b", false},
-		{"job and urn: job wins", `"urn:x:y"`, `"urn:a:b"`, "urn:x:y", true},
-		{"unicode blank job does not fall back", `"\u00a0"`, `"urn:a:b"`, "\u00a0", true},
-		{"non-string urn is no alias", `""`, `42`, "", true},
+		{"blank ascii job falls back", `"  "`, `"urn:a:b"`, "urn:a:b", false, false},
+		{"tab and newline job falls back", `"\t\n"`, `"urn:a:b"`, "urn:a:b", false, false},
+		{"empty job falls back", `""`, `"urn:a:b"`, "urn:a:b", false, false},
+		{"job and urn: job wins", `"urn:x:y"`, `"urn:a:b"`, "urn:x:y", true, false},
+		{"unicode blank job does not fall back", `"\u00a0"`, `"urn:a:b"`, "\u00a0", true, false},
+		{"non-string urn is no alias", `""`, `42`, "", true, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			body := []byte(`{"job":` + tc.job + `,"urn":` + tc.urn + `,` + blankJobTail)
 			var viaJSON Envelope
-			if err := json.Unmarshal(body, &viaJSON); err != nil {
-				t.Fatal(err)
-			}
+			jsonErr := json.Unmarshal(body, &viaJSON)
 			viaDecode, err := Decode(body)
-			if err != nil {
-				t.Fatal(err)
+			if tc.noIdentity {
+				if !errors.Is(jsonErr, ErrNoIdentity) || !errors.Is(err, ErrNoIdentity) {
+					t.Fatalf("Unmarshal err = %v, Decode err = %v, want ErrNoIdentity", jsonErr, err)
+				}
+			} else if jsonErr != nil || err != nil {
+				t.Fatalf("Unmarshal err = %v, Decode err = %v", jsonErr, err)
 			}
 			if viaJSON.Job != tc.wantJob {
 				t.Errorf("Unmarshal job = %q, want %q", viaJSON.Job, tc.wantJob)

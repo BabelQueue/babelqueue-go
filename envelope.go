@@ -20,6 +20,10 @@ var (
 	// ErrForbiddenKey: a forbidden non-canonical key (message-envelope.md §10) was
 	// supplied — through [WithMeta] or through extras carried by the envelope.
 	ErrForbiddenKey = errors.New("babelqueue: forbidden non-canonical envelope key (message-envelope.md §10)")
+	// ErrNoIdentity: decode found neither a valid string "job" nor a valid string
+	// "urn" alias (not blank under the ASCII set), so the message has no identity
+	// (ADR-0032 §6).
+	ErrNoIdentity = errors.New("babelqueue: envelope has no valid job or urn identity")
 	// ErrDuplicateMetaKey: [WithMeta] was given the same key more than once. A
 	// repeat is rejected, never merged and never last-write-wins.
 	ErrDuplicateMetaKey = errors.New("babelqueue: meta key supplied more than once")
@@ -32,10 +36,17 @@ var coreMetaKeys = map[string]bool{
 	"id": true, "queue": true, "lang": true, "schema_version": true, "created_at": true,
 }
 
-// isBlankASCII reports whether s is empty or only ASCII whitespace (space, \t, \n,
-// \v, \f, \r) — the closed "blank" set of the conformance suite. It deliberately
-// does not use strings.TrimSpace, which also trims Unicode spaces (GR-5).
-func isBlankASCII(s string) bool { return strings.Trim(s, " \t\n\v\f\r") == "" }
+// asciiWhitespace is the closed whitespace set of the conformance suite (ADR-0032 §5):
+// space, \t, \n, \v, \f, \r. It is the single source for every trim and blank check in
+// the core. It deliberately is not strings.TrimSpace, which also trims Unicode spaces
+// (U+00A0, U+2003, U+3000 and friends); those stay part of the value (GR-5).
+const asciiWhitespace = " \t\n\v\f\r"
+
+// trimASCII trims [asciiWhitespace] from both ends of s.
+func trimASCII(s string) string { return strings.Trim(s, asciiWhitespace) }
+
+// isBlankASCII reports whether s is empty or only [asciiWhitespace].
+func isBlankASCII(s string) bool { return trimASCII(s) == "" }
 
 // Envelope is the canonical BabelQueue wire message: a strict, language-neutral
 // JSON shape ({job, trace_id, data, meta, attempts}) that every SDK produces and
@@ -136,7 +147,7 @@ func WithMeta(key string, value any) Option {
 // millisecond timestamp. It returns ErrEmptyURN when urn is blank, and the
 // [WithMeta] error when an extension entry is rejected.
 func Make(urn string, data map[string]any, opts ...Option) (Envelope, error) {
-	urn = strings.TrimSpace(urn)
+	urn = trimASCII(urn)
 	if urn == "" {
 		return Envelope{}, ErrEmptyURN
 	}
@@ -149,7 +160,7 @@ func Make(urn string, data map[string]any, opts ...Option) (Envelope, error) {
 		return Envelope{}, cfg.metaErr
 	}
 
-	traceID := strings.TrimSpace(cfg.traceID)
+	traceID := trimASCII(cfg.traceID)
 	if traceID == "" {
 		traceID = uuidV4()
 	}
@@ -201,10 +212,22 @@ func (e Envelope) Encode() ([]byte, error) {
 // Envelope keys are matched by exact, case-sensitive spelling, like the canonical
 // schema and every other SDK core: a wrongly cased key ("JOB", "Data", "META",
 // "URN") is an unknown key — preserved and re-emitted, never read as the canonical
-// field — so {"JOB":"urn:x"} decodes to an empty Job and fails [Accepts]. A key
-// that occurs more than once resolves to its last occurrence (data is replaced,
-// never merged).
+// field — so {"JOB":"urn:x"} has no identity. A key that occurs more than once
+// resolves to its last occurrence (data is replaced, never merged).
+//
+// A "job" that is not a string (null, number, boolean, object, array) is ignored with
+// a warning and the identity falls back to a string "urn"; with neither a valid "job"
+// nor a valid "urn", Decode returns [ErrNoIdentity] (ADR-0032 §6) together with the
+// envelope decoded so far. A JSON `null` document has no identity either. Every consume
+// path (App, Redrive and the transports) uses this decode, so a body without identity is
+// poison there; a caller of json.Unmarshal that tolerates such a body can check
+// errors.Is(err, ErrNoIdentity) and keep the envelope returned beside it.
 func Decode(raw []byte) (Envelope, error) {
+	// A JSON null document names no handler either: it has no identity (ADR-0032 §6).
+	// (json.Unmarshal keeps the encoding/json convention that null is a no-op.)
+	if isJSONNull(raw) {
+		return Envelope{}, ErrNoIdentity
+	}
 	// decodeEnvelope also resolves the urn alias, so Decode and json.Unmarshal agree.
 	return decodeEnvelope(raw)
 }
@@ -243,7 +266,7 @@ func (e Envelope) Accepts() bool {
 	if e.Data == nil {
 		return false
 	}
-	if strings.TrimSpace(e.TraceID) == "" {
+	if isBlankASCII(e.TraceID) {
 		return false
 	}
 	return true

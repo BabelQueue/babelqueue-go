@@ -2,9 +2,11 @@ package babelqueue_test
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -607,5 +609,190 @@ func TestConformanceEncodeReject(t *testing.T) {
 				t.Errorf("error %q does not name %s", err, c.OffendingKey)
 			}
 		})
+	}
+}
+
+// trimCase is one `trim` case (ADR-0032 §5): the ASCII whitespace set is the only
+// thing trimmed; Unicode spaces are content; re-emit never trims.
+type trimCase struct {
+	Name            string          `json:"name"`
+	Mode            string          `json:"mode"`
+	URN             string          `json:"urn"`
+	TraceID         string          `json:"trace_id"`
+	File            string          `json:"file"`
+	Valid           bool            `json:"valid"`
+	Expect          json.RawMessage `json:"expect"`
+	ExpectWarning   bool            `json:"expect_warning"`
+	ExpectAccepts   bool            `json:"expect_accepts"`
+	ExpectDecodeOK  bool            `json:"expect_decode_ok"`
+	ExpectAttempts  int             `json:"expect_attempts"`
+	ExpectPreserved map[string]any  `json:"expect_preserved"`
+}
+
+// TestConformanceTrim runs the `trim` section: make / decode / accepts / reemit.
+func TestConformanceTrim(t *testing.T) {
+	var sec struct {
+		Cases []trimCase `json:"cases"`
+	}
+	loadManifestSection(t, "trim", &sec)
+	if len(sec.Cases) == 0 {
+		t.Fatal("trim section has no cases")
+	}
+	for _, c := range sec.Cases {
+		c := c
+		t.Run(c.Name, func(t *testing.T) {
+			switch c.Mode {
+			case "make":
+				opts := []babelqueue.Option{}
+				if c.TraceID != "" {
+					opts = append(opts, babelqueue.WithTraceID(c.TraceID))
+				}
+				env, err := babelqueue.Make(c.URN, map[string]any{}, opts...)
+				var reject string
+				if json.Unmarshal(c.Expect, &reject) == nil && reject == "reject" {
+					if err == nil {
+						t.Fatalf("make(%q) must reject a URN that is empty after the ASCII trim, got job %q", c.URN, env.Job)
+					}
+					return
+				}
+				if err != nil {
+					t.Fatalf("make: %v", err)
+				}
+				var want struct {
+					Job     string `json:"job"`
+					TraceID string `json:"trace_id"`
+				}
+				if err := json.Unmarshal(c.Expect, &want); err != nil {
+					t.Fatalf("parse expect: %v", err)
+				}
+				if env.Job != want.Job {
+					t.Errorf("job = %q, want %q", env.Job, want.Job)
+				}
+				if want.TraceID != "" && env.TraceID != want.TraceID {
+					t.Errorf("trace_id = %q, want %q", env.TraceID, want.TraceID)
+				}
+			case "decode":
+				checkIdentityDecode(t, readFixture(t, c.File), c.Valid, c.Expect, c.ExpectWarning)
+			case "accepts":
+				env, err := babelqueue.Decode(readFixture(t, c.File))
+				if (err == nil) != c.ExpectDecodeOK {
+					t.Fatalf("decode ok = %v (err %v), want %v", err == nil, err, c.ExpectDecodeOK)
+				}
+				if got := env.Accepts(); got != c.ExpectAccepts {
+					t.Errorf("accepts = %v, want %v", got, c.ExpectAccepts)
+				}
+			case "reemit":
+				rc := roundtripCase{Name: c.Name, File: c.File, ExpectAttempts: c.ExpectAttempts, ExpectPreserved: c.ExpectPreserved}
+				for _, msg := range checkRoundtrip(rc, readFixture(t, c.File)) {
+					t.Error(msg)
+				}
+			default:
+				t.Fatalf("unknown trim mode %q", c.Mode)
+			}
+		})
+	}
+}
+
+// checkIdentityDecode asserts the ADR-0032 §6 identity rule on one body: valid means
+// Decode succeeds with expect.urn as the identity and a warning iff wantWarning;
+// invalid means Decode raises.
+func checkIdentityDecode(t *testing.T, body []byte, valid bool, expect json.RawMessage, wantWarning bool) {
+	t.Helper()
+	env, err := babelqueue.Decode(body)
+	if !valid {
+		if err == nil {
+			t.Fatalf("decode must raise when there is no valid identity, got urn %q", env.URN())
+		}
+		return
+	}
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	var want struct {
+		URN string `json:"urn"`
+	}
+	if err := json.Unmarshal(expect, &want); err != nil {
+		t.Fatalf("parse expect: %v", err)
+	}
+	if env.URN() != want.URN {
+		t.Errorf("urn = %q, want %q", env.URN(), want.URN)
+	}
+	if got := len(env.Warnings()) > 0; got != wantWarning {
+		t.Errorf("warning emitted = %v (%q), want %v", got, env.Warnings(), wantWarning)
+	}
+}
+
+// TestConformanceJobType runs the `job_type` section: a non-string `job` is
+// ignored with a warning and the identity falls back to a string `urn`. Each case is checked at
+// the Decode level and again through the runtime consume path (App over an in-memory transport):
+// a valid case reaches the handler registered for expect.urn, and logs a decode warning iff
+// expect_warning; an invalid one never reaches a handler and is dead-lettered.
+func TestConformanceJobType(t *testing.T) {
+	var sec struct {
+		Cases []trimCase `json:"cases"`
+	}
+	loadManifestSection(t, "job_type", &sec)
+	if len(sec.Cases) == 0 {
+		t.Fatal("job_type section has no cases")
+	}
+	for _, c := range sec.Cases {
+		c := c
+		t.Run(c.Name, func(t *testing.T) {
+			body := readFixture(t, c.File)
+			checkIdentityDecode(t, body, c.Valid, c.Expect, c.ExpectWarning)
+			checkIdentityRuntime(t, body, c.Valid, c.Expect, c.ExpectWarning)
+		})
+	}
+}
+
+// checkIdentityRuntime drives body through App.Drain: the consume path must apply the same
+// ADR-0032 §6 identity rule as Decode.
+func checkIdentityRuntime(t *testing.T, body []byte, valid bool, expect json.RawMessage, wantWarning bool) {
+	t.Helper()
+	var logs bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	defer slog.SetDefault(prev)
+
+	tr := babelqueue.NewInMemoryTransport()
+	app := babelqueue.NewApp(tr, babelqueue.WithDefaultQueue("jobs"), babelqueue.WithDeadLetter(true))
+	var handled []string
+	register := func(urn string) {
+		app.Handle(urn, func(_ context.Context, e babelqueue.Envelope) error {
+			handled = append(handled, urn)
+			return nil
+		})
+	}
+	wantURN := ""
+	if valid {
+		var want struct {
+			URN string `json:"urn"`
+		}
+		if err := json.Unmarshal(expect, &want); err != nil {
+			t.Fatalf("parse expect: %v", err)
+		}
+		wantURN = want.URN
+		register(wantURN)
+	}
+	if err := tr.Publish(context.Background(), "jobs", string(body)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := app.Drain(context.Background(), "jobs", 1); err != nil {
+		t.Fatal(err)
+	}
+	if !valid {
+		if len(handled) != 0 {
+			t.Fatalf("a handler ran for a body without a valid identity: %v", handled)
+		}
+		if tr.Size("jobs.dlq") != 1 || tr.Size("jobs") != 0 {
+			t.Fatalf("jobs=%d jobs.dlq=%d, want 0/1 (identity-less body is poison)", tr.Size("jobs"), tr.Size("jobs.dlq"))
+		}
+		return
+	}
+	if len(handled) != 1 || handled[0] != wantURN {
+		t.Fatalf("handled = %v, want one call for %q", handled, wantURN)
+	}
+	if got := strings.Contains(logs.String(), "decode warning"); got != wantWarning {
+		t.Errorf("decode warning logged = %v, want %v:\n%s", got, wantWarning, logs.String())
 	}
 }

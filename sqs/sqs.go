@@ -32,6 +32,7 @@ package sqs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	neturl "net/url"
 	"sort"
@@ -215,7 +216,37 @@ func (t *Transport) PublishWithHeaders(ctx context.Context, queue, body string, 
 	return t.publish(ctx, queue, body, headers)
 }
 
+// MaxDelaySeconds is the SQS ceiling for a per-message DelaySeconds (15 min, §3.4).
+const MaxDelaySeconds = 900
+
+// ErrInvalidDelay is returned by [Transport.PublishDelayed] when the delay cannot be honoured
+// without silently dropping or truncating it: more than [MaxDelaySeconds], or any positive
+// per-message delay on a FIFO queue (SQS FIFO supports only a queue-level delay).
+var ErrInvalidDelay = errors.New("babelqueue/sqs: delay not supported by this queue (§3.4)")
+
+// PublishDelayed sends body with a per-message DelaySeconds (broker-bindings.md §3.4), rounding a
+// fractional second up. A delay of zero or less behaves like [Transport.Publish]. A delay above
+// [MaxDelaySeconds], or a positive delay on a FIFO queue ([WithFIFO]), is rejected with
+// [ErrInvalidDelay] and nothing is sent.
+func (t *Transport) PublishDelayed(ctx context.Context, queue, body string, delay time.Duration) error {
+	if delay <= 0 {
+		return t.publish(ctx, queue, body, nil)
+	}
+	if t.fifo {
+		return fmt.Errorf("%w: FIFO queues take no per-message delay", ErrInvalidDelay)
+	}
+	if delay > MaxDelaySeconds*time.Second {
+		return fmt.Errorf("%w: %s exceeds the %d s cap", ErrInvalidDelay, delay, MaxDelaySeconds)
+	}
+	secs := int32((delay + time.Second - 1) / time.Second)
+	return t.send(ctx, queue, body, nil, secs)
+}
+
 func (t *Transport) publish(ctx context.Context, queue, body string, headers map[string]string) error {
+	return t.send(ctx, queue, body, headers, 0)
+}
+
+func (t *Transport) send(ctx context.Context, queue, body string, headers map[string]string, delaySeconds int32) error {
 	url, err := t.resolveURL(ctx, queue)
 	if err != nil {
 		return err
@@ -224,6 +255,9 @@ func (t *Transport) publish(ctx context.Context, queue, body string, headers map
 		QueueUrl:          aws.String(url),
 		MessageBody:       aws.String(body),
 		MessageAttributes: mergeAttributes(attributes(body), headers),
+	}
+	if delaySeconds > 0 {
+		in.DelaySeconds = delaySeconds
 	}
 	if t.fifo {
 		group := t.messageGroupID

@@ -9,6 +9,49 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+Written against v1.15.0, the last tagged core. Behaviour change in the core's decode (ADR-0032
+section 6); the envelope stays at `schema_version: 1`. Not yet tagged: the transport modules still pin
+older core versions (see the release notes of the core tag that follows).
+
+### Added
+
+- **`ErrNoIdentity`** (core). `Decode` and `json.Unmarshal` return it for an identity-less document (see
+  Changed).
+- **Redis (section 1.1), Laravel-compatible layout**, opt-in on `redis.Transport`: `WithLaravelLayout(prefix)`
+  (ready list, `:delayed` / `:reserved` sorted sets and `:notify` wake-up list under the Laravel prefix),
+  `WithRetryAfter(d)` (reservation window), `Transport.Keys(queue)` and `LaravelKeys(prefix, queue)` plus
+  the `Keys` type. The default layout is unchanged. The reserved value is the stored value byte-for-byte
+  (payload identity, section 1.2). Not implemented: incrementing `payload.attempts` in Redis and scheduling
+  a delayed publish.
+- **SQS: `Transport.PublishDelayed(ctx, queue, body, delay)`** with `ErrInvalidDelay` and `MaxDelaySeconds`
+  (900). A delay over the cap, or any delay on a FIFO queue, is rejected and nothing is sent.
+- **Kafka retry tiers (section 6.4/6.5)**: `WithRetryTiers`, `RetryTopic`, `Transport.PublishDelayed`,
+  `Transport.PublishRetry` and `ErrDelayUnsupported`. These only write to the `<topic>.retry.<n>` topics.
+  The Go SDK ships **no re-inject consumer** (retry topic -> work topic, honouring `bq-delay`), so the
+  caller must run one (or another SDK's); without it a delayed or retried message is never redelivered.
+- **`otel.ExtractTraceparent(traceparent, envelopeTraceID)`** and the `otel.Extracted` result type: the
+  trace identity a consumer span really gets, resolved through the same extraction `WrapHandler` uses.
+- Conformance: `TestConformanceResults` runs the core and every transport module's conformance sections
+  against the vendored suite and writes `results.json` when `BQ_CONFORMANCE_RESULTS` is set (ADR-0032);
+  the core release publishes it as an asset.
+
+### Changed
+
+- **`Decode` / `json.Unmarshal` fail with `ErrNoIdentity` for an identity-less document** (no valid `job`
+  and no usable `urn`), including a bare JSON `null`. A non-string `job` is ignored with a warning, a
+  blank `job` falls back to `urn` silently. Migrate with `errors.Is(err, babelqueue.ErrNoIdentity)`.
+- **The consume paths apply the same rule.** `App` dispatch, `Redrive` and every transport module decode
+  with the strict `Decode`; an identity-less body is poison (dead-lettered), never dispatched. The one
+  exception is a message whose transport supplied the identity itself (`ReceivedMessage.RouteURN`), which
+  is still routed by that URN and keeps its decode warnings.
+
+### Notes
+
+- Kafka: until a re-inject consumer exists in the Go SDK, `PublishDelayed` / `PublishRetry` are
+  publish-side only (see Added).
+- Redis, Laravel layout: `WithPollTimeout(0)` (or a zero `Pop` timeout) waits indefinitely, like the
+  default layout; due delayed and expired reserved members are still migrated while it waits.
+
 ## [1.15.0] - 2026-10-17
 
 Minor; the envelope stays at `schema_version: 1` — ADR-0031. Only the core module is tagged; the

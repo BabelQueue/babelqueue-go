@@ -85,7 +85,7 @@ func TestArtemisConformance(t *testing.T) {
 	})
 
 	for _, c := range m.Artemis.AttemptsReconciliation.Cases {
-		t.Run("attempts/"+c.Name, func(t *testing.T) {
+		t.Run("attempts_reconciliation/"+c.Name, func(t *testing.T) {
 			env, _ := babelqueue.Make("urn:babel:orders:created", map[string]any{"x": 1})
 			env.Attempts = c.BodyAttempts
 			body, _ := env.Encode()
@@ -108,36 +108,39 @@ func TestArtemisConformance(t *testing.T) {
 			t.Fatalf("fixture: %v", err)
 		}
 		for i, c := range gate.Cases {
-			msg := incoming(string(body), "", 0)
-			label := "absent"
-			if !c.Absent {
-				if c.Value != nil {
-					msg.ApplicationProperties = map[string]any{gate.Property: *c.Value}
-					label = strconv.Quote(*c.Value)
-				} else {
-					// JSON null: the key is present with a null value; it must be treated as absent.
-					msg.ApplicationProperties = map[string]any{gate.Property: nil}
-					label = "null"
+			i, c := i, c
+			t.Run(strconv.Itoa(i), func(t *testing.T) {
+				msg := incoming(string(body), "", 0)
+				label := "absent"
+				if !c.Absent {
+					if c.Value != nil {
+						msg.ApplicationProperties = map[string]any{gate.Property: *c.Value}
+						label = strconv.Quote(*c.Value)
+					} else {
+						// JSON null: the key is present with a null value; it must be treated as absent.
+						msg.ApplicationProperties = map[string]any{gate.Property: nil}
+						label = "null"
+					}
 				}
-			}
-			receiver := &fakeReceiver{messages: []*amqp.Message{msg}}
-			tr, err := New(context.Background(), WithClient(&fakeClient{sender: &fakeSender{}, receiver: receiver}))
-			if err != nil {
-				t.Fatal(err)
-			}
-			got, err := tr.Pop(context.Background(), "orders", 0)
-			if err != nil || got == nil {
-				t.Fatalf("case %d (%s): Pop: msg=%v err=%v", i, label, got, err)
-			}
-			rejected := got.RouteURN != ""
-			if rejected != (c.Expect == "reject") {
-				t.Errorf("case %d (%s): rejected=%v, want expect=%s", i, label, rejected, c.Expect)
-			}
-			if !rejected {
-				if _, err := babelqueue.Decode([]byte(got.Body)); err != nil {
-					t.Errorf("case %d (%s): decode: %v", i, label, err)
+				receiver := &fakeReceiver{messages: []*amqp.Message{msg}}
+				tr, err := New(context.Background(), WithClient(&fakeClient{sender: &fakeSender{}, receiver: receiver}))
+				if err != nil {
+					t.Fatal(err)
 				}
-			}
+				got, err := tr.Pop(context.Background(), "orders", 0)
+				if err != nil || got == nil {
+					t.Fatalf("case %d (%s): Pop: msg=%v err=%v", i, label, got, err)
+				}
+				rejected := got.RouteURN != ""
+				if rejected != (c.Expect == "reject") {
+					t.Errorf("case %d (%s): rejected=%v, want expect=%s", i, label, rejected, c.Expect)
+				}
+				if !rejected {
+					if _, err := babelqueue.Decode([]byte(got.Body)); err != nil {
+						t.Errorf("case %d (%s): decode: %v", i, label, err)
+					}
+				}
+			})
 		}
 	})
 }

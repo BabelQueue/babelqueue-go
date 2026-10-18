@@ -69,7 +69,7 @@ func TestPulsarConformance(t *testing.T) {
 	})
 
 	for _, c := range m.Pulsar.AttemptsReconciliation.Cases {
-		t.Run("attempts/"+c.Name, func(t *testing.T) {
+		t.Run("attempts_reconciliation/"+c.Name, func(t *testing.T) {
 			env, _ := babelqueue.Make("urn:babel:orders:created", map[string]any{"x": 1})
 			env.Attempts = c.BodyAttempts
 			body, _ := env.Encode()
@@ -89,16 +89,19 @@ func TestPulsarConformance(t *testing.T) {
 			t.Fatal("manifest has no pulsar.schema_version_gate cases")
 		}
 		for i, c := range gate.Cases {
-			props := map[string]string{}
-			label := "absent"
-			if !c.Absent && c.Value != nil {
-				props[gate.Property] = *c.Value
-				label = strconv.Quote(*c.Value)
-			}
-			_, rejected := unsupportedSchemaVersion(props)
-			if rejected != (c.Expect == "reject") {
-				t.Errorf("case %d (%s): rejected=%v, want expect=%s", i, label, rejected, c.Expect)
-			}
+			i, c := i, c
+			t.Run(strconv.Itoa(i), func(t *testing.T) {
+				props := map[string]string{}
+				label := "absent"
+				if !c.Absent && c.Value != nil {
+					props[gate.Property] = *c.Value
+					label = strconv.Quote(*c.Value)
+				}
+				_, rejected := unsupportedSchemaVersion(props)
+				if rejected != (c.Expect == "reject") {
+					t.Errorf("case %d (%s): rejected=%v, want expect=%s", i, label, rejected, c.Expect)
+				}
+			})
 		}
 	})
 }

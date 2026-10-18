@@ -40,33 +40,35 @@ func TestRabbitMQConformance(t *testing.T) {
 	}
 	proj := m.Rabbitmq.PropertyProjection
 
-	body, err := os.ReadFile(filepath.Join(conformanceDir, proj.EnvelopeFile))
-	if err != nil {
-		t.Fatalf("fixture: %v", err)
-	}
-
-	pub := (&Transport{}).publishing(string(body), nil)
-
-	checks := map[string]struct{ got, want string }{
-		"type":           {pub.Type, proj.Properties["type"]},
-		"correlation_id": {pub.CorrelationId, proj.Properties["correlation_id"]},
-		"message_id":     {pub.MessageId, proj.Properties["message_id"]},
-		"app_id":         {pub.AppId, proj.Properties["app_id"]},
-		"content_type":   {pub.ContentType, proj.Properties["content_type"]},
-	}
-	for name, c := range checks {
-		if c.got != c.want {
-			t.Errorf("%s = %q, want %q", name, c.got, c.want)
+	t.Run("property_projection", func(t *testing.T) {
+		body, err := os.ReadFile(filepath.Join(conformanceDir, proj.EnvelopeFile))
+		if err != nil {
+			t.Fatalf("fixture: %v", err)
 		}
-	}
 
-	if v, _ := pub.Headers["x-schema-version"].(int); v != proj.Headers.SchemaVersion {
-		t.Errorf("x-schema-version = %v, want %d", pub.Headers["x-schema-version"], proj.Headers.SchemaVersion)
-	}
-	if v, _ := pub.Headers["x-source-lang"].(string); v != proj.Headers.SourceLang {
-		t.Errorf("x-source-lang = %v, want %q", pub.Headers["x-source-lang"], proj.Headers.SourceLang)
-	}
-	if v, _ := pub.Headers["x-attempts"].(int); v != proj.Headers.Attempts {
-		t.Errorf("x-attempts = %v, want %d", pub.Headers["x-attempts"], proj.Headers.Attempts)
-	}
+		pub := (&Transport{}).publishing(string(body), nil)
+
+		checks := map[string]struct{ got, want string }{
+			"type":           {pub.Type, proj.Properties["type"]},
+			"correlation_id": {pub.CorrelationId, proj.Properties["correlation_id"]},
+			"message_id":     {pub.MessageId, proj.Properties["message_id"]},
+			"app_id":         {pub.AppId, proj.Properties["app_id"]},
+			"content_type":   {pub.ContentType, proj.Properties["content_type"]},
+		}
+		for name, c := range checks {
+			if c.got != c.want {
+				t.Errorf("%s = %q, want %q", name, c.got, c.want)
+			}
+		}
+
+		if v, _ := pub.Headers["x-schema-version"].(int); v != proj.Headers.SchemaVersion {
+			t.Errorf("x-schema-version = %v, want %d", pub.Headers["x-schema-version"], proj.Headers.SchemaVersion)
+		}
+		if v, _ := pub.Headers["x-source-lang"].(string); v != proj.Headers.SourceLang {
+			t.Errorf("x-source-lang = %v, want %q", pub.Headers["x-source-lang"], proj.Headers.SourceLang)
+		}
+		if v, _ := pub.Headers["x-attempts"].(int); v != proj.Headers.Attempts {
+			t.Errorf("x-attempts = %v, want %d", pub.Headers["x-attempts"], proj.Headers.Attempts)
+		}
+	})
 }

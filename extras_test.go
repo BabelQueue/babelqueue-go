@@ -313,8 +313,8 @@ func TestDecodeCaseVariantKeysAreUnknownExtras(t *testing.T) {
 	raw := `{"JOB":"urn:babel:orders:created","trace_id":"t","data":{},` +
 		`"meta":{"Queue":"orders","schema_version":1,"TS":5},"Attempts":2,"Timestamp":1}`
 	env, err := Decode([]byte(raw))
-	if err != nil {
-		t.Fatal(err)
+	if !errors.Is(err, ErrNoIdentity) { // no canonical job: ADR-0032 §6
+		t.Fatalf("err = %v, want ErrNoIdentity", err)
 	}
 	if env.Job != "" || env.Meta.Queue != "" || env.Attempts != 0 {
 		t.Fatalf("case variants were read as canonical fields: %+v", env)
@@ -490,11 +490,11 @@ func TestAppReleaseUnsupportedIsNotReported(t *testing.T) {
 	}
 }
 
-// A body that decodes but names no URN stays bounded by WithMaxAttempts under StrategyRelease.
-// (Undecodable bodies are dead-lettered raw without a retry; see
-// TestAppUndecodableBodyIsDeadLetteredRawWithoutRetry.)
-func TestAppReleaseStrategyBoundsPoisonBodies(t *testing.T) {
-	bodies := []string{`{"trace_id":"t","data":{}}`}
+// A body that names no handler is poison (ADR-0032 §6: no valid job or urn is a decode error),
+// so it is dead-lettered raw without a retry under StrategyRelease, the same as any undecodable
+// body (see TestAppUndecodableBodyIsDeadLetteredRawWithoutRetry).
+func TestAppReleaseStrategyDeadLettersIdentitylessBodies(t *testing.T) {
+	bodies := []string{`{"trace_id":"t","data":{}}`, `{}`, `{"job":null}`, `{"job":5}`, `{"urn":5}`, `null`}
 	for _, body := range bodies {
 		// In-place release (native delivery count) and re-publish fallback.
 		for _, inPlace := range []bool{true, false} {
@@ -516,8 +516,8 @@ func TestAppReleaseStrategyBoundsPoisonBodies(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if n != 3 {
-				t.Errorf("%q inPlace=%v: deliveries = %d, want 3", body, inPlace, n)
+			if n != 1 {
+				t.Errorf("%q inPlace=%v: deliveries = %d, want 1 (poison is never retried)", body, inPlace, n)
 			}
 			if tr.Size("orders") != 0 || tr.Size("orders.dlq") != 1 {
 				t.Errorf("%q inPlace=%v: orders=%d dlq=%d, want 0/1", body, inPlace, tr.Size("orders"), tr.Size("orders.dlq"))

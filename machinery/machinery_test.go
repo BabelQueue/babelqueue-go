@@ -135,9 +135,13 @@ func TestBindRejectsUnacceptableAndBadJSON(t *testing.T) {
 	called := false
 	fn := Bind(func(context.Context, babelqueue.Envelope) error { called = true; return nil })
 
-	// Unacceptable: a syntactically valid envelope with an empty URN.
-	if err := fn(context.Background(), `{"job":"","trace_id":"t","data":{},"meta":{"schema_version":1},"attempts":0}`); !errors.Is(err, ErrNotAccepted) {
+	// Unacceptable: a decodable envelope with an unsupported schema_version.
+	if err := fn(context.Background(), `{"job":"urn:babel:orders:created","trace_id":"t","data":{},"meta":{"schema_version":2},"attempts":0}`); !errors.Is(err, ErrNotAccepted) {
 		t.Errorf("unacceptable: err = %v, want ErrNotAccepted", err)
+	}
+	// No identity (ADR-0032 §6): Decode raises ErrNoIdentity, which Bind surfaces unchanged.
+	if err := fn(context.Background(), `{"job":"","trace_id":"t","data":{},"meta":{"schema_version":1},"attempts":0}`); !errors.Is(err, babelqueue.ErrNoIdentity) {
+		t.Errorf("no identity: err = %v, want ErrNoIdentity", err)
 	}
 	// Malformed JSON → decode error.
 	if err := fn(context.Background(), "not json"); err == nil {
