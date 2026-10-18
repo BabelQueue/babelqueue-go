@@ -4,6 +4,8 @@
 [![Go Reference](https://pkg.go.dev/badge/github.com/babelqueue/babelqueue-go.svg)](https://pkg.go.dev/github.com/babelqueue/babelqueue-go)
 [![Go Report Card](https://goreportcard.com/badge/github.com/babelqueue/babelqueue-go)](https://goreportcard.com/report/github.com/babelqueue/babelqueue-go)
 [![License: MIT](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![Live interop](https://img.shields.io/endpoint?url=https%3A%2F%2Fbabelqueue.com%2Fbadges%2Fnightly.json)](https://babelqueue.com/compatibility/)
+[![BabelQueue conformance](https://img.shields.io/badge/BabelQueue-conformance%20matrix-10B981.svg)](https://babelqueue.com/compatibility/)
 
 > **Polyglot Queues, Simplified.** Read and write the canonical BabelQueue message
 > envelope from Go — so your Go services exchange messages with Laravel, Symfony,
