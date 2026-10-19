@@ -147,7 +147,7 @@ func TestConformanceResults(t *testing.T) {
 			t.Errorf("compliance gap: section %q (scope %q) is in scope but has no runner", name, scopes[name])
 			continue
 		}
-		k := key{r.dir, r.test}
+		k := key(r)
 		if _, done := outcomes[k]; done {
 			continue
 		}
@@ -168,7 +168,7 @@ func TestConformanceResults(t *testing.T) {
 		if !ok {
 			continue
 		}
-		k := key{r.dir, r.test}
+		k := key(r)
 		sec := map[string]caseResult{}
 		for _, id := range manifestCaseIDs(name, manifest) {
 			sec[id] = outcomeFor(outcomes[k], r.test, id, runErr[k])
