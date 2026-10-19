@@ -9,9 +9,10 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
-Written against v1.15.0, the last tagged core. Behaviour change in the core's decode (ADR-0032
-section 6); the envelope stays at `schema_version: 1`. Not yet tagged: the transport modules still pin
-older core versions (see the release notes of the core tag that follows).
+## [1.16.0] - 2026-10-19
+
+Behaviour change in the core's decode (ADR-0032 section 6); the envelope stays at `schema_version: 1`.
+The changed transport and helper modules are tagged separately and require this core.
 
 ### Added
 
