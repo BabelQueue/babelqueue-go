@@ -4,7 +4,7 @@ go 1.24
 
 require (
 	github.com/RichardKnop/machinery/v2 v2.0.16
-	github.com/babelqueue/babelqueue-go v1.0.0
+	github.com/babelqueue/babelqueue-go v1.16.0
 )
 
 require (

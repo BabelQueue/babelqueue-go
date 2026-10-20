@@ -53,6 +53,14 @@ The changed transport and helper modules are tagged separately and require this 
 - Redis, Laravel layout: `WithPollTimeout(0)` (or a zero `Pop` timeout) waits indefinitely, like the
   default layout; due delayed and expired reserved members are still migrated while it waits.
 
+### Release note for the transport modules
+
+Tag the core `v1.16.0` first, then pin the changed modules to it and tag each as a MINOR (strict decode on
+the consume path, plus the module additions above): `amqp/v1.2.0`, `artemis/v1.2.0`,
+`azureservicebus/v1.2.0`, `kafka/v1.4.0`, `machinery/v1.1.0`, `otel/v0.3.0`, `pulsar/v1.3.0`,
+`redis/v1.2.0`, `sqs/v1.11.0`. `asynq`, `idempotency-postgres` and `idempotency-redis` are unchanged and
+keep their pins.
+
 ## [1.15.0] - 2026-10-17
 
 Minor; the envelope stays at `schema_version: 1` — ADR-0031. Only the core module is tagged; the

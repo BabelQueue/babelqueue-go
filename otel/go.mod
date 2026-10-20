@@ -3,7 +3,7 @@ module github.com/babelqueue/babelqueue-go/otel
 go 1.25.0
 
 require (
-	github.com/babelqueue/babelqueue-go v1.6.0
+	github.com/babelqueue/babelqueue-go v1.16.0
 	go.opentelemetry.io/otel v1.46.0
 	go.opentelemetry.io/otel/sdk v1.46.0
 	go.opentelemetry.io/otel/trace v1.46.0
