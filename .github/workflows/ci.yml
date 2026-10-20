@@ -185,6 +185,10 @@ jobs:
           check-latest: true
       - name: Core coverage gate
         run: bash scripts/check-coverage.sh 90
+      # GR-8 timing gate, run without -race and -cover: both instrument the codec more
+      # heavily than bare JSON and skew the measurement, so the test skips itself under them.
+      - name: GR-8 codec overhead gate
+        run: go test -count=1 -run '^TestCodecOverheadWithinBudget$' -v .
 
   integration:
     runs-on: ubuntu-latest

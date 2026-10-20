@@ -57,12 +57,15 @@ func BenchmarkBarePayloadJSON(b *testing.B) {
 // already pays), measured against a conservative broker round-trip. It is pure CPU
 // — no broker — so it is stable and environment-independent in CI.
 func TestCodecOverheadWithinBudget(t *testing.T) {
-	// GR-8 is a pure-CPU timing gate. The race detector instruments every memory
-	// access and inflates the codec disproportionately (it touches more memory than
-	// bare JSON), so the measurement is meaningless under -race. CI runs this suite
-	// with -race; the non-race coverage job enforces this gate instead.
+	// GR-8 is a pure-CPU timing gate. The race detector and coverage instrumentation
+	// both inflate the codec disproportionately (it executes more instrumented code and
+	// touches more memory than bare JSON), so the measurement is meaningless under -race
+	// or -cover. CI enforces this gate in a dedicated uninstrumented step instead.
 	if raceEnabled {
-		t.Skip("GR-8 overhead is a pure-CPU timing gate; skipped under -race (enforced in the non-race coverage job)")
+		t.Skip("GR-8 overhead is a pure-CPU timing gate; skipped under -race (enforced in an uninstrumented CI step)")
+	}
+	if testing.CoverMode() != "" {
+		t.Skip("GR-8 overhead is a pure-CPU timing gate; skipped under -cover (enforced in an uninstrumented CI step)")
 	}
 
 	const iter = 200_000
