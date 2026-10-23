@@ -122,7 +122,8 @@ func TestRedisConformance(t *testing.T) {
 }
 
 // TestRedisLayoutConformance locks the broker-bindings.md §1.1 key names of the
-// Laravel-compatible layout.
+// Laravel-compatible layout (static cases) and replays the behavioural blocks (reserve, migrate,
+// release, sweep, gates ...) against a live Redis (layout_behaviour_test.go).
 func TestRedisLayoutConformance(t *testing.T) {
 	m := loadRedisManifest(t)
 	for _, c := range m.RedisLayout.Cases {
@@ -139,4 +140,5 @@ func TestRedisLayoutConformance(t *testing.T) {
 			}
 		})
 	}
+	runLayoutBlocks(t)
 }

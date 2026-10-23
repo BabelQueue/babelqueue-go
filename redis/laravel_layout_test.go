@@ -39,7 +39,7 @@ func TestLaravelLayoutReserveAck(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	if err := tr.Publish(ctx, "bq-laravel-reserve", `{"job":"urn:babel:t:a"}`); err != nil {
+	if err := tr.Publish(ctx, "bq-laravel-reserve", `{"job":"urn:babel:t:a","attempts":0}`); err != nil {
 		t.Fatal(err)
 	}
 	if n, _ := tr.client.LLen(ctx, k.Ready).Result(); n != 1 {
@@ -68,7 +68,7 @@ func TestLaravelLayoutReserveAck(t *testing.T) {
 }
 
 func TestLaravelLayoutMigratesDelayedAndExpired(t *testing.T) {
-	tr, k := laravelTransport(t, "bq-laravel-migrate", WithRetryAfter(-time.Minute))
+	tr, k := laravelTransport(t, "bq-laravel-migrate", WithRetryAfter(0))
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -83,7 +83,7 @@ func TestLaravelLayoutMigratesDelayedAndExpired(t *testing.T) {
 	if err != nil || msg == nil || msg.Body != "due-delayed" {
 		t.Fatalf("delayed pop = %v %v", msg, err)
 	}
-	// The reservation deadline is already past, so the next pop makes it ready again.
+	// retry_after is 0, so the reservation deadline is due and the next pop makes it ready again.
 	again, err := tr.Pop(ctx, "bq-laravel-migrate", time.Second)
 	if err != nil || again == nil || again.Body != "due-delayed" {
 		t.Fatalf("expired reservation was not re-readied: %v %v", again, err)
@@ -101,7 +101,7 @@ func TestLaravelLayoutPopReservesReadyValueWithoutNotifyToken(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	if err := tr.client.RPush(ctx, k.Ready, `{"job":"urn:babel:t:a"}`).Err(); err != nil {
+	if err := tr.client.RPush(ctx, k.Ready, `{"job":"urn:babel:t:a","attempts":0}`).Err(); err != nil {
 		t.Fatal(err)
 	}
 	if n, _ := tr.client.LLen(ctx, k.Notify).Result(); n != 0 {
@@ -129,7 +129,7 @@ func TestLaravelLayoutNotifyListDoesNotGrow(t *testing.T) {
 
 	const n = 5
 	for i := 0; i < n; i++ {
-		if err := tr.Publish(ctx, "bq-laravel-notify", `{"job":"urn:babel:t:a"}`); err != nil {
+		if err := tr.Publish(ctx, "bq-laravel-notify", `{"job":"urn:babel:t:a","attempts":0}`); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -162,7 +162,7 @@ func TestLaravelLayoutZeroTimeoutWaitsForAValue(t *testing.T) {
 
 	go func() {
 		time.Sleep(500 * time.Millisecond)
-		_ = tr.Publish(ctx, "bq-laravel-zero", `{"job":"urn:babel:t:a"}`)
+		_ = tr.Publish(ctx, "bq-laravel-zero", `{"job":"urn:babel:t:a","attempts":0}`)
 	}()
 	start := time.Now()
 	msg, err := tr.Pop(ctx, "bq-laravel-zero", 0)

@@ -149,14 +149,18 @@ type backoffCase struct {
 	RetryTiersMs   []int64         `json:"retry_tiers_ms"`
 	DelayMs        int64           `json:"delay_ms"`
 	Attempts       int             `json:"attempts"`
-	ReleaseDelayMs int64           `json:"release_delay_ms"`
+	AttemptsBefore int             `json:"attempts_before"`
+	Key            *string         `json:"key"`
 	Expect         json.RawMessage `json:"expect"`
 }
 
 type backoffExpect struct {
+	N            int               `json:"n"`
+	Topic        string            `json:"topic"`
 	TierMs       int64             `json:"tier_ms"`
 	BodyAttempts int               `json:"body_attempts"`
 	Headers      map[string]string `json:"headers"`
+	Key          *string           `json:"key"`
 }
 
 func (c backoffCase) transport(t *testing.T) (*Transport, *fakeWriter) {
@@ -218,6 +222,9 @@ func (c backoffCase) check(t *testing.T, err error, w *fakeWriter, bodyAttempts 
 			t.Errorf("header %s = %q, want %q", k, got[k], v)
 		}
 	}
+	if want.Key != nil && string(rec.Key) != *want.Key {
+		t.Errorf("key = %q, want %q", rec.Key, *want.Key)
+	}
 	if bodyAttempts != nil {
 		env, derr := babelqueue.Decode(rec.Value)
 		if derr != nil || env.Attempts != *bodyAttempts {
@@ -228,11 +235,11 @@ func (c backoffCase) check(t *testing.T, err error, w *fakeWriter, bodyAttempts 
 
 // TestKafkaBackoffConformance locks broker-bindings.md §6.4 (smallest tier >= delay, bq-delay and
 // bq-original-topic, reject above the largest tier or with no tiers) and §6.5 (retry republish:
-// bq-attempts + 1, body attempts in sync).
+// tier n = min(attempts_before, N-1)+1, bq-attempts + 1, body attempts in sync, key byte for byte),
+// plus the retry topic names and the recommended default tier list.
 //
-// SCOPE: these cases prove only tier selection and the write to the retry topic (topic, headers,
-// body attempts). They do NOT prove re-injection or redelivery to the work topic: the Go SDK has
-// no retry-topic -> work-topic re-inject consumer yet, so that half of §6.4/§6.5 is untested here.
+// SCOPE: these cases prove tier selection and the write to the retry topic (topic, headers, body
+// attempts, key). Re-injection to the work topic is covered by TestReinject* (reinject_test.go).
 func TestKafkaBackoffConformance(t *testing.T) {
 	raw, err := os.ReadFile(filepath.Join(conformanceDir, "manifest.json"))
 	if err != nil {
@@ -244,6 +251,24 @@ func TestKafkaBackoffConformance(t *testing.T) {
 			RetryRepublish struct {
 				Cases []backoffCase `json:"cases"`
 			} `json:"retry_republish"`
+			TopicNames struct {
+				Cases []struct {
+					Name        string `json:"name"`
+					WorkTopic   string `json:"work_topic"`
+					N           int    `json:"n"`
+					ExpectTopic string `json:"expect_topic"`
+				} `json:"cases"`
+			} `json:"topic_names"`
+			RetryAttemptTier struct {
+				Cases []backoffCase `json:"cases"`
+			} `json:"retry_attempt_tier"`
+			DefaultTiers struct {
+				Cases []struct {
+					Name     string  `json:"name"`
+					Constant string  `json:"constant"`
+					Expect   []int64 `json:"expect"`
+				} `json:"cases"`
+			} `json:"default_tiers"`
 		} `json:"backoff"`
 	}
 	if err := json.Unmarshal(raw, &m); err != nil {
@@ -263,21 +288,64 @@ func TestKafkaBackoffConformance(t *testing.T) {
 		})
 	}
 
+	retry := func(t *testing.T, c backoffCase, attemptsBefore int) {
+		env, err := babelqueue.Make("urn:babel:test:backoff", map[string]any{"n": 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		env.Attempts = attemptsBefore
+		body, _ := env.Encode()
+		tr, w := c.transport(t)
+		var handle any
+		if c.Key != nil {
+			handle = kafkago.Message{Key: []byte(*c.Key)}
+		}
+		from := &babelqueue.ReceivedMessage{Body: string(body), Queue: c.WorkTopic, Handle: handle}
+		err = tr.PublishRetryForAttempt(context.Background(), from, attemptsBefore)
+		var want backoffExpect
+		_ = json.Unmarshal(c.Expect, &want)
+		c.check(t, err, w, &want.BodyAttempts)
+		if err == nil && len(w.sent) == 1 && w.sent[0].Topic != want.Topic {
+			t.Errorf("topic = %q, want %q", w.sent[0].Topic, want.Topic)
+		}
+	}
+
 	t.Run("retry_republish", func(t *testing.T) {
 		for _, c := range m.Backoff.RetryRepublish.Cases {
+			t.Run(c.Name, func(t *testing.T) { retry(t, c, c.Attempts) })
+		}
+	})
+
+	t.Run("retry_attempt_tier", func(t *testing.T) {
+		for _, c := range m.Backoff.RetryAttemptTier.Cases {
+			t.Run(c.Name, func(t *testing.T) { retry(t, c, c.AttemptsBefore) })
+		}
+	})
+
+	t.Run("topic_names", func(t *testing.T) {
+		for _, c := range m.Backoff.TopicNames.Cases {
 			t.Run(c.Name, func(t *testing.T) {
-				env, err := babelqueue.Make("urn:babel:test:backoff", map[string]any{"n": 1})
-				if err != nil {
-					t.Fatal(err)
+				if got := RetryTopic(c.WorkTopic, c.N); got != c.ExpectTopic {
+					t.Errorf("RetryTopic(%q, %d) = %q, want %q", c.WorkTopic, c.N, got, c.ExpectTopic)
 				}
-				env.Attempts = c.Attempts
-				body, _ := env.Encode()
-				tr, w := c.transport(t)
-				from := &babelqueue.ReceivedMessage{Body: string(body), Queue: c.WorkTopic}
-				err = tr.PublishRetry(context.Background(), from, time.Duration(c.ReleaseDelayMs)*time.Millisecond)
-				var want backoffExpect
-				_ = json.Unmarshal(c.Expect, &want)
-				c.check(t, err, w, &want.BodyAttempts)
+			})
+		}
+	})
+
+	t.Run("default_tiers", func(t *testing.T) {
+		if len(m.Backoff.DefaultTiers.Cases) == 0 {
+			t.Fatal("default_tiers has no cases")
+		}
+		for _, c := range m.Backoff.DefaultTiers.Cases {
+			t.Run(c.Name, func(t *testing.T) {
+				if len(DefaultRetryTiersMs) != len(c.Expect) || len(DefaultRetryTiers) != len(c.Expect) {
+					t.Fatalf("DefaultRetryTiersMs = %v, DefaultRetryTiers = %v, want %v", DefaultRetryTiersMs, DefaultRetryTiers, c.Expect)
+				}
+				for i, ms := range c.Expect {
+					if DefaultRetryTiersMs[i] != ms || DefaultRetryTiers[i].Milliseconds() != ms {
+						t.Errorf("tier %d = %d ms / %s, want %d ms", i, DefaultRetryTiersMs[i], DefaultRetryTiers[i], ms)
+					}
+				}
 			})
 		}
 	})

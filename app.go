@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
+	"math/rand/v2"
 	"strings"
 	"time"
 )
@@ -35,6 +37,9 @@ type App struct {
 	deadLetterSuffix string
 	pollTimeout      time.Duration
 	retryBackoff     time.Duration
+	retryMultiplier  float64
+	retryBackoffMax  time.Duration
+	retryJitter      RetryJitter
 	unknownURNDelay  time.Duration
 	onAckError       func(ctx context.Context, msg *ReceivedMessage, err error)
 	onReleaseError   func(ctx context.Context, msg *ReceivedMessage, err error)
@@ -84,6 +89,78 @@ func WithPollTimeout(d time.Duration) AppOption { return func(a *App) { a.pollTi
 // (e.g. SQS, where it becomes the ChangeMessageVisibility timeout); transports
 // without that capability re-publish the retry immediately.
 func WithRetryBackoff(d time.Duration) AppOption { return func(a *App) { a.retryBackoff = d } }
+
+// RetryJitter selects how the computed retry delay is randomised (ADR-0034 §9).
+type RetryJitter string
+
+const (
+	// JitterNone applies the computed delay exactly (the default).
+	JitterNone RetryJitter = "none"
+	// JitterFull draws the delay uniformly from [0, d(n)].
+	JitterFull RetryJitter = "full"
+)
+
+// WithRetryBackoffMultiplier sets retry_backoff_multiplier: the growth factor between
+// consecutive retries (default 1 = constant delay). Values below 1 are ignored.
+func WithRetryBackoffMultiplier(m float64) AppOption {
+	return func(a *App) {
+		if m >= 1 {
+			a.retryMultiplier = m
+		}
+	}
+}
+
+// WithRetryBackoffMax sets retry_backoff_max: the cap on a computed retry delay
+// (default 0 = unlimited).
+func WithRetryBackoffMax(d time.Duration) AppOption {
+	return func(a *App) {
+		if d >= 0 {
+			a.retryBackoffMax = d
+		}
+	}
+}
+
+// WithRetryJitter sets retry_jitter: [JitterNone] (default) or [JitterFull]. Any other
+// value is ignored.
+func WithRetryJitter(j RetryJitter) AppOption {
+	return func(a *App) {
+		if j == JitterNone || j == JitterFull {
+			a.retryJitter = j
+		}
+	}
+}
+
+// retryDelay computes the worker-side retry delay for the n-th failure (n = attempts + 1,
+// 1-based): d(n) = min(max, base * multiplier^(n-1)); with full jitter the result is drawn
+// uniformly from [0, d(n)]. rnd returns a value in [0, 1). The defaults (base 0) yield 0, so
+// an unconfigured App keeps its historical behaviour.
+func retryDelay(base time.Duration, multiplier float64, max time.Duration, jitter RetryJitter, n int, rnd func() float64) time.Duration {
+	d := computeRetryDelay(base, multiplier, max, n)
+	if jitter == JitterFull && d > 0 {
+		return time.Duration(rnd() * float64(d))
+	}
+	return d
+}
+
+func computeRetryDelay(base time.Duration, multiplier float64, max time.Duration, n int) time.Duration {
+	if base <= 0 {
+		return 0
+	}
+	if multiplier < 1 {
+		multiplier = 1
+	}
+	if n < 1 {
+		n = 1
+	}
+	d := float64(base) * math.Pow(multiplier, float64(n-1))
+	if max > 0 && d > float64(max) {
+		return max
+	}
+	if math.IsInf(d, 0) || math.IsNaN(d) || d >= float64(math.MaxInt64) {
+		return time.Duration(math.MaxInt64)
+	}
+	return time.Duration(d)
+}
 
 // WithUnknownURNReleaseDelay sets the redelivery delay for the [StrategyRelease]
 // unknown-URN strategy — the contract's unknown_urn_release_delay (default 0). Like
@@ -144,6 +221,8 @@ func NewApp(transport Transport, opts ...AppOption) *App {
 		deadLetterSuffix: ".dlq",
 		pollTimeout:      time.Second,
 		rewindPause:      time.Second,
+		retryMultiplier:  1,
+		retryJitter:      JitterNone,
 		handlers:         make(map[string]Handler),
 	}
 	for _, o := range opts {
@@ -279,6 +358,14 @@ func (a *App) dispatch(ctx context.Context, msg *ReceivedMessage) {
 		a.settleVersionGated(ctx, msg)
 		return
 	}
+	// A delivery the transport itself classified as poison (the Redis zset reserve script,
+	// broker-bindings §1.1) is dead-lettered with its body untouched, whatever Decode would
+	// make of it: a body with a null or missing attempts decodes without error but is still
+	// poison, and no handler or retry may run for it.
+	if msg.Poison {
+		a.settleTransportPoison(ctx, msg)
+		return
+	}
 	env, decodeErr := Decode([]byte(msg.Body))
 	// ADR-0032 §6: a body with no valid job or urn alias fails decode and is poison. The one
 	// exception is a delivery whose transport supplied the identity out of band (RouteURN, e.g.
@@ -384,11 +471,42 @@ func (a *App) settleVersionGated(ctx context.Context, msg *ReceivedMessage) {
 	// §3.7/§4.7/§5.7/§6.7/§7.7: reject WITHOUT decoding. The DLQ record is the raw body exactly as
 	// it arrived: an unknown schema is never best-effort parsed or re-encoded, so no dead_letter
 	// block is added and the bytes stay identical to the incoming body (Java/.NET/Node parity).
-	if err := a.republish(ctx, msg, a.deadLetterTarget(msg), msg.Body); err != nil {
+	settled, err := a.deadLetterRaw(ctx, msg, msg.Body)
+	if err != nil {
 		a.leaveDeadLetterUnsettled(ctx, msg, err, "a version-gated message")
 		return
 	}
-	a.ack(ctx, msg)
+	a.settle(ctx, msg, settled)
+}
+
+// settleTransportPoison dead-letters a delivery the transport flagged [ReceivedMessage.Poison]:
+// the body goes to the DLQ byte for byte (it is never decoded or annotated) and the reservation
+// is dropped, in every configuration. A failed write leaves it unacknowledged and handed back
+// to the broker, like any other dead-letter failure.
+func (a *App) settleTransportPoison(ctx context.Context, msg *ReceivedMessage) {
+	settled, err := a.deadLetterRaw(ctx, msg, msg.Body)
+	if err != nil {
+		a.leaveDeadLetterUnsettled(ctx, msg, err, "a poison message")
+		return
+	}
+	a.settle(ctx, msg, settled)
+}
+
+// deadLetterRaw writes body to msg's dead-letter queue. A transport with the [DeadLetterer]
+// capability does it as one gated step that also settles msg (settled is true: the caller must
+// not ack); otherwise the body is re-published and the caller acks.
+func (a *App) deadLetterRaw(ctx context.Context, msg *ReceivedMessage, body string) (settled bool, err error) {
+	if dl, ok := a.transport.(DeadLetterer); ok {
+		return true, dl.DeadLetter(ctx, msg, a.deadLetterTarget(msg), body)
+	}
+	return false, a.republish(ctx, msg, a.deadLetterTarget(msg), body)
+}
+
+// settle acknowledges msg unless a gated operation already settled it.
+func (a *App) settle(ctx context.Context, msg *ReceivedMessage, settled bool) {
+	if !settled {
+		a.ack(ctx, msg)
+	}
 }
 
 // leaveDeadLetterUnsettled reports a failed dead-letter write of subject (e.g. a version-gated
@@ -504,14 +622,15 @@ func (a *App) routePoison(ctx context.Context, msg *ReceivedMessage, env Envelop
 // failed version-gate dead-letter write is (see leaveDeadLetterUnsettled).
 func (a *App) settleRawPoison(ctx context.Context, msg *ReceivedMessage, decodeErr error) {
 	body, err := poisonDeadLetterBody(msg, decodeErr)
+	settled := false
 	if err == nil {
-		err = a.republish(ctx, msg, a.deadLetterTarget(msg), string(body))
+		settled, err = a.deadLetterRaw(ctx, msg, string(body))
 	}
 	if err != nil {
 		a.leaveDeadLetterUnsettled(ctx, msg, err, "an undecodable message")
 		return
 	}
-	a.ack(ctx, msg)
+	a.settle(ctx, msg, settled)
 }
 
 // poisonDeadLetterBody builds the DLQ record for an undecodable body. A body that is a single JSON
@@ -579,7 +698,7 @@ func (a *App) retryOrDeadLetter(ctx context.Context, msg *ReceivedMessage, env E
 	if env.Attempts < a.maxAttempts {
 		// A Releaser redelivers the original in place; the broker's own receive
 		// count then carries the incremented attempt (no re-publish, no ack).
-		if a.release(ctx, msg, a.retryBackoff) {
+		if a.release(ctx, msg, retryDelay(a.retryBackoff, a.retryMultiplier, a.retryBackoffMax, a.retryJitter, env.Attempts, rand.Float64)) {
 			return
 		}
 		body, err := env.Encode()
@@ -647,7 +766,8 @@ func (a *App) release(ctx context.Context, msg *ReceivedMessage, delay time.Dura
 }
 
 func (a *App) deadLetterMessage(ctx context.Context, msg *ReceivedMessage, env Envelope, reason string, cause error) {
-	if err := a.writeDeadLetter(ctx, msg, env, reason, cause); err != nil {
+	settled, err := a.writeDeadLetter(ctx, msg, env, reason, cause)
+	if err != nil {
 		// Never ack a message whose dead-letter record was not written.
 		subject := "a failed message"
 		if reason == "unknown_urn" {
@@ -656,7 +776,7 @@ func (a *App) deadLetterMessage(ctx context.Context, msg *ReceivedMessage, env E
 		a.leaveDeadLetterUnsettled(ctx, msg, err, subject)
 		return
 	}
-	a.ack(ctx, msg)
+	a.settle(ctx, msg, settled)
 }
 
 // deadLetterTarget is the queue msg's dead-letter record is written to.
@@ -667,9 +787,10 @@ func (a *App) deadLetterTarget(msg *ReceivedMessage) string {
 	return msg.Queue + a.deadLetterSuffix
 }
 
-// writeDeadLetter encodes the annotated dead-letter record and publishes it to the DLQ. It does
-// not acknowledge msg; the caller decides what a failure means.
-func (a *App) writeDeadLetter(ctx context.Context, msg *ReceivedMessage, env Envelope, reason string, cause error) error {
+// writeDeadLetter encodes the annotated dead-letter record and writes it to the DLQ
+// ([App.deadLetterRaw]). settled reports that the write also settled msg; otherwise the caller
+// acks. The caller decides what a failure means.
+func (a *App) writeDeadLetter(ctx context.Context, msg *ReceivedMessage, env Envelope, reason string, cause error) (settled bool, err error) {
 	originalQueue := msg.Queue
 	if env.Meta.Queue != "" {
 		originalQueue = env.Meta.Queue
@@ -678,7 +799,7 @@ func (a *App) writeDeadLetter(ctx context.Context, msg *ReceivedMessage, env Env
 
 	body, err := annotated.Encode()
 	if err != nil {
-		return err
+		return false, err
 	}
-	return a.republish(ctx, msg, a.deadLetterTarget(msg), string(body))
+	return a.deadLetterRaw(ctx, msg, string(body))
 }

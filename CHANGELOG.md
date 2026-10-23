@@ -9,6 +9,64 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+Implements conformance **1.6.0** (vendored from the local, untagged `conformance/` copy until the tag is
+cut). The envelope stays at `schema_version: 1`; nothing here touches the wire.
+
+### Added
+
+- **Redis, Laravel layout (ADR-0033):** Laravel's pop script as reserve (attempt count `job.attempts+1`,
+  ack is `ZREM :reserved`, poison path for undecodable heads), `Transport.PublishDelayed(ctx, queue, env,
+  delay)`, `Transport.Release(ctx, msg, delay)` (one script; an undecodable head returns `ErrReleaseUnsupported`
+  and is never re-encoded, so there is no push+ack fallback for it), migrate of `:delayed`
+  then `:reserved` before every pop, `WithMigrationBatchSize`, `WithoutRetryAfter`, 90 s default
+  `retry_after`, and a block slice of at most 1 s in every blocking wait. The `cjson` re-encoded
+  `:reserved` member is the documented Laravel compatibility exception.
+- **Redis, legacy `:processing` mode:** a deadlines sorted set `<q>:processing:deadlines` with
+  `<token>:<raw>` members (32-hex `crypto/rand` token), a sweep before every reserve, and ack/release/DLQ
+  gated on the deadline member (a late ack touches nothing). Replaces the crash-orphaned `:processing`
+  behaviour.
+- **Core transport poison signal:** `ReceivedMessage.Poison` and the optional `DeadLetterer` interface
+  (`DeadLetter(ctx, msg, dlq, body)`). A delivery a transport flags as poison is dead-lettered by the
+  `App` with its body untouched, before any decode, handler or retry, and in EVERY configuration
+  (including `deadLetter=false`, `StrategyFail`/`Delete`/`Release`). Used by the Redis legacy
+  `:processing` layout (a body the core `Decode` rejects, dead-lettered raw on the first delivery) and by
+  the Redis Laravel layout (reserve script `{job, job}` answer, and bodies the script's `cjson` accepts but the core `Decode`
+  rejects: string `meta`/`data`, numeric `trace_id`, fractional `attempts`); the DLQ write is gated on the
+  reservation.
+- **`App` retry backoff (C5):** `WithRetryBackoffMultiplier`, `WithRetryBackoffMax`, `WithRetryJitter`
+  (`JitterNone` | `JitterFull`); `d(n) = min(max, base * mult^(n-1))`. The defaults keep the current
+  behaviour. Not applied on Kafka.
+- **Kafka:** `DefaultRetryTiers` / `DefaultRetryTiersMs`, `Transport.PublishRetryForAttempt`, and the
+  re-inject consumer `Transport.NewReinjector` / `Reinjector.Run` (waits from `record.timestamp`, byte
+  for byte carry, commit after the write ack).
+
+### Changed
+
+- Redis legacy `:processing` mode: `Release` is now an immediate, reservation-gated move (late release
+  touches nothing), and a body that cannot be decoded returns `ErrReleaseUnsupported` instead of being
+  re-queued verbatim. Such a body is flagged `Poison` on delivery, so the `App` dead-letters its raw bytes
+  to `<q>.dlq` on the first delivery in every configuration (binding section 1.1): it can neither loop
+  forever nor be dropped.
+- Redis Laravel layout: `PublishWithHeaders` drops the headers and writes the bare envelope (A3); a
+  `traceparent` is not carried in that mode (`trace_id` stays in the envelope).
+- CI/release pin the `fetch.sh` they run to `BQ_FETCH_SH_SHA256` and check it with `sha256sum -c`;
+  `BQ_CONFORMANCE_VERSION` is now `1.6.0`.
+- Kafka: the poison/identity test table is the conformance `kafka_poison` section; the Go-owned
+  `kafka/testdata/poison-trigger-set.json` is removed.
+
+### Deprecated
+
+- `kafka.Transport.PublishRetry(ctx, from, delay)`: use `PublishRetryForAttempt`. Behaviour unchanged.
+
+### Notes
+
+- Retry topics SHOULD be created with `message.timestamp.type=LogAppendTime`.
+- The live-broker tests (Redis, Kafka integration) skip without a broker.
+- The `redis` module now uses `ReceivedMessage.Poison` and `DeadLetterer`, so it requires a core release
+  that contains them (the next core tag after v1.16.0). It builds today only through its local
+  `replace => ../`; cutting the core tag and pinning `redis/go.mod` to it is a release step outside this
+  change.
+
 ## [1.16.0] - 2026-10-19
 
 Behaviour change in the core's decode (ADR-0032 section 6); the envelope stays at `schema_version: 1`.

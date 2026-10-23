@@ -620,3 +620,115 @@ func TestIntegrationRecordKeySurvivesRetryDLQAndRedrive(t *testing.T) {
 		})
 	}
 }
+
+// Scenario: a failing message is parked on <topic>.retry.1 and the re-inject consumer carries it
+// back to the work topic. The value and the key that come back are byte-identical to the retry
+// record's; bq-delay and bq-original-topic are gone and traceparent is kept (ADR-0034 §6.4).
+func TestIntegrationReinjectCarriesRetryRecordBack(t *testing.T) {
+	brokers := integrationBrokers(t)
+	suffix := strconv.FormatInt(time.Now().UnixNano(), 36)
+	queue := "bq-it-reinject-" + suffix
+	retry1 := RetryTopic(queue, 1)
+	createTopics(t, brokers, queue, retry1)
+
+	const tier = 2 * time.Second
+	tr, err := New(WithBrokers(brokers...), WithWriter(isolatedWriter(t, brokers)),
+		WithGroupID("bq-it-group-"+suffix), WithRetryTiers(tier))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = tr.Close() })
+
+	env, err := babelqueue.Make(integrationURN, map[string]any{"marker": suffix}, babelqueue.WithQueue(queue))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := env.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01"
+	seedRecord(t, brokers, queue, kafkago.Message{
+		Key:     []byte("order-1042"),
+		Value:   []byte(body),
+		Headers: []kafkago.Header{{Key: "traceparent", Value: []byte(traceparent)}},
+	})
+
+	// 1. The first delivery "fails": it is parked on the first retry tier.
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	msg, err := tr.Pop(ctx, queue, 30*time.Second)
+	if err != nil || msg == nil {
+		t.Fatalf("pop: msg=%v err=%v", msg, err)
+	}
+	if err := tr.PublishRetryForAttempt(ctx, msg, 0); err != nil {
+		t.Fatalf("park on retry tier: %v", err)
+	}
+	if err := tr.Ack(ctx, msg); err != nil {
+		t.Fatalf("ack: %v", err)
+	}
+	parked := waitForRecords(t, brokers, retry1, 1, 30*time.Second)[0]
+	parkedAt := time.Now()
+
+	// 2. A re-injector with its own group carries it back to the work topic.
+	rtr, err := New(WithBrokers(brokers...), WithWriter(isolatedWriter(t, brokers)),
+		WithGroupID("bq-it-reinject-group-"+suffix), WithRetryTiers(tier))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = rtr.Close() })
+	ri, err := rtr.NewReinjector(queue)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runCtx, stop := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- ri.Run(runCtx) }()
+	t.Cleanup(func() {
+		stop()
+		select {
+		case <-done:
+		case <-time.After(15 * time.Second):
+		}
+	})
+
+	// The work topic now holds the original record plus the re-injected one.
+	back := waitForRecords(t, brokers, queue, 2, 60*time.Second)[1]
+	if waited := time.Since(parkedAt); waited < tier-time.Second {
+		t.Errorf("record came back after %s, want it held for about the %s tier", waited, tier)
+	}
+	if !bytes.Equal(back.Value, parked.Value) {
+		t.Errorf("value changed on the way back:\n got  %s\n want %s", back.Value, parked.Value)
+	}
+	if m := keyMismatch(parked.Key, back.Key); m != "" {
+		t.Errorf("key changed on the way back: %s", m)
+	}
+
+	reader := kafkago.NewReader(kafkago.ReaderConfig{Brokers: brokers, Topic: queue, Partition: 0, MinBytes: 1, MaxBytes: 1 << 20})
+	defer reader.Close()
+	if err := reader.SetOffset(back.Offset); err != nil {
+		t.Fatal(err)
+	}
+	rctx, rcancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer rcancel()
+	m, err := reader.ReadMessage(rctx)
+	if err != nil {
+		t.Fatalf("read re-injected record: %v", err)
+	}
+	got := map[string]string{}
+	for _, h := range m.Headers {
+		got[h.Key] = string(h.Value)
+	}
+	if _, ok := got["bq-delay"]; ok {
+		t.Error("bq-delay must not reach the work topic")
+	}
+	if _, ok := got["bq-original-topic"]; ok {
+		t.Error("bq-original-topic must not reach the work topic")
+	}
+	if got["traceparent"] != traceparent {
+		t.Errorf("traceparent = %q, want %q", got["traceparent"], traceparent)
+	}
+	if got["bq-attempts"] != "1" {
+		t.Errorf("bq-attempts = %q, want 1", got["bq-attempts"])
+	}
+}

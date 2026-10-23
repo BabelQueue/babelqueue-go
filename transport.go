@@ -29,6 +29,13 @@ type ReceivedMessage struct {
 	// retries and the dead-letter record all keep the producer's original body.
 	// Empty means "route on the body URN" (the default for every other transport).
 	RouteURN string
+	// Poison is set by a transport that has classified this delivery as poison itself (the
+	// Redis zset layout's reserve script, broker-bindings §1.1: a head that does not decode or
+	// whose attempts is not a number comes back as {job, job}). The [App] then never runs a
+	// handler or a retry for it: it writes Body, unchanged, to the dead-letter queue and
+	// settles the reservation, under every configuration (WithDeadLetter and the
+	// unknown-URN strategy do not apply). False for every other delivery.
+	Poison bool
 }
 
 // Transport is the minimal broker contract the [App] runtime talks to: publish a
@@ -100,6 +107,17 @@ func publishKeepingRoute(ctx context.Context, t Transport, queue, body, routeURN
 // it once its reservation lapses.
 type Releaser interface {
 	Release(ctx context.Context, msg *ReceivedMessage, delay time.Duration) error
+}
+
+// DeadLetterer is an optional [Transport] capability: write body to dlqQueue and settle msg
+// (the equivalent of an ack) in one gated step. A transport whose acknowledgement is only valid
+// for the consumer that still owns the reservation (Redis: the deadline-member gate of
+// broker-bindings §1.7) implements it so a consumer whose reservation expired writes nothing —
+// the new owner of the message handles it — instead of producing a duplicate in the dead-letter
+// queue. When it returns nil the message is settled and the [App] does not ack it again; any
+// error leaves the message unsettled (handed back to the broker).
+type DeadLetterer interface {
+	DeadLetter(ctx context.Context, msg *ReceivedMessage, dlqQueue, body string) error
 }
 
 // Rewinder is an optional [Transport] capability: hand an unacknowledged reserved message back to
