@@ -33,7 +33,7 @@ cut). The envelope stays at `schema_version: 1`; nothing here touches the wire.
   the Redis Laravel layout (reserve script `{job, job}` answer, and bodies the script's `cjson` accepts but the core `Decode`
   rejects: string `meta`/`data`, numeric `trace_id`, fractional `attempts`); the DLQ write is gated on the
   reservation.
-- **`App` retry backoff (C5):** `WithRetryBackoffMultiplier`, `WithRetryBackoffMax`, `WithRetryJitter`
+- **`App` retry backoff (ADR-0034 §9):** `WithRetryBackoffMultiplier`, `WithRetryBackoffMax`, `WithRetryJitter`
   (`JitterNone` | `JitterFull`); `d(n) = min(max, base * mult^(n-1))`. The defaults keep the current
   behaviour. Not applied on Kafka.
 - **Kafka:** `DefaultRetryTiers` / `DefaultRetryTiersMs`, `Transport.PublishRetryForAttempt`, and the
@@ -47,7 +47,7 @@ cut). The envelope stays at `schema_version: 1`; nothing here touches the wire.
   re-queued verbatim. Such a body is flagged `Poison` on delivery, so the `App` dead-letters its raw bytes
   to `<q>.dlq` on the first delivery in every configuration (binding section 1.1): it can neither loop
   forever nor be dropped.
-- Redis Laravel layout: `PublishWithHeaders` drops the headers and writes the bare envelope (A3); a
+- Redis Laravel layout: `PublishWithHeaders` drops the headers and writes the bare envelope (ADR-0033 §5); a
   `traceparent` is not carried in that mode (`trace_id` stays in the envelope).
 - CI/release pin the `fetch.sh` they run to `BQ_FETCH_SH_SHA256` and check it with `sha256sum -c`;
   `BQ_CONFORMANCE_VERSION` is now `1.6.0`.
