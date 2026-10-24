@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.17.0] - 2026-10-24
+
 Implements conformance **1.6.0** (vendored from the local, untagged `conformance/` copy until the tag is
 cut). The envelope stays at `schema_version: 1`; nothing here touches the wire.
 
@@ -72,9 +74,14 @@ cut). The envelope stays at `schema_version: 1`; nothing here touches the wire.
 - Retry topics SHOULD be created with `message.timestamp.type=LogAppendTime`.
 - The live-broker tests (Redis, Kafka integration) skip without a broker.
 - The `redis` module now uses `ReceivedMessage.Poison` and `DeadLetterer`, so it requires a core release
-  that contains them (the next core tag after v1.16.0). It builds today only through its local
+  that contains them (core v1.17.0). It builds today only through its local
   `replace => ../`; cutting the core tag and pinning `redis/go.mod` to it is a release step outside this
   change.
+
+### Release note for the transport modules
+
+Tag the core `v1.17.0` first, then pin the changed modules to it and tag each as a MINOR:
+`redis/v1.3.0`, `kafka/v1.5.0`. The other modules are unchanged and keep their pins.
 
 ## [1.16.0] - 2026-10-19
 
