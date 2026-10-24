@@ -137,11 +137,7 @@ func TestPoisonDLQConformance(t *testing.T) {
 					t.Errorf("spliced record has a top-level raw_encoding member: %s", text)
 				}
 				keys := topLevelKeys(t, rec)
-				var want []string
-				for _, k := range c.Expect.SpliceKeys {
-					want = append(want, k)
-				}
-				want = append(want, "dead_letter")
+				want := append(append([]string(nil), c.Expect.SpliceKeys...), "dead_letter")
 				sort.Strings(want)
 				if !reflect.DeepEqual(keys, want) {
 					t.Errorf("top-level members = %v, want %v", keys, want)
