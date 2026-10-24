@@ -61,7 +61,7 @@ jobs:
           BQ_REQUIRE_REDIS: "1"
           REDIS_URL: redis://localhost:6379/0
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@v7
         if: ${{ !contains(github.ref_name, '/') }}
         with:
           python-version: "3.12"
