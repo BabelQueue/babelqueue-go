@@ -3,6 +3,7 @@ package redis
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -52,6 +53,19 @@ func TestIsPoisonHeadClassifiesCodecRejectedBodies(t *testing.T) {
 				t.Fatalf("isPoisonHead(%q) = true, want false", body)
 			}
 		})
+	}
+
+	// Binding §1.1 "Invalid UTF-8": a body the codec decodes (U+FFFD) but whose stored bytes are not
+	// valid UTF-8 is poison in the zset layout too, whichever of job / reserved carries the byte.
+	badUTF8 := "{\"job\":\"urn:x\",\"attempts\":0,\"data\":{\"n\":\"\xff\"}}"
+	if !decodesForRelease(badUTF8) {
+		t.Fatal("precondition: the core codec decodes this body (that is why the transport must classify it)")
+	}
+	if !isPoisonHead(badUTF8, strings.Replace(badUTF8, `"attempts":0`, `"attempts":1`, 1)) {
+		t.Fatal("a decodable body with invalid UTF-8 must be poison in the zset layout")
+	}
+	if !isPoisonHead(`{"job":"urn:x","attempts":0}`, `{"job":"urn:x","attempts":1,"x":"`+"\xff"+`"}`) {
+		t.Fatal("an invalid UTF-8 reserved member must be poison too")
 	}
 
 	// A1 stays: the script's own {job, job} answer is poison whatever the body is.

@@ -61,6 +61,7 @@ var sectionRunners = map[string]sectionRunner{
 	"pulsar":                 {"pulsar", "TestPulsarConformance"},
 	"artemis":                {"artemis", "TestArtemisConformance"},
 	"traceparent":            {"otel", "TestTraceparentConformance"},
+	"poison_dlq":             {".", "TestPoisonDLQConformance"},
 }
 
 // moduleBindings derives the results.json `bindings` from the repo's own Go modules:

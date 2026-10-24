@@ -60,7 +60,7 @@ func TestZsetReserveNeverLosesUnencodableBody(t *testing.T) {
 	}
 }
 
-// MAJOR 2: a poison head the Lua flagged ({job, job}) is dead-lettered by the App itself, raw,
+// MAJOR 2: a poison head the Lua flagged ({job, job}) is dead-lettered by the App itself as an ADR-0035 poison record,
 // under the DEFAULT configuration (deadLetter=false, StrategyFail), including a body the core
 // Decode accepts (attempts null / missing). The handler never runs and nothing is re-published
 // to the source queue.
@@ -91,12 +91,10 @@ func TestZsetPoisonThroughAppGoesToDLQRaw(t *testing.T) {
 			}
 			dlq, _ := f.c.LRange(f.ctx, tr.Keys(f.queue+".dlq").Ready, 0, -1).Result()
 			if len(dlq) != len(poison) {
-				t.Fatalf("dlq = %q, want %d untouched poison bodies", dlq, len(poison))
+				t.Fatalf("dlq = %q, want %d poison records", dlq, len(poison))
 			}
 			for i := range poison {
-				if dlq[i] != poison[i] {
-					t.Fatalf("dlq[%d] = %q, want %q (byte for byte)", i, dlq[i], poison[i])
-				}
+				assertPoisonRecord(t, dlq[i], poison[i], f.queue)
 			}
 			k := tr.Keys(f.queue)
 			if n, _ := f.c.LLen(f.ctx, k.Ready).Result(); n != 0 {
@@ -301,7 +299,7 @@ func TestLegacyIdenticalCopiesAckIndependently(t *testing.T) {
 
 // MINOR 1 (zset layout): bodies the reserve script's cjson accepts but the core Decode rejects
 // (string meta, string data, numeric trace_id, fractional attempts) are poison at reserve: with the
-// DEFAULT App settings they land in the DLQ byte for byte, the handler never runs, and nothing is
+// DEFAULT App settings they land in the DLQ as ADR-0035 poison records, the handler never runs, and nothing is
 // left in the source queue, :delayed or :reserved (no zero-envelope push + ack, no lost body).
 func TestZsetCodecRejectedBodiesGoToDLQRaw(t *testing.T) {
 	bodies := []string{
@@ -328,12 +326,10 @@ func TestZsetCodecRejectedBodiesGoToDLQRaw(t *testing.T) {
 	}
 	dlq, _ := f.c.LRange(f.ctx, tr.Keys(f.queue+".dlq").Ready, 0, -1).Result()
 	if len(dlq) != len(bodies) {
-		t.Fatalf("dlq = %q, want %d bodies", dlq, len(bodies))
+		t.Fatalf("dlq = %q, want %d poison records", dlq, len(bodies))
 	}
 	for i := range bodies {
-		if dlq[i] != bodies[i] {
-			t.Fatalf("dlq[%d] = %q, want %q (byte for byte)", i, dlq[i], bodies[i])
-		}
+		assertPoisonRecord(t, dlq[i], bodies[i], f.queue)
 	}
 	k := tr.Keys(f.queue)
 	if n, _ := f.c.LLen(f.ctx, k.Ready).Result(); n != 0 {
@@ -350,7 +346,7 @@ func TestZsetCodecRejectedBodiesGoToDLQRaw(t *testing.T) {
 // MAJOR (default legacy :processing layout): an undecodable body under the DEFAULT App settings
 // (deadLetter=false, StrategyFail, maxAttempts 3) must terminate AND must not be lost (binding
 // §1.1, ADR-0033): the transport flags it Poison, so the App delivers it exactly once and writes
-// the raw body to <queue>.dlq through the gated DeadLetter, even with dead-lettering off. Nothing
+// an ADR-0035 poison record to <queue>.dlq through the gated DeadLetter, even with dead-lettering off. Nothing
 // stays in the queue, :processing or the deadline set. Before the original fix Release re-queued it
 // verbatim and it looped forever; before the Poison flag it was dropped after 3 deliveries.
 func TestLegacyUndecodableBodyIsBoundedThroughApp(t *testing.T) {
@@ -371,9 +367,10 @@ func TestLegacyUndecodableBodyIsBoundedThroughApp(t *testing.T) {
 				t.Fatalf("processed %d deliveries, want exactly 1 (poison goes straight to the DLQ)", processed)
 			}
 			dlq, _ := f.c.LRange(f.ctx, tr.Keys(f.queue+".dlq").Ready, 0, -1).Result()
-			if len(dlq) != 1 || dlq[0] != body {
-				t.Fatalf("dlq = %q, want the raw body %q (never silently dropped)", dlq, body)
+			if len(dlq) != 1 {
+				t.Fatalf("dlq = %q, want exactly one poison record (never silently dropped)", dlq)
 			}
+			assertPoisonRecord(t, dlq[0], body, f.queue)
 			k := tr.Keys(f.queue)
 			if n, _ := f.c.LLen(f.ctx, k.Ready).Result(); n != 0 {
 				t.Fatalf("ready length = %d, want 0", n)

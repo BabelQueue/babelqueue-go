@@ -87,6 +87,7 @@ import (
 	"math"
 	"strconv"
 	"time"
+	"unicode/utf8"
 
 	babelqueue "github.com/babelqueue/babelqueue-go"
 	goredis "github.com/redis/go-redis/v9"
@@ -509,10 +510,13 @@ func (t *Transport) reserveZset(ctx context.Context, queue string, now float64) 
 //     numeric "trace_id", a fractional "attempts" ...) but the core Decode rejects it. No handler or
 //     retry can ever use such a body, and Release could not re-encode it without destroying it
 //     (there is no push + ack fallback in this layout), so it is poison, not a retry candidate.
+//   - The stored bytes are not valid UTF-8 (binding §1.1 "Invalid UTF-8"): even when cjson and the
+//     codec could decode such a body, it is never handed to a handler, retried or re-published; it
+//     is dead-lettered as the ADR-0035 base64 wrapper by its exact bytes.
 //
 // An identity-less body (ErrNoIdentity) is not poison here: it decodes, and the App decides.
 func isPoisonHead(job, reserved string) bool {
-	if job == reserved {
+	if job == reserved || !utf8.ValidString(job) || !utf8.ValidString(reserved) {
 		return true
 	}
 	return !decodesForRelease(job)
@@ -569,8 +573,21 @@ func (t *Transport) reserveLegacy(ctx context.Context, queue string, now float64
 // App would otherwise re-publish a zero envelope and eventually drop the message, losing its
 // bytes. Flagged, it is dead-lettered raw through the gated [Transport.DeadLetter] on the first
 // delivery in every configuration (binding §1.1: poison instead of loss), the same route the
-// zset layout uses. An identity-less body (ErrNoIdentity) is not poison; the App decides.
+// zset layout uses. A stored value that is not valid UTF-8 is poison too, even when the codec can
+// decode it (binding §1.1 "Invalid UTF-8"). An identity-less body (ErrNoIdentity) is not poison;
+// the App decides.
 func (t *Transport) legacyMessage(queue, raw, token string) *babelqueue.ReceivedMessage {
+	if !utf8.ValidString(raw) {
+		// Invalid UTF-8 is poison (binding §1.1 K-G). Do not unframe: decoding the frame's JSON
+		// would replace the bad bytes inside its body with U+FFFD, so the dead-letter record
+		// would no longer carry the exact stored bytes. The whole stored value is the body.
+		return &babelqueue.ReceivedMessage{
+			Body:   raw,
+			Queue:  queue,
+			Handle: legacyHandle{raw: raw, token: token},
+			Poison: true,
+		}
+	}
 	body, headers := unframe(raw)
 	return &babelqueue.ReceivedMessage{
 		Body:    body,

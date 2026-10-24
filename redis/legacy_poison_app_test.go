@@ -2,6 +2,7 @@ package redis
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -57,7 +58,7 @@ func (l *legacyAppTransport) DeadLetter(_ context.Context, _ *babelqueue.Receive
 }
 
 // Binding §1.1 (poison instead of loss) in the default :processing layout: an undecodable body is
-// written to the DLQ with its raw bytes on the FIRST delivery, in every App configuration
+// written to the DLQ as an ADR-0035 poison record on the FIRST delivery, in every App configuration
 // (including dead-lettering off, where it used to end in a silent drop after 3 deliveries with a
 // zero envelope as the only trace). Nothing is retried, released or handled.
 func TestLegacyUndecodableBodyIsDeadLetteredRawThroughApp(t *testing.T) {
@@ -73,7 +74,10 @@ func TestLegacyUndecodableBodyIsDeadLetteredRawThroughApp(t *testing.T) {
 		"max attempts 1":    {babelqueue.WithMaxAttempts(1)},
 		"custom dlq suffix": {babelqueue.WithDeadLetterSuffix(".dead")},
 	}
-	bodies := []string{`not-json`, `{"job":`, `[1,2]`, `{"job":"urn:x","attempts":0,"meta":"x"}`}
+	bodies := []string{`not-json`, `{"job":`, `[1,2]`, `{"job":"urn:x","attempts":0,"meta":"x"}`, "\xff\xfe not-json",
+		// A decodable envelope whose data carries a raw 0xFF byte: the codec accepts it (U+FFFD), but
+		// invalid UTF-8 is poison (binding §1.1), so it must never reach the "urn:x" handler.
+		"{\"job\":\"urn:x\",\"attempts\":0,\"data\":{\"n\":\"\xff\"},\"meta\":{\"id\":\"1\",\"queue\":\"q\"}}"}
 
 	for name, opts := range configs {
 		for _, body := range bodies {
@@ -94,10 +98,14 @@ func TestLegacyUndecodableBodyIsDeadLetteredRawThroughApp(t *testing.T) {
 				if name == "custom dlq suffix" {
 					suffix = ".dead"
 				}
-				want := "q" + suffix + "|" + body
-				if len(l.dlq) != 1 || l.dlq[0] != want {
-					t.Fatalf("dlq = %q, want exactly [%q] (raw bytes)", l.dlq, want)
+				if len(l.dlq) != 1 {
+					t.Fatalf("dlq = %q, want exactly one record", l.dlq)
 				}
+				record, ok := strings.CutPrefix(l.dlq[0], "q"+suffix+"|")
+				if !ok {
+					t.Fatalf("dlq entry %q is not addressed to q%s", l.dlq[0], suffix)
+				}
+				assertPoisonRecord(t, record, body, "q")
 				if handled != 0 || l.released != 0 || l.acked != 0 || len(l.queue) != 0 {
 					t.Fatalf("handled %d released %d acked %d queue %q: want none (DeadLetter settles the reservation)", handled, l.released, l.acked, l.queue)
 				}
@@ -113,12 +121,35 @@ func TestLegacyMessageFlagsOnlyCodecRejectedBodiesAsPoison(t *testing.T) {
 	tok := "0123456789abcdef0123456789abcdef"
 	for body, want := range map[string]bool{
 		`not-json`: true,
-		`{"job":"urn:x","attempts":0,"meta":"x"}`: true,
-		`{"job":"urn:x","attempts":0}`:            false,
-		`{"attempts":0,"data":{}}`:                false,
+		`{"job":"urn:x","attempts":0,"meta":"x"}`:                      true,
+		`{"job":"urn:x","attempts":0}`:                                 false,
+		`{"attempts":0,"data":{}}`:                                     false,
+		"{\"job\":\"urn:x\",\"attempts\":0,\"data\":{\"n\":\"\xff\"}}": true, // decodable, invalid UTF-8
 	} {
 		if got := tr.legacyMessage("q", body, tok).Poison; got != want {
 			t.Fatalf("legacyMessage(%q).Poison = %v, want %v", body, got, want)
 		}
+	}
+}
+
+// A framed body whose inner bytes are not valid UTF-8 is poison and must NOT be unframed: the
+// frame's JSON decode would substitute U+FFFD, so the message body is the exact stored value.
+func TestLegacyMessageFramedInvalidUTF8KeepsExactStoredBytes(t *testing.T) {
+	tr := NewWithClient(goredis.NewClient(&goredis.Options{Addr: "127.0.0.1:1"}))
+	t.Cleanup(func() { _ = tr.Close() })
+	tok := "0123456789abcdef0123456789abcdef"
+	raw := "{\"__bq_frame\":1,\"body\":\"{\\\"job\\\":\\\"urn:x\\\",\\\"attempts\\\":0,\\\"data\\\":{\\\"n\\\":\\\"\xff\\\"}}\",\"headers\":{}}"
+	msg := tr.legacyMessage("q", raw, tok)
+	if !msg.Poison {
+		t.Fatalf("Poison = false, want true")
+	}
+	if msg.Body != raw {
+		t.Fatalf("Body = %q, want the exact stored bytes %q", msg.Body, raw)
+	}
+	if len(msg.Headers) != 0 {
+		t.Fatalf("Headers = %v, want none", msg.Headers)
+	}
+	if strings.Contains(msg.Body, "\uFFFD") {
+		t.Fatalf("Body contains U+FFFD: %q", msg.Body)
 	}
 }

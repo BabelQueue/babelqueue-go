@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"math"
 	"math/rand/v2"
@@ -480,16 +479,19 @@ func (a *App) settleVersionGated(ctx context.Context, msg *ReceivedMessage) {
 }
 
 // settleTransportPoison dead-letters a delivery the transport flagged [ReceivedMessage.Poison]:
-// the body goes to the DLQ byte for byte (it is never decoded or annotated) and the reservation
-// is dropped, in every configuration. A failed write leaves it unacknowledged and handed back
-// to the broker, like any other dead-letter failure.
+// the DLQ record follows ADR-0035 (broker-bindings §1.1/§1.3) exactly like an undecodable body
+// ([App.settleRawPoison]): the body is spliced or wrapped and carries a dead_letter block with
+// reason "poison", and the reservation is dropped, in every configuration. The body is never
+// decoded for routing. A failed write leaves it unacknowledged and handed back to the broker, like
+// any other dead-letter failure.
 func (a *App) settleTransportPoison(ctx context.Context, msg *ReceivedMessage) {
-	settled, err := a.deadLetterRaw(ctx, msg, msg.Body)
-	if err != nil {
-		a.leaveDeadLetterUnsettled(ctx, msg, err, "a poison message")
-		return
+	// The decode error (when there is one) only documents why the body is poison; a body that
+	// decodes yet was flagged by the transport (null attempts, cjson failure) has no cause.
+	_, decodeErr := Decode([]byte(msg.Body))
+	if errors.Is(decodeErr, ErrNoIdentity) {
+		decodeErr = nil
 	}
-	a.settle(ctx, msg, settled)
+	a.settleRawPoison(ctx, msg, decodeErr)
 }
 
 // deadLetterRaw writes body to msg's dead-letter queue. A transport with the [DeadLetterer]
@@ -615,11 +617,12 @@ func (a *App) routePoison(ctx context.Context, msg *ReceivedMessage, env Envelop
 }
 
 // settleRawPoison dead-letters an undecodable body without retrying it. The DLQ record follows
-// the PHP reference (ADR-0009, error-handling §6): a body that is a JSON object is kept verbatim
-// and a body that is not is wrapped as {"raw": <body>}, then annotated with a dead_letter block
-// (reason "poison"); see poisonDeadLetterBody. It is acknowledged only after the DLQ write
-// succeeded; otherwise it is left unacknowledged and handed back to the broker, the same way a
-// failed version-gate dead-letter write is (see leaveDeadLetterUnsettled).
+// ADR-0035 (error-handling §6): a body that is a strict JSON object without a top-level
+// dead_letter member is spliced byte for byte, anything else is wrapped as
+// {"raw": <string>, "raw_encoding"?: "base64"}, then annotated with a dead_letter block (reason
+// "poison"); see poisonDeadLetterBody. It is acknowledged only after the DLQ write succeeded;
+// otherwise it is left unacknowledged and handed back to the broker, the same way a failed
+// version-gate dead-letter write is (see leaveDeadLetterUnsettled).
 func (a *App) settleRawPoison(ctx context.Context, msg *ReceivedMessage, decodeErr error) {
 	body, err := poisonDeadLetterBody(msg, decodeErr)
 	settled := false
@@ -633,43 +636,23 @@ func (a *App) settleRawPoison(ctx context.Context, msg *ReceivedMessage, decodeE
 	a.settle(ctx, msg, settled)
 }
 
-// poisonDeadLetterBody builds the DLQ record for an undecodable body. A body that is a single JSON
-// object keeps its keys and values (numbers are not re-formatted; key order and whitespace are
-// normalised); anything else is carried as the string value of "raw" (a body that is not valid
-// UTF-8 cannot be represented in JSON and is stored with U+FFFD substitutions). The dead_letter block is the one [Annotate] writes, with the poison
-// reason and the decode error as its cause.
+// poisonDeadLetterBody builds the DLQ record for an undecodable body (ADR-0035): the body is
+// spliced when it is a strict JSON object, otherwise carried in "raw" (plain text when it is valid
+// UTF-8, standard base64 plus "raw_encoding": "base64" when it is not — never U+FFFD substitution).
+// The dead_letter block is the one [Annotate] writes, with the poison reason and the decode error
+// as its cause.
 func poisonDeadLetterBody(msg *ReceivedMessage, decodeErr error) ([]byte, error) {
-	record, ok := decodeJSONObject(msg.Body)
-	if !ok {
-		record = map[string]any{"raw": msg.Body}
-	}
 	attempts := msg.DeliveryCount - 1
 	if attempts < 0 {
 		attempts = 0
 	}
-	record["dead_letter"] = Annotate(Envelope{}, "poison", msg.Queue, attempts, decodeErr).DeadLetter
-
-	var buf bytes.Buffer
-	enc := json.NewEncoder(&buf)
+	var dl bytes.Buffer
+	enc := json.NewEncoder(&dl)
 	enc.SetEscapeHTML(false)
-	if err := enc.Encode(record); err != nil {
+	if err := enc.Encode(Annotate(Envelope{}, "poison", msg.Queue, attempts, decodeErr).DeadLetter); err != nil {
 		return nil, err
 	}
-	return bytes.TrimRight(buf.Bytes(), "\n"), nil
-}
-
-// decodeJSONObject parses body as exactly one JSON object, keeping numbers as json.Number.
-func decodeJSONObject(body string) (map[string]any, bool) {
-	dec := json.NewDecoder(strings.NewReader(body))
-	dec.UseNumber()
-	var obj map[string]any
-	if err := dec.Decode(&obj); err != nil || obj == nil {
-		return nil, false
-	}
-	if _, err := dec.Token(); err != io.EOF {
-		return nil, false
-	}
-	return obj, true
+	return buildPoisonRecord(msg.Body, bytes.TrimRight(dl.Bytes(), "\n")), nil
 }
 
 func (a *App) routeUnknown(ctx context.Context, urn string, msg *ReceivedMessage, env Envelope) {

@@ -42,6 +42,7 @@ cut). The envelope stays at `schema_version: 1`; nothing here touches the wire.
 
 ### Changed
 
+- The Redis poison dead-letter element is now the ADR-0035 record (raw splice, or the `raw`/`raw_encoding` wrapper) carrying a `dead_letter` block, instead of the bare element (broker-bindings section 1). A legacy `__bq_frame` header is unwrapped, not re-applied. Non-DLQ behaviour is unchanged.
 - Redis legacy `:processing` mode: `Release` is now an immediate, reservation-gated move (late release
   touches nothing), and a body that cannot be decoded returns `ErrReleaseUnsupported` instead of being
   re-queued verbatim. Such a body is flagged `Poison` on delivery, so the `App` dead-letters its raw bytes
@@ -53,6 +54,14 @@ cut). The envelope stays at `schema_version: 1`; nothing here touches the wire.
   `BQ_CONFORMANCE_VERSION` is now `1.6.0`.
 - Kafka: the poison/identity test table is the conformance `kafka_poison` section; the Go-owned
   `kafka/testdata/poison-trigger-set.json` is removed.
+- Poison DLQ raw record follows ADR-0035 (behaviour change): a body that is not valid UTF-8 is now carried as
+  lossless standard base64 plus `raw_encoding: "base64"` (was lossy U+FFFD substitution); a strict JSON object is
+  spliced byte for byte (numbers, repeated members kept), and an object that already has a top-level
+  `dead_letter` is wrapped instead of overwritten. Runs the conformance `poison_dlq` section.
+
+### Fixed
+- **Invalid UTF-8 is poison in both Redis layouts (broker-bindings section 1.1).** A stored value (or zset `:reserved` member) that is not valid UTF-8 is dead-lettered on first delivery as the ADR-0035 `raw`/`raw_encoding: "base64"` wrapper, even when the codec or `cjson` could decode it: it is never handed to a handler and never retried, released or re-published, and the exact stored bytes are used for the settle script, so no byte is rewritten.
+- **A legacy `__bq_frame` value with invalid UTF-8 keeps its exact bytes.** The default-layout poison path no longer unframes such a value (decoding the frame's JSON replaced the bad bytes inside its body with U+FFFD); the whole stored value is the dead-letter body, so the ADR-0035 base64 record is lossless.
 
 ### Deprecated
 
@@ -179,7 +188,6 @@ transport and helper modules are unchanged and keep their pins.
   `meta.schema_version` stays 1. Conformance suite 1.3.0 locks the behaviour in all six cores.
 
 ### Fixed
-
 - **core `Redrive`: a failed restore write now rewinds the DLQ record.** When writing a DLQ
   message back to the DLQ fails (dry run, unselected, undecodable body, failed redrive write) and
   the transport implements the optional `Rewinder` capability, `Redrive` calls `Rewind` so the
