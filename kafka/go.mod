@@ -3,7 +3,7 @@ module github.com/babelqueue/babelqueue-go/kafka
 go 1.24
 
 require (
-	github.com/babelqueue/babelqueue-go v1.16.0
+	github.com/babelqueue/babelqueue-go v1.17.0
 	github.com/segmentio/kafka-go v0.4.51
 )
 

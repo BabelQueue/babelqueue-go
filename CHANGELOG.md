@@ -83,6 +83,12 @@ cut). The envelope stays at `schema_version: 1`; nothing here touches the wire.
 Tag the core `v1.17.0` first, then pin the changed modules to it and tag each as a MINOR:
 `redis/v1.3.0`, `kafka/v1.5.0`. The other modules are unchanged and keep their pins.
 
+### Release note for the transport modules
+
+Tag the core `v1.17.0` first, then pin the changed modules to it and tag each as a MINOR: `redis/v1.3.0`
+(zset layout, delayed publish, legacy sweep, ADR-0035 poison records) and `kafka/v1.5.0` (re-inject consumer,
+attempt-based retry tiers, poison route). The other modules are unchanged and keep their pins.
+
 ## [1.16.0] - 2026-10-19
 
 Behaviour change in the core's decode (ADR-0032 section 6); the envelope stays at `schema_version: 1`.
