@@ -4,7 +4,7 @@ go 1.24
 
 require (
 	github.com/babelqueue/babelqueue-go v1.16.0
-	github.com/rabbitmq/amqp091-go v1.15.0
+	github.com/rabbitmq/amqp091-go v1.16.0
 )
 
 // In-repo development: resolve the core locally. Consumers ignore replace
