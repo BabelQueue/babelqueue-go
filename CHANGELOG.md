@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [redis 1.4.0, pulsar 1.4.0] - 2026-10-25
+
 Implements conformance **1.7.0** (vendored from the `v1.7.0` release asset, verified with `fetch.sh --check`;
 `BQ_CONFORMANCE_VERSION` is now `1.7.0` in `ci.yml` and `release.yml`). The envelope stays at
 `schema_version: 1`; nothing here touches the wire (ADR-0036).
@@ -48,6 +50,12 @@ Implements conformance **1.7.0** (vendored from the `v1.7.0` release asset, veri
   The 2%-of-750 µs budget keeps its meaning on the calibration machine and a codec that slows down relative to
   plain JSON still fails; a slow or contended runner no longer does. R1 measured 1.0 to 2.09% on CI with the
   fixed reference (envelope/bare ratio 4.5 to 4.8x each time); the scaled gate reads about 0.8% on a dev machine and 0.8 to 1.0% under heavy CPU contention.
+
+### Release note for the transport modules
+
+No core tag: the core changed only in tests, CI and the vendored conformance suite. Tag the two changed
+modules as MINORs: `redis/v1.4.0` (identity-less poison behaviour change) and `pulsar/v1.4.0` (bounded poison
+redelivery). The other modules are unchanged and keep their pins.
 
 ## [1.17.0] - 2026-10-24
 
