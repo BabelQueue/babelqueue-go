@@ -3,6 +3,7 @@ package azureservicebus
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -183,4 +184,117 @@ func toFloat(v any) (float64, bool) {
 		return float64(n), true
 	}
 	return 0, false
+}
+
+type versionGateCase struct {
+	Name         string `json:"name"`
+	OnUnknownURN string `json:"on_unknown_urn"`
+	DeadLetter   string `json:"dead_letter"`
+	DLQWrite     string `json:"dlq_write"`
+	BQAttempts   string `json:"bq_attempts"`
+	Expect       struct {
+		Outcome         string `json:"outcome"`
+		Record          string `json:"record"`
+		OutcomeNoWriter string `json:"outcome_no_writer"`
+	} `json:"expect"`
+}
+
+// TestAsbVersionGateConformance runs the `version_gate_asb` section (ADR-0037 decision 1;
+// broker-bindings §5.7 / §4.5): a version-gated delivery goes through the real transport and App.
+// With dead-lettering off (and not the dead_letter strategy) the outcome is `native`: no Complete,
+// no write, no retry - this transport dead-letters it natively (explicit DeadLetter into
+// $DeadLetterQueue). `unsettled` is an Abandon. The Go runtime always has a writable DLQ target,
+// so `outcome_no_writer` never applies here.
+func TestAsbVersionGateConformance(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join(conformanceDir, "manifest.json"))
+	if err != nil {
+		t.Skipf("vendored conformance manifest not found: %v", err)
+	}
+	var m struct {
+		Section struct {
+			Cases          []versionGateCase `json:"cases"`
+			IncomingBodies []struct {
+				Name string `json:"name"`
+				Body string `json:"body"`
+			} `json:"incoming_bodies"`
+		} `json:"version_gate_asb"`
+	}
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("manifest: %v", err)
+	}
+	if len(m.Section.Cases) == 0 || len(m.Section.IncomingBodies) == 0 {
+		t.Fatal("manifest has no version_gate_asb cases or incoming bodies")
+	}
+
+	for _, c := range m.Section.Cases {
+		t.Run(c.Name, func(t *testing.T) {
+			for _, in := range m.Section.IncomingBodies {
+				t.Run(in.Name, func(t *testing.T) {
+					rm := gatedMessage(in.Body, "2", true)
+					if c.BQAttempts != "" {
+						// The outcome must not depend on the attempts or the native delivery count.
+						rm.DeliveryCount = 8
+						rm.ApplicationProperties["bq-attempts"] = c.BQAttempts
+					}
+					receiver := &fakeReceiver{messages: []*azservicebus.ReceivedMessage{rm}}
+					sender := &fakeSender{}
+					if c.DLQWrite == "fails" {
+						sender.err = errors.New("dlq unavailable")
+					}
+					tr, err := New(WithClient(&fakeClient{sender: sender, receiver: receiver}))
+					if err != nil {
+						t.Fatal(err)
+					}
+					opts := []babelqueue.AppOption{
+						babelqueue.WithDefaultQueue("orders"), babelqueue.WithMaxAttempts(3),
+						babelqueue.WithDeadLetter(c.DeadLetter == "on"), babelqueue.WithRewindPause(0),
+					}
+					if c.OnUnknownURN != "" {
+						opts = append(opts, babelqueue.WithUnknownURNStrategy(c.OnUnknownURN))
+					}
+					reported := 0
+					opts = append(opts, babelqueue.WithDeadLetterErrorHandler(func(context.Context, *babelqueue.ReceivedMessage, error) { reported++ }))
+					app := babelqueue.NewApp(tr, opts...)
+					handled := 0
+					app.Handle("urn:babelqueue:order.created", func(context.Context, babelqueue.Envelope) error { handled++; return nil })
+					if _, err := app.Drain(context.Background(), "orders", 1); err != nil {
+						t.Fatal(err)
+					}
+					if handled != 0 {
+						t.Fatalf("a handler ran %d times for a version-gated delivery", handled)
+					}
+					switch c.Expect.Outcome {
+					case "ack":
+						if len(receiver.completed) != 1 || len(sender.sent) != 0 || len(receiver.deadLettered) != 0 {
+							t.Fatalf("completed = %d, sent = %d, dead-lettered = %d; want one Complete and nothing else",
+								len(receiver.completed), len(sender.sent), len(receiver.deadLettered))
+						}
+					case "dlq_raw":
+						if len(sender.sent) != 1 || len(receiver.completed) != 1 || len(receiver.deadLettered) != 0 {
+							t.Fatalf("sent = %d, completed = %d, dead-lettered = %d; want one DLQ write then one Complete",
+								len(sender.sent), len(receiver.completed), len(receiver.deadLettered))
+						}
+						if c.Expect.Record == "incoming_body" && string(sender.sent[0].Body) != in.Body {
+							t.Fatalf("DLQ record is not byte-identical to the incoming body:\n got: %q\nwant: %q", sender.sent[0].Body, in.Body)
+						}
+					case "unsettled":
+						if len(receiver.completed) != 0 || len(receiver.deadLettered) != 0 || len(receiver.abandoned) != 1 || reported == 0 {
+							t.Fatalf("completed = %d, dead-lettered = %d, abandoned = %d, reported = %d; want an Abandon and a reported failure only",
+								len(receiver.completed), len(receiver.deadLettered), len(receiver.abandoned), reported)
+						}
+					case "native":
+						if len(receiver.completed) != 0 || len(sender.sent) != 0 || len(receiver.deadLettered)+len(receiver.abandoned) != 1 {
+							t.Fatalf("completed = %d, sent = %d, dead-lettered = %d, abandoned = %d; native means no Complete, no write and exactly one native settle",
+								len(receiver.completed), len(sender.sent), len(receiver.deadLettered), len(receiver.abandoned))
+						}
+						if len(receiver.deadLettered) == 1 && receiver.dlReasons[0] != "unsupported schema version" {
+							t.Fatalf("DeadLetterReason = %q, want %q", receiver.dlReasons[0], "unsupported schema version")
+						}
+					default:
+						t.Fatalf("unhandled expected outcome %q", c.Expect.Outcome)
+					}
+				})
+			}
+		})
+	}
 }

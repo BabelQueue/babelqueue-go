@@ -12,17 +12,35 @@ import (
 
 const urn = "urn:babel:orders:created"
 
-type fakeSender struct{ sent []*azservicebus.Message }
+type fakeSender struct {
+	sent []*azservicebus.Message
+	err  error // when set, SendMessage fails
+}
 
 func (f *fakeSender) SendMessage(_ context.Context, m *azservicebus.Message, _ *azservicebus.SendMessageOptions) error {
+	if f.err != nil {
+		return f.err
+	}
 	f.sent = append(f.sent, m)
 	return nil
 }
 
 type fakeReceiver struct {
-	messages  []*azservicebus.ReceivedMessage
-	completed []*azservicebus.ReceivedMessage
-	abandoned []*azservicebus.ReceivedMessage
+	messages     []*azservicebus.ReceivedMessage
+	completed    []*azservicebus.ReceivedMessage
+	abandoned    []*azservicebus.ReceivedMessage
+	deadLettered []*azservicebus.ReceivedMessage
+	dlReasons    []string // DeadLetterReason of every DeadLetterMessage call
+	dlDetails    []string // DeadLetterErrorDescription of every call
+}
+
+func (f *fakeReceiver) DeadLetterMessage(_ context.Context, m *azservicebus.ReceivedMessage, o *azservicebus.DeadLetterOptions) error {
+	f.deadLettered = append(f.deadLettered, m)
+	if o != nil {
+		f.dlReasons = append(f.dlReasons, derefStr(o.Reason))
+		f.dlDetails = append(f.dlDetails, derefStr(o.ErrorDescription))
+	}
+	return nil
 }
 
 func (f *fakeReceiver) ReceiveMessages(_ context.Context, max int, _ *azservicebus.ReceiveMessagesOptions) ([]*azservicebus.ReceivedMessage, error) {
@@ -336,4 +354,186 @@ func TestRewindAbandonsTheMessage(t *testing.T) {
 	if len(receiver.abandoned) != 1 || len(receiver.completed) != 0 {
 		t.Fatalf("abandoned = %d, completed = %d; want 1 and 0", len(receiver.abandoned), len(receiver.completed))
 	}
+}
+
+// abandonOnlyReceiver is a Receiver that offers AbandonMessage but not DeadLetterMessage.
+type abandonOnlyReceiver struct{ r *fakeReceiver }
+
+func (a abandonOnlyReceiver) ReceiveMessages(ctx context.Context, n int, o *azservicebus.ReceiveMessagesOptions) ([]*azservicebus.ReceivedMessage, error) {
+	return a.r.ReceiveMessages(ctx, n, o)
+}
+
+func (a abandonOnlyReceiver) CompleteMessage(ctx context.Context, m *azservicebus.ReceivedMessage, o *azservicebus.CompleteMessageOptions) error {
+	return a.r.CompleteMessage(ctx, m, o)
+}
+
+func (a abandonOnlyReceiver) AbandonMessage(ctx context.Context, m *azservicebus.ReceivedMessage, o *azservicebus.AbandonMessageOptions) error {
+	return a.r.AbandonMessage(ctx, m, o)
+}
+
+type abandonOnlyClient struct {
+	sender   *fakeSender
+	receiver *fakeReceiver
+}
+
+func (c *abandonOnlyClient) NewSender(string) (Sender, error) { return c.sender, nil }
+func (c *abandonOnlyClient) NewReceiver(string) (Receiver, error) {
+	return abandonOnlyReceiver{c.receiver}, nil
+}
+
+// SettleNative dead-letters the message natively (reason and description set), never completing
+// or abandoning it, and never touching the body.
+func TestSettleNativeDeadLettersWithReasonAndDescription(t *testing.T) {
+	receiver := &fakeReceiver{messages: []*azservicebus.ReceivedMessage{gatedMessage("not json", "2", true)}}
+	tr, err := New(WithClient(&fakeClient{sender: &fakeSender{}, receiver: receiver}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, err := tr.Pop(context.Background(), "orders", 0)
+	if err != nil || msg == nil {
+		t.Fatalf("Pop: msg=%v err=%v", msg, err)
+	}
+	if err := tr.SettleNative(context.Background(), msg, "unsupported schema version", "declares version 2"); err != nil {
+		t.Fatalf("SettleNative: %v", err)
+	}
+	if len(receiver.deadLettered) != 1 || len(receiver.completed) != 0 || len(receiver.abandoned) != 0 {
+		t.Fatalf("dead-lettered = %d, completed = %d, abandoned = %d; want 1, 0, 0",
+			len(receiver.deadLettered), len(receiver.completed), len(receiver.abandoned))
+	}
+	if receiver.dlReasons[0] != "unsupported schema version" || receiver.dlDetails[0] != "declares version 2" {
+		t.Errorf("reason/description = %q/%q", receiver.dlReasons[0], receiver.dlDetails[0])
+	}
+	if string(receiver.deadLettered[0].Body) != "not json" {
+		t.Errorf("body = %q, want it untouched", receiver.deadLettered[0].Body)
+	}
+}
+
+// A receiver without DeadLetterMessage falls back to Abandon (MaxDeliveryCount takes over): still
+// a native settle, still never a Complete.
+func TestSettleNativeFallsBackToAbandon(t *testing.T) {
+	receiver := &fakeReceiver{messages: []*azservicebus.ReceivedMessage{gatedMessage("not json", "2", true)}}
+	tr, err := New(WithClient(&abandonOnlyClient{sender: &fakeSender{}, receiver: receiver}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	msg, _ := tr.Pop(context.Background(), "orders", 0)
+	if err := tr.SettleNative(context.Background(), msg, "poison", "x"); err != nil {
+		t.Fatal(err)
+	}
+	if len(receiver.abandoned) != 1 || len(receiver.completed) != 0 || len(receiver.deadLettered) != 0 {
+		t.Fatalf("abandoned = %d, completed = %d, dead-lettered = %d; want 1, 0, 0",
+			len(receiver.abandoned), len(receiver.completed), len(receiver.deadLettered))
+	}
+}
+
+func TestSettleNativeNoopWithoutHandle(t *testing.T) {
+	tr, _ := New(WithClient(&fakeClient{sender: &fakeSender{}, receiver: &fakeReceiver{}}))
+	if err := tr.SettleNative(context.Background(), &babelqueue.ReceivedMessage{Queue: "orders"}, "poison", "x"); err != nil {
+		t.Errorf("SettleNative with no handle returned %v", err)
+	}
+}
+
+// drainOne runs one delivery through a real App over the transport.
+func drainOne(t *testing.T, receiver *fakeReceiver, sender *fakeSender, opts ...babelqueue.AppOption) (handled int) {
+	t.Helper()
+	tr, err := New(WithClient(&fakeClient{sender: sender, receiver: receiver}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	app := babelqueue.NewApp(tr, append([]babelqueue.AppOption{babelqueue.WithMaxAttempts(5)}, opts...)...)
+	app.Handle(urn, func(context.Context, babelqueue.Envelope) error { handled++; return nil })
+	if _, err := app.Drain(context.Background(), "orders", 1); err != nil {
+		t.Fatal(err)
+	}
+	return handled
+}
+
+// ADR-0037 decision 1 rule 3: DLQ off + fail (default) + a version-gated message is never
+// Completed: it is dead-lettered natively (reason "unsupported schema version") on the first
+// delivery. Nothing is sent to <queue>.dlq and nothing is retried.
+func TestAppVersionGatedDLQOffDeadLettersNativelyWithoutComplete(t *testing.T) {
+	for name, opts := range map[string][]babelqueue.AppOption{
+		"default fail": nil,
+		"release":      {babelqueue.WithUnknownURNStrategy(babelqueue.StrategyRelease)},
+	} {
+		t.Run(name, func(t *testing.T) {
+			receiver := &fakeReceiver{messages: []*azservicebus.ReceivedMessage{gatedMessage(sampleBody(t), "2", true)}}
+			sender := &fakeSender{}
+			if drainOne(t, receiver, sender, opts...) != 0 {
+				t.Fatal("handler ran for a version-gated delivery")
+			}
+			if len(receiver.completed) != 0 || len(sender.sent) != 0 || len(receiver.deadLettered) != 1 {
+				t.Fatalf("completed = %d, sent = %d, dead-lettered = %d; want 0, 0, 1",
+					len(receiver.completed), len(sender.sent), len(receiver.deadLettered))
+			}
+			if receiver.dlReasons[0] != "unsupported schema version" {
+				t.Errorf("DeadLetterReason = %q", receiver.dlReasons[0])
+			}
+		})
+	}
+
+	t.Run("delete strategy still completes", func(t *testing.T) {
+		receiver := &fakeReceiver{messages: []*azservicebus.ReceivedMessage{gatedMessage(sampleBody(t), "2", true)}}
+		sender := &fakeSender{}
+		drainOne(t, receiver, sender, babelqueue.WithUnknownURNStrategy(babelqueue.StrategyDelete))
+		if len(receiver.completed) != 1 || len(receiver.deadLettered) != 0 || len(sender.sent) != 0 {
+			t.Fatalf("completed = %d, dead-lettered = %d, sent = %d; want 1, 0, 0",
+				len(receiver.completed), len(receiver.deadLettered), len(sender.sent))
+		}
+	})
+
+	t.Run("dlq on writes the raw body then completes", func(t *testing.T) {
+		body := sampleBody(t)
+		receiver := &fakeReceiver{messages: []*azservicebus.ReceivedMessage{gatedMessage(body, "2", true)}}
+		sender := &fakeSender{}
+		drainOne(t, receiver, sender, babelqueue.WithDeadLetter(true))
+		if len(sender.sent) != 1 || string(sender.sent[0].Body) != body || len(receiver.completed) != 1 || len(receiver.deadLettered) != 0 {
+			t.Fatalf("sent = %d, completed = %d, dead-lettered = %d; want the raw body sent once, 1 complete, 0 native",
+				len(sender.sent), len(receiver.completed), len(receiver.deadLettered))
+		}
+	})
+}
+
+// ADR-0037 decision 2 ("Go and Python"): with DLQ off a poison body (invalid JSON, identity-less
+// object) is dead-lettered natively on the first delivery: no Complete, no re-send, no retry. With
+// DLQ on it is the ADR-0035 record then Complete; delete drops with a Complete.
+func TestAppPoisonDLQOffDeadLettersNativelyWithoutComplete(t *testing.T) {
+	for _, body := range []string{"not json at all", `{"data":{"a":1}}`} {
+		t.Run("dlq off "+body, func(t *testing.T) {
+			receiver := &fakeReceiver{messages: []*azservicebus.ReceivedMessage{{Body: []byte(body), DeliveryCount: 1}}}
+			sender := &fakeSender{}
+			drainOne(t, receiver, sender)
+			if len(receiver.completed) != 0 || len(sender.sent) != 0 || len(receiver.deadLettered) != 1 {
+				t.Fatalf("completed = %d, sent = %d, dead-lettered = %d; want 0, 0, 1",
+					len(receiver.completed), len(sender.sent), len(receiver.deadLettered))
+			}
+			if receiver.dlReasons[0] != "poison" {
+				t.Errorf("DeadLetterReason = %q, want poison", receiver.dlReasons[0])
+			}
+			if string(receiver.deadLettered[0].Body) != body {
+				t.Errorf("body = %q, want it untouched", receiver.deadLettered[0].Body)
+			}
+		})
+		t.Run("dlq on "+body, func(t *testing.T) {
+			receiver := &fakeReceiver{messages: []*azservicebus.ReceivedMessage{{Body: []byte(body), DeliveryCount: 1}}}
+			sender := &fakeSender{}
+			drainOne(t, receiver, sender, babelqueue.WithDeadLetter(true))
+			if len(sender.sent) != 1 || len(receiver.completed) != 1 || len(receiver.deadLettered) != 0 {
+				t.Fatalf("sent = %d, completed = %d, dead-lettered = %d; want 1, 1, 0",
+					len(sender.sent), len(receiver.completed), len(receiver.deadLettered))
+			}
+			if !strings.Contains(string(sender.sent[0].Body), `"reason":"poison"`) {
+				t.Errorf("DLQ record = %s; want the ADR-0035 poison record", sender.sent[0].Body)
+			}
+		})
+	}
+	t.Run("delete strategy drops with a Complete", func(t *testing.T) {
+		receiver := &fakeReceiver{messages: []*azservicebus.ReceivedMessage{{Body: []byte("not json"), DeliveryCount: 1}}}
+		sender := &fakeSender{}
+		drainOne(t, receiver, sender, babelqueue.WithUnknownURNStrategy(babelqueue.StrategyDelete))
+		if len(receiver.completed) != 1 || len(receiver.deadLettered) != 0 || len(sender.sent) != 0 {
+			t.Fatalf("completed = %d, dead-lettered = %d, sent = %d; want 1, 0, 0",
+				len(receiver.completed), len(receiver.deadLettered), len(sender.sent))
+		}
+	})
 }

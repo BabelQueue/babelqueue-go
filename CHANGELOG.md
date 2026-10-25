@@ -9,6 +9,56 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+Implements conformance **1.8.0** (vendored from the `v1.8.0` release asset, verified with `fetch.sh --check`;
+`BQ_CONFORMANCE_VERSION` is now `1.8.0` in `ci.yml` and `release.yml`). The envelope stays at
+`schema_version: 1`; nothing here touches the wire (ADR-0037). The new `version_gate_pulsar`,
+`version_gate_artemis`, `version_gate_sqs` and `version_gate_asb` sections run and pass (17 cases each).
+The version numbers of the core and the `sqs` and `azureservicebus` modules are set at release time (core,
+`sqs` and `azureservicebus` are each a MINOR); the two modules' `require` of the core moves to the core
+version that contains `NativeSettler` then.
+
+### Changed
+
+- **Behaviour change (core `App`, `sqs`, `azureservicebus`): with dead-lettering off, SQS and Azure Service Bus
+  no longer drop a version-gated message or retry a poison body; they are left to the broker's native
+  mechanism (ADR-0037 decision 1 rule 3 and decision 2 "Go and Python"; broker-bindings §3.5, §4.5, §5.7;
+  owner decision 2026-10-25).**
+  - *Version-gated message* (a `bq-schema-version` the consumer does not support), dead-lettering off and a
+    strategy other than `delete` or `dead_letter`: it used to be acknowledged and dropped. It is now
+    **not** acknowledged. On SQS there is no `DeleteMessage`: visibility expiry redelivers it (the gate rejects
+    it again) and the queue's `RedrivePolicy` moves it to the native DLQ after `maxReceiveCount`. On Azure
+    Service Bus it is dead-lettered natively with an explicit `DeadLetter` (reason `unsupported schema version`)
+    into `$DeadLetterQueue` instead of `Complete`.
+  - *Poison body* (invalid JSON or an identity-less object), dead-lettering off and a strategy other than
+    `delete` or `dead_letter`: it used to take the bounded `fail` path (re-publish an empty envelope up to
+    `WithMaxAttempts`, then drop). On SQS and Azure Service Bus it is now settled natively **on the first
+    delivery** exactly as above (Azure Service Bus reason `poison`): no re-publish, no retry, no ack, body
+    unchanged, the event is logged. Every other transport (Pulsar, Artemis, AMQP, Kafka, Redis, memory) keeps
+    its behaviour, and `delete` (drop with an ack), dead-lettering on and `dead_letter` (the raw record, then
+    ack) are unchanged on SQS and Azure Service Bus too.
+  - A deployment that relied on SQS/Azure Service Bus silently dropping these messages now needs a
+    `RedrivePolicy` (SQS) or accepts them in `$DeadLetterQueue` (Azure Service Bus), or sets
+    `WithDeadLetter(true)` / `StrategyDelete`.
+
+### Added
+
+- **Core: the optional `NativeSettler` transport capability** (`SettleNative(ctx, msg, reason, description)`).
+  When dead-lettering is off, the `App` calls it instead of acknowledging a version-gated message (and, in the
+  poison route, instead of the bounded retry) on a transport that offers it; the decision is made by the
+  capability, never by the transport's name. Transports without it are unchanged.
+- **`sqs` and `azureservicebus` implement `NativeSettler`** (SQS: a deliberate no-op, no `DeleteMessage`; Azure
+  Service Bus: `DeadLetterMessage` with the reason and description, falling back to `AbandonMessage` for a
+  receiver without it).
+- **Conformance `version_gate_*` runners** (`version_gate_pulsar` / `version_gate_artemis` through the `App`,
+  `version_gate_sqs` / `version_gate_asb` through the real transports) and their entries in the results writer.
+
+### Fixed
+
+- **`release.yml` tests a module before publishing its tag.** A module tag (`redis/v*`, `sqs/v*`,
+  `azureservicebus/v*`, `pulsar/v*`, `kafka/v*`, `artemis/v*`, `amqp/v*`, `asynq/v*`, `machinery/v*`, `otel/v*`)
+  now runs `go build`, `go vet` and `go test -race` in that module's directory; before, only the core's tests
+  ran, so a module could be tagged without its own tests. The core tag (`v*`) is unchanged.
+
 ## [redis 1.4.0, pulsar 1.4.0] - 2026-10-25
 
 Implements conformance **1.7.0** (vendored from the `v1.7.0` release asset, verified with `fetch.sh --check`;

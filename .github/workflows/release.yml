@@ -19,7 +19,7 @@ permissions:
   contents: write
 
 env:
-  BQ_CONFORMANCE_VERSION: "1.7.0"
+  BQ_CONFORMANCE_VERSION: "1.8.0"
   # sha256 of that release's fetch.sh: the script runs on the runner, so it is pinned rather than
   # trusted from a mutable tag. Bump together with BQ_CONFORMANCE_VERSION.
   BQ_FETCH_SH_SHA256: 8bb6ba567b288fb0ac71a70fd17041b2503df119e01998d76fdad372570bf849
@@ -64,6 +64,26 @@ jobs:
           BQ_CONFORMANCE_RESULTS: ${{ !contains(github.ref_name, '/') && format('{0}/results.json', runner.temp) || '' }}
           BQ_REQUIRE_REDIS: "1"
           REDIS_URL: redis://localhost:6379/0
+
+      # A module tag (`redis/v*`, `sqs/v*`, ...) publishes that module's own go.mod, which the
+      # core test above does not exercise: run the module's build, vet and tests before anything is
+      # released, as ci.yml does. The module directory is the tag's prefix; the case below accepts
+      # only the modules the `on.push.tags` filter lists, so a stray prefix fails the release. The
+      # core tag (`v*`, no prefix) skips this step and releases exactly as before.
+      - name: Test module
+        if: ${{ contains(github.ref_name, '/') }}
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          MODULE_DIR="${TAG%%/*}"
+          case "$MODULE_DIR" in
+            redis|amqp|sqs|azureservicebus|pulsar|kafka|artemis|asynq|machinery|otel) ;;
+            *) echo "release: unknown module tag prefix '$MODULE_DIR'" >&2; exit 1 ;;
+          esac
+          cd "$MODULE_DIR"
+          go build ./...
+          go vet ./...
+          go test -race -count=1 ./...
 
       - uses: actions/setup-python@v6
         if: ${{ !contains(github.ref_name, '/') }}

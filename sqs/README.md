@@ -73,12 +73,15 @@ timeout lapses; it is never deleted or re-sent. The IAM principal needs
 A zero delay means a message that always fails is redelivered in a tight loop until
 the App's `WithMaxAttempts` is reached (counted from `ApproximateReceiveCount`, surfaced
 as `ReceivedMessage.DeliveryCount` — so the bound also holds for a body that does not
-decode — under the `release` strategy such a body bypasses `release` and takes the
-bounded `fail` path rather than being redelivered forever; `delete` acks it at once and
-`dead_letter` writes it to the DLQ at once). On that `fail` path, once `WithMaxAttempts`
-is reached the body is dead-lettered if `WithDeadLetter` is on — as an empty envelope,
-the raw body is not preserved — and otherwise **deleted with `DeleteMessage`**: it never
-reaches the queue's `RedrivePolicy`, and nothing is logged. To keep such bodies intact in
+decode). A **poison body** (it does not decode, or has no identity) is never retried by the
+`App`: with `WithDeadLetter(true)` (or `StrategyDeadLetter`) it is written to `<queue>.dlq` as
+the ADR-0035 record and then deleted; `StrategyDelete` deletes it at once; and with
+dead-lettering off it is **not deleted and not re-sent** — the transport's
+`SettleNative` capability leaves it to SQS on the first delivery (the event is logged), so
+it becomes visible again after the visibility timeout and the queue's `RedrivePolicy` moves it to the
+native DLQ after `maxReceiveCount` (without a `RedrivePolicy` it is redelivered until the retention
+period ends; ADR-0037 decision 2). A handler failure still follows `WithMaxAttempts` and, once
+exhausted with dead-lettering off, is deleted. To keep such failed bodies intact in
 the broker-side DLQ, set `WithMaxAttempts` above the queue's `maxReceiveCount` — note this is App-wide, so it
 also routes every handler failure to the broker DLQ (raw, without a `dead_letter` block)
 instead of the App's `WithDeadLetter` queue. A failed `ChangeMessageVisibility` (e.g. a missing IAM permission) is
@@ -100,9 +103,12 @@ Anything else is compared as-is — never trimmed — with the version the core 
 `babelqueue:unsupported-schema-version:<v>`. No handler owns that route, so the `App`
 dead-letters the message **directly, with no retry** — whatever `WithMaxAttempts` is (the
 handler is never reached): with `WithDeadLetter(true)` it lands on the dead-letter queue as the
-incoming body, byte-identical (never decoded, no `dead_letter` block), and without
-dead-lettering it is acknowledged (deleted) and dropped. `StrategyDelete` is the one
-exception: it drops the message (acknowledged, no dead-letter record), as in the Python SDK.
+incoming body, byte-identical (never decoded, no `dead_letter` block). Without
+dead-lettering it is **not deleted**: it is left to SQS (no `DeleteMessage`, no re-send; the
+event is logged), so visibility expiry redelivers it — the gate rejects it again — and the
+queue's `RedrivePolicy` moves it to the native DLQ after `maxReceiveCount` (ADR-0037 decision 1,
+rule 3; before, it was acknowledged and dropped). `StrategyDelete` is the one
+exception: it drops the message (acknowledged, no dead-letter record).
 If the dead-letter write itself fails the message is **not** deleted: it stays in the queue
 and becomes visible again after the visibility timeout, and the failure is logged and
 reported to `WithDeadLetterErrorHandler`. A retry could not change the outcome, so none is

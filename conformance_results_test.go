@@ -64,6 +64,10 @@ var sectionRunners = map[string]sectionRunner{
 	"poison_dlq":             {".", "TestPoisonDLQConformance"},
 	"identity_verdict":       {".", "TestConformanceIdentityVerdict"},
 	"pulsar_exhaustion":      {"pulsar", "TestConformancePulsarExhaustion"},
+	"version_gate_pulsar":    {".", "TestVersionGatePulsarConformance"},
+	"version_gate_artemis":   {".", "TestVersionGateArtemisConformance"},
+	"version_gate_sqs":       {"sqs", "TestSqsVersionGateConformance"},
+	"version_gate_asb":       {"azureservicebus", "TestAsbVersionGateConformance"},
 }
 
 // moduleBindings derives the results.json `bindings` from the repo's own Go modules:

@@ -820,3 +820,168 @@ func (o *orderedRewinder) Rewind(context.Context, *babelqueue.ReceivedMessage) e
 	*o.order = append(*o.order, "rewind")
 	return nil
 }
+
+// nativeSettleTransport is a recording transport with the optional NativeSettler capability
+// (what the sqs and azureservicebus modules offer): it hands the App one message, records every
+// re-publish, ack and native settle, and can fail the native call.
+type nativeSettleTransport struct {
+	*babelqueue.InMemoryTransport
+	next      *babelqueue.ReceivedMessage
+	queues    []string
+	bodies    []string
+	acks      int
+	natives   []string // reason of every SettleNative call
+	nativeErr error
+}
+
+func (n *nativeSettleTransport) Pop(context.Context, string, time.Duration) (*babelqueue.ReceivedMessage, error) {
+	m := n.next
+	n.next = nil
+	return m, nil
+}
+
+func (n *nativeSettleTransport) Publish(_ context.Context, queue, body string) error {
+	n.queues = append(n.queues, queue)
+	n.bodies = append(n.bodies, body)
+	return nil
+}
+
+func (n *nativeSettleTransport) Ack(context.Context, *babelqueue.ReceivedMessage) error {
+	n.acks++
+	return nil
+}
+
+func (n *nativeSettleTransport) SettleNative(_ context.Context, _ *babelqueue.ReceivedMessage, reason, _ string) error {
+	n.natives = append(n.natives, reason)
+	return n.nativeErr
+}
+
+// ADR-0037 decision 1 rule 3: with dead-lettering off (and not the dead_letter strategy) a
+// version-gated delivery on a transport with the NativeSettler capability is neither acknowledged
+// nor re-published nor retried: it is left to the broker's native mechanism. delete still acks;
+// dead-lettering on and the dead_letter strategy still write the raw record then ack.
+func TestAppVersionGatedDLQOffIsLeftToTheNativeMechanism(t *testing.T) {
+	const gateRoute = "babelqueue:unsupported-schema-version:2"
+	const raw = `{"job":"urn:babel:orders:created","data":{},"meta":{"schema_version":2}}`
+	cases := []struct {
+		name         string
+		opts         []babelqueue.AppOption
+		wantNative   int
+		wantAcks     int
+		wantRepubDLQ bool
+	}{
+		{"default fail, dlq off", nil, 1, 0, false},
+		{"release, dlq off", []babelqueue.AppOption{babelqueue.WithUnknownURNStrategy(babelqueue.StrategyRelease)}, 1, 0, false},
+		{"explicit fail, max attempts 7, dlq off", []babelqueue.AppOption{babelqueue.WithUnknownURNStrategy(babelqueue.StrategyFail), babelqueue.WithMaxAttempts(7)}, 1, 0, false},
+		{"delete, dlq off acks", []babelqueue.AppOption{babelqueue.WithUnknownURNStrategy(babelqueue.StrategyDelete)}, 0, 1, false},
+		{"fail, dlq on writes raw then acks", []babelqueue.AppOption{babelqueue.WithDeadLetter(true)}, 0, 1, true},
+		{"dead_letter strategy, dlq off flag, writes raw then acks", []babelqueue.AppOption{babelqueue.WithUnknownURNStrategy(babelqueue.StrategyDeadLetter)}, 0, 1, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			tr := &nativeSettleTransport{
+				InMemoryTransport: babelqueue.NewInMemoryTransport(),
+				next:              &babelqueue.ReceivedMessage{Body: raw, Queue: "orders", RouteURN: gateRoute},
+			}
+			app := babelqueue.NewApp(tr, c.opts...)
+			calls := 0
+			app.Handle("urn:babel:orders:created", func(context.Context, babelqueue.Envelope) error { calls++; return nil })
+			if _, err := app.Drain(context.Background(), "orders", 1); err != nil {
+				t.Fatal(err)
+			}
+			if calls != 0 {
+				t.Fatalf("handler ran %d times for a version-gated delivery", calls)
+			}
+			if len(tr.natives) != c.wantNative || tr.acks != c.wantAcks {
+				t.Fatalf("native settles = %v, acks = %d; want %d and %d", tr.natives, tr.acks, c.wantNative, c.wantAcks)
+			}
+			if c.wantNative == 1 && tr.natives[0] != "unsupported schema version" {
+				t.Errorf("native reason = %q, want %q", tr.natives[0], "unsupported schema version")
+			}
+			if c.wantRepubDLQ {
+				if len(tr.queues) != 1 || tr.queues[0] != "orders.dlq" || tr.bodies[0] != raw {
+					t.Errorf("re-published %v %v; want exactly the raw body on orders.dlq", tr.queues, tr.bodies)
+				}
+			} else if len(tr.queues) != 0 {
+				t.Errorf("re-published to %v; nothing may be re-published", tr.queues)
+			}
+		})
+	}
+}
+
+// ADR-0037 decision 2 ("Go and Python"): with dead-lettering off (and not the dead_letter
+// strategy) a poison body - invalid JSON and an identity-less object - on a transport with the
+// NativeSettler capability gets the same native settle on the first delivery: no bounded retry,
+// no empty-envelope re-publish, no ack, nothing dropped.
+func TestAppPoisonDLQOffIsLeftToTheNativeMechanism(t *testing.T) {
+	for _, body := range []string{"not json at all", `{"data":{"a":1}}`, `{"job":"","data":{}}`, `[1,2]`} {
+		for _, strategy := range []string{babelqueue.StrategyFail, babelqueue.StrategyRelease} {
+			t.Run(strategy+" "+body, func(t *testing.T) {
+				tr := &nativeSettleTransport{
+					InMemoryTransport: babelqueue.NewInMemoryTransport(),
+					next:              &babelqueue.ReceivedMessage{Body: body, Queue: "orders"},
+				}
+				app := babelqueue.NewApp(tr, babelqueue.WithMaxAttempts(5), babelqueue.WithUnknownURNStrategy(strategy))
+				if _, err := app.Drain(context.Background(), "orders", 1); err != nil {
+					t.Fatal(err)
+				}
+				if len(tr.natives) != 1 || tr.natives[0] != "poison" || tr.acks != 0 || len(tr.queues) != 0 {
+					t.Fatalf("natives = %v acks = %d re-published = %v; want one \"poison\" native settle and nothing else",
+						tr.natives, tr.acks, tr.queues)
+				}
+			})
+		}
+	}
+
+	t.Run("delete strategy still drops with an ack", func(t *testing.T) {
+		tr := &nativeSettleTransport{
+			InMemoryTransport: babelqueue.NewInMemoryTransport(),
+			next:              &babelqueue.ReceivedMessage{Body: "not json", Queue: "orders"},
+		}
+		app := babelqueue.NewApp(tr, babelqueue.WithUnknownURNStrategy(babelqueue.StrategyDelete))
+		if _, err := app.Drain(context.Background(), "orders", 1); err != nil {
+			t.Fatal(err)
+		}
+		if len(tr.natives) != 0 || tr.acks != 1 || len(tr.queues) != 0 {
+			t.Fatalf("natives = %v acks = %d re-published = %v; want an ack only", tr.natives, tr.acks, tr.queues)
+		}
+	})
+
+	for name, opts := range map[string][]babelqueue.AppOption{
+		"dlq on":                      {babelqueue.WithDeadLetter(true)},
+		"dead_letter strategy":        {babelqueue.WithUnknownURNStrategy(babelqueue.StrategyDeadLetter)},
+		"dlq on and release strategy": {babelqueue.WithDeadLetter(true), babelqueue.WithUnknownURNStrategy(babelqueue.StrategyRelease)},
+	} {
+		t.Run(name+" writes the ADR-0035 record then acks", func(t *testing.T) {
+			tr := &nativeSettleTransport{
+				InMemoryTransport: babelqueue.NewInMemoryTransport(),
+				next:              &babelqueue.ReceivedMessage{Body: "not json", Queue: "orders"},
+			}
+			app := babelqueue.NewApp(tr, opts...)
+			if _, err := app.Drain(context.Background(), "orders", 1); err != nil {
+				t.Fatal(err)
+			}
+			if len(tr.natives) != 0 || tr.acks != 1 || len(tr.queues) != 1 || tr.queues[0] != "orders.dlq" {
+				t.Fatalf("natives = %v acks = %d re-published = %v; want one orders.dlq record and an ack", tr.natives, tr.acks, tr.queues)
+			}
+			if !strings.Contains(tr.bodies[0], `"reason":"poison"`) || !strings.Contains(tr.bodies[0], "not json") {
+				t.Errorf("DLQ record = %s; want the ADR-0035 poison record carrying the raw body", tr.bodies[0])
+			}
+		})
+	}
+
+	t.Run("a failing native call neither acks nor re-publishes", func(t *testing.T) {
+		tr := &nativeSettleTransport{
+			InMemoryTransport: babelqueue.NewInMemoryTransport(),
+			next:              &babelqueue.ReceivedMessage{Body: "not json", Queue: "orders"},
+			nativeErr:         errors.New("broker unavailable"),
+		}
+		app := babelqueue.NewApp(tr)
+		if _, err := app.Drain(context.Background(), "orders", 1); err != nil {
+			t.Fatal(err)
+		}
+		if len(tr.natives) != 1 || tr.acks != 0 || len(tr.queues) != 0 {
+			t.Fatalf("natives = %v acks = %d re-published = %v", tr.natives, tr.acks, tr.queues)
+		}
+	})
+}

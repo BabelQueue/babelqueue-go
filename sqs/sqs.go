@@ -24,8 +24,10 @@
 // the core's supported version is version-gated (§3.7): the body is not decoded and the message
 // is routed to a reserved unsupported-version URN no handler owns, so the App
 // dead-letters it directly, with no retry (whatever the unknown-URN strategy, StrategyRelease
-// included), or drops it when dead-lettering is off. The optional [OnSchemaVersionRejected] hook
-// names the rejected version.
+// included). With dead-lettering off it is not deleted: the transport's [Transport.SettleNative]
+// leaves it to SQS (visibility expiry redelivers it, the queue's RedrivePolicy moves it to the
+// native DLQ after maxReceiveCount); a poison body takes the same native settle on the first
+// delivery. The optional [OnSchemaVersionRejected] hook names the rejected version.
 //
 // Full spec: https://babelqueue.com
 package sqs
@@ -406,6 +408,18 @@ func (t *Transport) Ack(ctx context.Context, msg *babelqueue.ReceivedMessage) er
 	return err
 }
 
+// SettleNative implements [babelqueue.NativeSettler] (ADR-0037 decisions 1 and 2): a
+// version-gated delivery or a poison body that the App may neither process nor drop, with
+// dead-lettering off, is left to SQS itself. It deliberately does nothing: no DeleteMessage, no
+// ChangeMessageVisibility, no re-send. The message becomes visible again when its visibility
+// timeout lapses (the gate or the poison check rejects it again), and the queue's RedrivePolicy
+// moves it to the native DLQ once maxReceiveCount is reached; without a RedrivePolicy it is
+// redelivered until the retention period ends. The body and its attributes are never touched, and
+// the App has already logged the event.
+func (t *Transport) SettleNative(context.Context, *babelqueue.ReceivedMessage, string, string) error {
+	return nil
+}
+
 func (t *Transport) resolveURL(ctx context.Context, name string) (string, error) {
 	t.mu.Lock()
 	if u, ok := t.urls[name]; ok {
@@ -553,6 +567,7 @@ var (
 	_ babelqueue.Transport       = (*Transport)(nil)
 	_ babelqueue.HeaderPublisher = (*Transport)(nil)
 	_ babelqueue.Releaser        = (*Transport)(nil)
+	_ babelqueue.NativeSettler   = (*Transport)(nil)
 	_ VisibilityAPI              = (*awssqs.Client)(nil)
 )
 
