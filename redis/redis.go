@@ -493,16 +493,22 @@ func (t *Transport) reserveZset(ctx context.Context, queue string, now float64) 
 	}
 	job, _ := res[0].(string)
 	reserved, _ := res[1].(string)
+	return zsetMessage(queue, job, reserved), nil
+}
+
+// zsetMessage builds the delivery for a zset-layout reservation from the reserve script's answer
+// (job: the popped head, reserved: the member now in :reserved). It decides Poison.
+func zsetMessage(queue, job, reserved string) *babelqueue.ReceivedMessage {
 	return &babelqueue.ReceivedMessage{
 		Body:          job,
 		Queue:         queue,
 		Handle:        zsetHandle{job: job, reserved: reserved},
 		DeliveryCount: deliveryCount(job, reserved),
 		Poison:        isPoisonHead(job, reserved),
-	}, nil
+	}
 }
 
-// isPoisonHead reports whether a zset reservation is poison. Two sources, both dead-lettered by the
+// isPoisonHead reports whether a zset reservation is poison. Four sources, all dead-lettered by the
 // App raw and gated, in every configuration:
 //   - A1: the reserve script returned {job, job} for a head it could not decode or re-encode (cjson
 //     failure, attempts not a number).
@@ -513,24 +519,27 @@ func (t *Transport) reserveZset(ctx context.Context, queue string, now float64) 
 //   - The stored bytes are not valid UTF-8 (binding §1.1 "Invalid UTF-8"): even when cjson and the
 //     codec could decode such a body, it is never handed to a handler, retried or re-published; it
 //     is dead-lettered as the ADR-0035 base64 wrapper by its exact bytes.
-//
-// An identity-less body (ErrNoIdentity) is not poison here: it decodes, and the App decides.
+//   - An identity-less body (neither a valid job nor a valid urn, [babelqueue.ErrNoIdentity]):
+//     ADR-0036 decision 4, binding §1.1 "Identity-less body". It is poison like the others and is
+//     never routed as an unknown URN, so on_unknown_urn: delete and a disabled dead-letter have no
+//     effect on it.
 func isPoisonHead(job, reserved string) bool {
 	if job == reserved || !utf8.ValidString(job) || !utf8.ValidString(reserved) {
 		return true
 	}
-	return !decodesForRelease(job)
+	return !decodesWithIdentity(job)
 }
 
-// decodesForRelease is true when raw decodes into an envelope the SDK codec can re-encode
-// (identity-less bodies included, which the App routes itself).
+// decodesWithIdentity is true when raw decodes into an envelope with a valid identity (a valid job
+// or urn alias, ADR-0032 §6). A body the codec rejects, and an identity-less body
+// ([babelqueue.ErrNoIdentity]), are both poison (ADR-0036 decision 4).
 //
 // It runs once per reservation and the App decodes the same body again right after: the extra
 // parse is the price of classifying poison where the bytes are still raw. The cost is measured
-// by BenchmarkDecodesForRelease and is small next to the Redis round trip of the reserve.
-func decodesForRelease(raw string) bool {
+// by BenchmarkDecodesWithIdentity and is small next to the Redis round trip of the reserve.
+func decodesWithIdentity(raw string) bool {
 	_, err := babelqueue.Decode([]byte(raw))
-	return err == nil || errors.Is(err, babelqueue.ErrNoIdentity)
+	return err == nil
 }
 
 // deliveryCount is the attempt count of a zset reservation: the head's attempts plus one. A
@@ -574,8 +583,8 @@ func (t *Transport) reserveLegacy(ctx context.Context, queue string, now float64
 // bytes. Flagged, it is dead-lettered raw through the gated [Transport.DeadLetter] on the first
 // delivery in every configuration (binding §1.1: poison instead of loss), the same route the
 // zset layout uses. A stored value that is not valid UTF-8 is poison too, even when the codec can
-// decode it (binding §1.1 "Invalid UTF-8"). An identity-less body (ErrNoIdentity) is not poison;
-// the App decides.
+// decode it (binding §1.1 "Invalid UTF-8"). An identity-less body (ErrNoIdentity) is poison too
+// (ADR-0036 decision 4, binding §1.1 "Identity-less body"), in every configuration.
 func (t *Transport) legacyMessage(queue, raw, token string) *babelqueue.ReceivedMessage {
 	if !utf8.ValidString(raw) {
 		// Invalid UTF-8 is poison (binding §1.1 K-G). Do not unframe: decoding the frame's JSON
@@ -594,7 +603,7 @@ func (t *Transport) legacyMessage(queue, raw, token string) *babelqueue.Received
 		Queue:   queue,
 		Handle:  legacyHandle{raw: raw, token: token},
 		Headers: headers,
-		Poison:  !decodesForRelease(body),
+		Poison:  !decodesWithIdentity(body),
 	}
 }
 

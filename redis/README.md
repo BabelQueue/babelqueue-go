@@ -51,10 +51,13 @@ layout stays the Go-owned reliable queue below.
   with `attempts+1`. There is no push-and-ack fallback.
 - **Undecodable bodies (poison, binding section 1.1):** a head the reserve script flags (`{job, job}`
   answer) and a body the core codec rejects (string `meta`/`data`, numeric `trace_id`, fractional
-  `attempts`) are flagged `Poison`. The `App` writes the raw body, untouched, to `<q>.dlq` through the
-  reservation-gated `DeadLetter`, on the first delivery and in every configuration (also with dead-lettering
-  off, any retry strategy). `Release` returns `ErrReleaseUnsupported` for such a body and never re-encodes
-  it, so it is never lost and never loops.
+  `attempts`) are flagged `Poison`, and so is an **identity-less body** (neither a valid `job` nor a valid
+  `urn`; ADR-0036 decision 4, binding section 1.1 "Identity-less body"): it is no unknown URN, so
+  `on_unknown_urn: delete` and a disabled dead-letter have no effect on it. The `App` writes the raw body,
+  untouched, to `<q>.dlq` (ADR-0035 record, `reason: "poison"`) through the reservation-gated `DeadLetter`,
+  on the first delivery and in every configuration (also with dead-lettering off, any retry strategy).
+  `Release` returns `ErrReleaseUnsupported` for such a body and never re-encodes it, so it is never lost and
+  never loops.
 - **Migration** runs before every pop: due `:delayed` members first, then expired `:reserved` members
   (score <= `floor(now)`), `WithMigrationBatchSize(n)` bounds one migrate (default: unbounded). An expired
   `:reserved` member goes back to `<q>` and counts as an attempt.
@@ -85,8 +88,9 @@ set `<q>:processing:deadlines` whose members are `<32 lowercase hex token>:<raw 
 - **Undecodable bodies (poison, binding section 1.1):** a body the core codec rejects (not JSON, wrong
   field types) is flagged `Poison` on delivery. The `App` writes the raw body to `<q>.dlq` through the
   deadline-gated `DeadLetter`, on the first delivery and in every configuration (also with dead-lettering
-  off, any retry strategy), so it is never lost and never redelivered. An identity-less body that does
-  decode is not poison. `Release` returns `ErrReleaseUnsupported` for an undecodable body (this layout has
+  off, any retry strategy), so it is never lost and never redelivered. An identity-less body (neither a valid
+  `job` nor a valid `urn`) is poison too (ADR-0036 decision 4), also under `on_unknown_urn: delete`.
+  `Release` returns `ErrReleaseUnsupported` for an undecodable body (this layout has
   no delivery counter, so a verbatim re-queue would loop forever); the `App` does not reach that branch for
   a flagged body.
 

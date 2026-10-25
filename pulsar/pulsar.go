@@ -275,7 +275,16 @@ func (t *Transport) Pop(ctx context.Context, queue string, timeout time.Duration
 		return &babelqueue.ReceivedMessage{Body: string(msg.Payload()), Queue: queue, Handle: msg, RouteURN: gateRoute(v, msg.Properties())}, nil
 	}
 	body, routeURN := reconcile(string(msg.Payload()), msg.Properties(), msg.RedeliveryCount(), t.onMismatch)
-	return &babelqueue.ReceivedMessage{Body: body, Queue: queue, Handle: msg, RouteURN: routeURN}, nil
+	// A body that does not decode (or has no identity) cannot carry the reconciled count in its
+	// own attempts, so the count travels as the delivery count: the App takes DeliveryCount-1 as
+	// the floor of the attempts, which keeps the bounded retry of a poison body terminating
+	// (ADR-0036 decision 2). Pulsar's redelivery count is 0-based and bq-attempts is
+	// authoritative (§5.5), so the floor is the larger of the two and the delivery is one more.
+	floor := int(msg.RedeliveryCount())
+	if n, ok := parseAttempts(msg.Properties()["bq-attempts"]); ok && n > floor {
+		floor = n
+	}
+	return &babelqueue.ReceivedMessage{Body: body, Queue: queue, Handle: msg, RouteURN: routeURN, DeliveryCount: floor + 1}, nil
 }
 
 // Rewind hands a reserved message back to the broker with a negative acknowledgement, so it is

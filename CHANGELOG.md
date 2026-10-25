@@ -9,6 +9,54 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [redis 1.4.0, pulsar 1.4.0] - 2026-10-25
+
+Implements conformance **1.7.0** (vendored from the `v1.7.0` release asset, verified with `fetch.sh --check`;
+`BQ_CONFORMANCE_VERSION` is now `1.7.0` in `ci.yml` and `release.yml`). The envelope stays at
+`schema_version: 1`; nothing here touches the wire (ADR-0036).
+
+### Changed
+
+- **`redis` module: an identity-less body is poison on both layouts (ADR-0036 decision 4, binding §1.1
+  "Identity-less body").** A body that decodes but has neither a valid `job` nor a valid `urn`
+  (`babelqueue.ErrNoIdentity`) used to be left to the `App`, which routed it as an unknown URN: dropped under
+  `on_unknown_urn: delete`, retried and then dropped with dead-lettering off. The transport now flags it
+  `ReceivedMessage.Poison` (zset and legacy `:processing` layout), so the `App` dead-letters it through
+  `settleTransportPoison` as the ADR-0035 record (`reason: "poison"`, body spliced untouched) on the first
+  delivery in **every** configuration. The handler never runs and nothing is retried. A valid envelope whose
+  URN has no handler is unaffected. **Behaviour change** for the `redis` module (MINOR): a deployment that
+  relied on `delete` or a disabled dead-letter to discard identity-less bodies now finds them in `<queue>.dlq`.
+  The core `App` is unchanged.
+
+- **`pulsar` module: a poison body is bounded across redeliveries (ADR-0036 decision 2).** `Pop` now sets
+  `ReceivedMessage.DeliveryCount` to the reconciled count plus one (`bq-attempts`, floored by the native
+  redelivery count). A body that does not decode, or has no identity, cannot carry the counter itself, so
+  before this the `App` saw 0 attempts on every redelivery: with dead-lettering off, a poison body was
+  re-published instead of dropped at `WithMaxAttempts`. Decodable bodies are unaffected (their `attempts`
+  already carried the count; the floor only adds the delivery number). Conformance `pulsar_exhaustion`
+  (`poison-reconciled-2-dlq-off-drops` and two more) pins it.
+
+### Added
+
+- Conformance runners for the two 1.7.0 sections: `identity_verdict` (core, `TestConformanceIdentityVerdict`)
+  and `pulsar_exhaustion` (`pulsar` module, `TestConformancePulsarExhaustion`, drives the real Pulsar transport
+  and the `App`), both registered in the `TestConformanceResults` writer.
+
+### Fixed
+
+- `TestCodecOverheadWithinBudget` (GR-8) no longer divides the codec's marginal cost by a fixed 750 µs. The
+  reference round-trip is scaled by the runner's own speed (the bare-JSON baseline measured in the same process,
+  against its cost on the calibration machine), the two paths are measured alternately and 7 rounds are taken.
+  The 2%-of-750 µs budget keeps its meaning on the calibration machine and a codec that slows down relative to
+  plain JSON still fails; a slow or contended runner no longer does. R1 measured 1.0 to 2.09% on CI with the
+  fixed reference (envelope/bare ratio 4.5 to 4.8x each time); the scaled gate reads about 0.8% on a dev machine and 0.8 to 1.0% under heavy CPU contention.
+
+### Release note for the transport modules
+
+No core tag: the core changed only in tests, CI and the vendored conformance suite. Tag the two changed
+modules as MINORs: `redis/v1.4.0` (identity-less poison behaviour change) and `pulsar/v1.4.0` (bounded poison
+redelivery). The other modules are unchanged and keep their pins.
+
 ## [1.17.0] - 2026-10-24
 
 Implements conformance **1.6.0** (vendored from the local, untagged `conformance/` copy until the tag is

@@ -980,3 +980,38 @@ func TestRewindNacksThePulsarMessageAndIgnoresForeignHandles(t *testing.T) {
 		t.Fatalf("a foreign handle was nacked; nacked = %d", len(consumer.nacked))
 	}
 }
+
+// DeliveryCount carries the reconciled count (bq-attempts, floored by the native redelivery
+// count) as a 1-based delivery number, so the App's attempts floor holds for a body that cannot
+// carry the counter itself (an undecodable or identity-less body).
+func TestPopSetsDeliveryCountFromBqAttemptsAndRedelivery(t *testing.T) {
+	cases := []struct {
+		name       string
+		props      map[string]string
+		redelivery uint32
+		want       int
+	}{
+		{"first delivery", nil, 0, 1},
+		{"redelivery count", nil, 2, 3},
+		{"bq-attempts", map[string]string{"bq-attempts": "2"}, 0, 3},
+		{"redelivery above bq-attempts", map[string]string{"bq-attempts": "1"}, 4, 5},
+		{"invalid bq-attempts is ignored", map[string]string{"bq-attempts": "abc"}, 1, 2},
+	}
+	for _, c := range cases {
+		for _, body := range []string{"not-json", `{"data":{}}`, sampleBody(t)} {
+			t.Run(c.name+"/"+body[:min(len(body), 8)], func(t *testing.T) {
+				consumer := &fakeConsumer{messages: []pulsarsdk.Message{
+					fakeMessage{payload: []byte(body), redeliveryCount: c.redelivery, properties: c.props},
+				}}
+				tr, _ := New(WithClient(&fakeClient{producer: &fakeProducer{}, consumer: consumer}))
+				got, err := tr.Pop(context.Background(), "orders", 0)
+				if err != nil || got == nil {
+					t.Fatalf("Pop = (%v, %v)", got, err)
+				}
+				if got.DeliveryCount != c.want {
+					t.Errorf("DeliveryCount = %d, want %d (body %q)", got.DeliveryCount, c.want, body)
+				}
+			})
+		}
+	}
+}

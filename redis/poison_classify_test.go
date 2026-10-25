@@ -26,11 +26,18 @@ func TestIsPoisonHeadClassifiesCodecRejectedBodies(t *testing.T) {
 		"json array":        `[1,2]`,
 		"string attempts":   `{"job":"urn:x","attempts":"1"}`,
 		"unterminated json": `{"job":`,
+		// ADR-0036 decision 4 (K-E): an identity-less body is poison, not an unknown URN.
+		"no identity":            `{"attempts":0,"data":{}}`,
+		"job number, no urn":     `{"job":5,"attempts":0}`,
+		"job blank, no urn":      `{"job":" \t","attempts":0}`,
+		"urn number, no job":     `{"urn":5,"attempts":0}`,
+		"job and urn both blank": `{"job":"","urn":"  ","attempts":0}`,
+		"bare null":              `null`,
 	}
 	for name, body := range poison {
 		t.Run("poison/"+name, func(t *testing.T) {
-			if decodesForRelease(body) {
-				t.Fatalf("decodesForRelease(%q) = true, want false (core Decode must reject it)", body)
+			if decodesWithIdentity(body) {
+				t.Fatalf("decodesWithIdentity(%q) = true, want false (core Decode must reject it)", body)
 			}
 			if !isPoisonHead(body, body+"-incremented") {
 				t.Fatalf("isPoisonHead(%q) = false, want true", body)
@@ -39,15 +46,17 @@ func TestIsPoisonHeadClassifiesCodecRejectedBodies(t *testing.T) {
 	}
 
 	ok := map[string]string{
-		"full envelope": `{"job":"urn:bq:orders:created","trace_id":"t","data":{"n":1},"meta":{"id":"i","queue":"orders","lang":"go","schema_version":1,"created_at":1},"attempts":0}`,
-		"minimal":       `{"job":"urn:x","attempts":0}`,
-		"no identity":   `{"attempts":0,"data":{}}`,
-		"missing tries": `{"job":"urn:x"}`,
+		"full envelope":   `{"job":"urn:bq:orders:created","trace_id":"t","data":{"n":1},"meta":{"id":"i","queue":"orders","lang":"go","schema_version":1,"created_at":1},"attempts":0}`,
+		"minimal":         `{"job":"urn:x","attempts":0}`,
+		"missing tries":   `{"job":"urn:x"}`,
+		"urn alias":       `{"urn":"urn:x","attempts":0}`,
+		"blank job, urn":  `{"job":" ","urn":"urn:x","attempts":0}`,
+		"job number, urn": `{"job":5,"urn":"urn:x","attempts":0}`,
 	}
 	for name, body := range ok {
 		t.Run("not-poison/"+name, func(t *testing.T) {
-			if !decodesForRelease(body) {
-				t.Fatalf("decodesForRelease(%q) = false, want true", body)
+			if !decodesWithIdentity(body) {
+				t.Fatalf("decodesWithIdentity(%q) = false, want true", body)
 			}
 			if isPoisonHead(body, body+"-incremented") {
 				t.Fatalf("isPoisonHead(%q) = true, want false", body)
@@ -58,7 +67,7 @@ func TestIsPoisonHeadClassifiesCodecRejectedBodies(t *testing.T) {
 	// Binding §1.1 "Invalid UTF-8": a body the codec decodes (U+FFFD) but whose stored bytes are not
 	// valid UTF-8 is poison in the zset layout too, whichever of job / reserved carries the byte.
 	badUTF8 := "{\"job\":\"urn:x\",\"attempts\":0,\"data\":{\"n\":\"\xff\"}}"
-	if !decodesForRelease(badUTF8) {
+	if !decodesWithIdentity(badUTF8) {
 		t.Fatal("precondition: the core codec decodes this body (that is why the transport must classify it)")
 	}
 	if !isPoisonHead(badUTF8, strings.Replace(badUTF8, `"attempts":0`, `"attempts":1`, 1)) {
@@ -109,13 +118,13 @@ func TestZsetReleaseOfUndecodableBodyIsUnsupported(t *testing.T) {
 	}
 }
 
-// BenchmarkDecodesForRelease measures the per-reservation cost of classifying a body in the
+// BenchmarkDecodesWithIdentity measures the per-reservation cost of classifying a body in the
 // transport (a second parse next to the App's own Decode).
-func BenchmarkDecodesForRelease(b *testing.B) {
+func BenchmarkDecodesWithIdentity(b *testing.B) {
 	body := `{"job":"urn:bq:orders:created","trace_id":"t","data":{"order_id":42,"items":[1,2,3]},"meta":{"id":"i","queue":"orders","lang":"go","schema_version":1,"created_at":1},"attempts":0}`
 	b.ReportAllocs()
 	for i := 0; i < b.N; i++ {
-		if !decodesForRelease(body) {
+		if !decodesWithIdentity(body) {
 			b.Fatal("body must decode")
 		}
 	}
