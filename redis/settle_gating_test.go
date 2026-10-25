@@ -70,6 +70,10 @@ func TestZsetPoisonThroughAppGoesToDLQRaw(t *testing.T) {
 		`{"job":"urn:bq:orders:created","attempts":"3"}`,
 		`{"job":"urn:bq:orders:created","attempts":null,"data":{"id":1}}`,
 		`{"job":"urn:bq:orders:created","data":{"id":2}}`,
+		// ADR-0036 decision 4: identity-less bodies are poison too, under delete and with
+		// dead-lettering off (the default here), where they used to be dropped / retried.
+		`{"attempts":0,"data":{"id":3}}`,
+		`{"job":5,"urn":" ","attempts":0}`,
 	}
 	for _, strategy := range []string{babelqueue.StrategyFail, babelqueue.StrategyDelete, babelqueue.StrategyRelease} {
 		t.Run(strategy, func(t *testing.T) {
@@ -350,37 +354,41 @@ func TestZsetCodecRejectedBodiesGoToDLQRaw(t *testing.T) {
 // stays in the queue, :processing or the deadline set. Before the original fix Release re-queued it
 // verbatim and it looped forever; before the Poison flag it was dropped after 3 deliveries.
 func TestLegacyUndecodableBodyIsBoundedThroughApp(t *testing.T) {
-	for _, body := range []string{`not-json`, `{"job":"urn:x","attempts":0,"meta":"x"}`} {
-		t.Run(body, func(t *testing.T) {
-			f := newLive(t)
-			tr := f.transport()
-			if err := tr.Publish(f.ctx, f.queue, body); err != nil {
-				t.Fatal(err)
-			}
-			app := babelqueue.NewApp(tr)
-			// Far above one delivery: an unbounded loop would consume the whole cap.
-			processed, err := app.Drain(f.ctx, f.queue, 20)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if processed != 1 {
-				t.Fatalf("processed %d deliveries, want exactly 1 (poison goes straight to the DLQ)", processed)
-			}
-			dlq, _ := f.c.LRange(f.ctx, tr.Keys(f.queue+".dlq").Ready, 0, -1).Result()
-			if len(dlq) != 1 {
-				t.Fatalf("dlq = %q, want exactly one poison record (never silently dropped)", dlq)
-			}
-			assertPoisonRecord(t, dlq[0], body, f.queue)
-			k := tr.Keys(f.queue)
-			if n, _ := f.c.LLen(f.ctx, k.Ready).Result(); n != 0 {
-				t.Fatalf("ready length = %d, want 0", n)
-			}
-			if n, _ := f.c.LLen(f.ctx, tr.processing(f.queue)).Result(); n != 0 {
-				t.Fatalf(":processing residue: %d", n)
-			}
-			if n, _ := f.c.ZCard(f.ctx, tr.deadlines(f.queue)).Result(); n != 0 {
-				t.Fatalf("deadline residue: %d", n)
-			}
-		})
+	// The identity-less body (ADR-0036 decision 4) takes the same route, also under delete.
+	bodies := []string{`not-json`, `{"job":"urn:x","attempts":0,"meta":"x"}`, `{"attempts":0,"data":{"id":3}}`}
+	for _, body := range bodies {
+		for _, strategy := range []string{babelqueue.StrategyFail, babelqueue.StrategyDelete} {
+			t.Run(strategy+"/"+body, func(t *testing.T) {
+				f := newLive(t)
+				tr := f.transport()
+				if err := tr.Publish(f.ctx, f.queue, body); err != nil {
+					t.Fatal(err)
+				}
+				app := babelqueue.NewApp(tr, babelqueue.WithUnknownURNStrategy(strategy))
+				// Far above one delivery: an unbounded loop would consume the whole cap.
+				processed, err := app.Drain(f.ctx, f.queue, 20)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if processed != 1 {
+					t.Fatalf("processed %d deliveries, want exactly 1 (poison goes straight to the DLQ)", processed)
+				}
+				dlq, _ := f.c.LRange(f.ctx, tr.Keys(f.queue+".dlq").Ready, 0, -1).Result()
+				if len(dlq) != 1 {
+					t.Fatalf("dlq = %q, want exactly one poison record (never silently dropped)", dlq)
+				}
+				assertPoisonRecord(t, dlq[0], body, f.queue)
+				k := tr.Keys(f.queue)
+				if n, _ := f.c.LLen(f.ctx, k.Ready).Result(); n != 0 {
+					t.Fatalf("ready length = %d, want 0", n)
+				}
+				if n, _ := f.c.LLen(f.ctx, tr.processing(f.queue)).Result(); n != 0 {
+					t.Fatalf(":processing residue: %d", n)
+				}
+				if n, _ := f.c.ZCard(f.ctx, tr.deadlines(f.queue)).Result(); n != 0 {
+					t.Fatalf("deadline residue: %d", n)
+				}
+			})
+		}
 	}
 }
