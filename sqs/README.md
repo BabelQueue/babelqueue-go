@@ -74,8 +74,9 @@ A zero delay means a message that always fails is redelivered in a tight loop un
 the App's `WithMaxAttempts` is reached (counted from `ApproximateReceiveCount`, surfaced
 as `ReceivedMessage.DeliveryCount` — so the bound also holds for a body that does not
 decode). A **poison body** (it does not decode, or has no identity) is never retried by the
-`App`: with `WithDeadLetter(true)` (or `StrategyDeadLetter`) it is written to `<queue>.dlq` as
-the ADR-0035 record and then deleted; `StrategyDelete` deletes it at once; and with
+`App`: with `WithDeadLetter(true)` (or `StrategyDeadLetter`) it is written to the dead-letter queue as
+the ADR-0035 record and then deleted (on SQS that queue is `<queue>-dlq` by default, FIFO `<queue>-dlq.fifo`: a queue name cannot
+contain a dot; `WithDeadLetterQueue` on the `App` overrides it, and `WithDeadLetterSuffix` replaces `-dlq`, placed before `.fifo` on a FIFO queue); `StrategyDelete` deletes it at once; and with
 dead-lettering off it is **not deleted and not re-sent** — the transport's
 `SettleNative` capability leaves it to SQS on the first delivery (the event is logged), so
 it becomes visible again after the visibility timeout and the queue's `RedrivePolicy` moves it to the

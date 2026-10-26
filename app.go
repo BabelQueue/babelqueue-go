@@ -34,17 +34,20 @@ type App struct {
 	deadLetter       bool
 	deadLetterQueue  string
 	deadLetterSuffix string
-	pollTimeout      time.Duration
-	retryBackoff     time.Duration
-	retryMultiplier  float64
-	retryBackoffMax  time.Duration
-	retryJitter      RetryJitter
-	unknownURNDelay  time.Duration
-	onAckError       func(ctx context.Context, msg *ReceivedMessage, err error)
-	onReleaseError   func(ctx context.Context, msg *ReceivedMessage, err error)
-	onDeadLetterErr  func(ctx context.Context, msg *ReceivedMessage, err error)
-	rewindPause      time.Duration
-	handlers         map[string]Handler
+	// deadLetterSuffixSet records an explicit WithDeadLetterSuffix, which a transport's
+	// DeadLetterNamer receives instead of choosing its own default.
+	deadLetterSuffixSet bool
+	pollTimeout         time.Duration
+	retryBackoff        time.Duration
+	retryMultiplier     float64
+	retryBackoffMax     time.Duration
+	retryJitter         RetryJitter
+	unknownURNDelay     time.Duration
+	onAckError          func(ctx context.Context, msg *ReceivedMessage, err error)
+	onReleaseError      func(ctx context.Context, msg *ReceivedMessage, err error)
+	onDeadLetterErr     func(ctx context.Context, msg *ReceivedMessage, err error)
+	rewindPause         time.Duration
+	handlers            map[string]Handler
 }
 
 // AppOption customizes NewApp.
@@ -74,9 +77,10 @@ func WithDeadLetterQueue(queue string) AppOption {
 }
 
 // WithDeadLetterSuffix sets the suffix appended to the source queue to derive the
-// dead-letter queue name (default ".dlq").
+// dead-letter queue name (default ".dlq"; on Amazon SQS the transport's [DeadLetterNamer] gives
+// "<queue>-dlq", FIFO "<queue>-dlq.fifo", and places an explicit suffix before ".fifo" too).
 func WithDeadLetterSuffix(suffix string) AppOption {
-	return func(a *App) { a.deadLetterSuffix = suffix }
+	return func(a *App) { a.deadLetterSuffix, a.deadLetterSuffixSet = suffix, true }
 }
 
 // WithPollTimeout sets how long Pop blocks waiting for a message each iteration
@@ -804,6 +808,13 @@ func (a *App) deadLetterMessage(ctx context.Context, msg *ReceivedMessage, env E
 func (a *App) deadLetterTarget(msg *ReceivedMessage) string {
 	if a.deadLetterQueue != "" {
 		return a.deadLetterQueue
+	}
+	if n, ok := a.transport.(DeadLetterNamer); ok {
+		suffix := ""
+		if a.deadLetterSuffixSet {
+			suffix = a.deadLetterSuffix
+		}
+		return n.DeadLetterQueueName(msg.Queue, suffix)
 	}
 	return msg.Queue + a.deadLetterSuffix
 }

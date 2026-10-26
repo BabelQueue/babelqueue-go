@@ -318,7 +318,7 @@ func TestSqsVersionGateConformance(t *testing.T) {
 						t.Fatalf("ChangeMessageVisibility called %d times: a version-gated delivery is never released", len(fake.visibility))
 					}
 					for _, s := range fake.sent {
-						if aws.ToString(s.QueueUrl) != "http://fake/orders.dlq" {
+						if aws.ToString(s.QueueUrl) != "http://fake/orders-dlq" {
 							t.Fatalf("sent to %s: only the DLQ may be written", aws.ToString(s.QueueUrl))
 						}
 					}

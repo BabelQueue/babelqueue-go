@@ -420,6 +420,23 @@ func (t *Transport) SettleNative(context.Context, *babelqueue.ReceivedMessage, s
 	return nil
 }
 
+// DeadLetterQueueName implements [babelqueue.DeadLetterNamer]: the BabelQueue DLQ of an SQS queue is
+// "<queue>-dlq" by default and, for a FIFO queue, "<queue>-dlq.fifo". An explicit suffix (set with
+// [babelqueue.WithDeadLetterSuffix]; "" means none) replaces "-dlq" and is placed before ".fifo" as
+// well: an SQS FIFO queue name must end in ".fifo", so "orders.fifo" + "-x" is "orders-x.fifo", never
+// "orders.fifo-x". An SQS queue name may hold only alphanumerics, hyphens and underscores (plus that
+// one ".fifo" suffix), so the runtime-wide default "<queue>.dlq" cannot be created on SQS (ADR-0037
+// decision 7). An explicit [babelqueue.WithDeadLetterQueue] overrides all of it.
+func (t *Transport) DeadLetterQueueName(queue, suffix string) string {
+	if suffix == "" {
+		suffix = "-dlq"
+	}
+	if base, ok := strings.CutSuffix(queue, ".fifo"); ok {
+		return base + suffix + ".fifo"
+	}
+	return queue + suffix
+}
+
 func (t *Transport) resolveURL(ctx context.Context, name string) (string, error) {
 	t.mu.Lock()
 	if u, ok := t.urls[name]; ok {
@@ -568,6 +585,7 @@ var (
 	_ babelqueue.HeaderPublisher = (*Transport)(nil)
 	_ babelqueue.Releaser        = (*Transport)(nil)
 	_ babelqueue.NativeSettler   = (*Transport)(nil)
+	_ babelqueue.DeadLetterNamer = (*Transport)(nil)
 	_ VisibilityAPI              = (*awssqs.Client)(nil)
 )
 

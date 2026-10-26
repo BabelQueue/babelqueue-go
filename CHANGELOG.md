@@ -59,6 +59,19 @@ version that contains `NativeSettler` then.
   now runs `go build`, `go vet` and `go test -race` in that module's directory; before, only the core's tests
   ran, so a module could be tagged without its own tests. The core tag (`v*`) is unchanged.
 
+- **`sqs`: the default dead-letter queue name is now `<queue>-dlq` (FIFO `<queue>-dlq.fifo`) (ADR-0037
+  decision 7).** The old default `<queue>.dlq` was never a valid Amazon SQS queue name (a name may hold only
+  alphanumerics, hyphens and underscores, plus one `.fifo` suffix), so a DLQ write by default could not find a
+  queue on real SQS. The core gains the optional `DeadLetterNamer` transport capability
+  (`DeadLetterQueueName(queue, suffix)`); the `App` asks it for the DLQ name unless `WithDeadLetterQueue` was
+  set, handing it the `WithDeadLetterSuffix` value (empty when none was set), and the `sqs` transport implements
+  it. On a FIFO queue the `.fifo` suffix always stays last, an explicit suffix included: `orders.fifo` with
+  `WithDeadLetterSuffix("-x")` is `orders-x.fifo`, never `orders.fifo-x` (an SQS FIFO name must end in
+  `.fifo`; before, that explicit suffix produced the uncreatable `orders.fifo-x`). An explicit queue name
+  behaves as before; every other transport keeps `<queue><suffix>` with the default `.dlq`. Deployments that
+  relied on the default must name the SQS DLQ `<queue>-dlq`, or set `WithDeadLetterSuffix(".dlq")` /
+  `WithDeadLetterQueue` to keep the old name. An explicitly empty `WithDeadLetterSuffix("")` now counts as "no suffix" on SQS (`-dlq`); before, it made the DLQ the source queue itself.
+
 ## [redis 1.4.0, pulsar 1.4.0] - 2026-10-25
 
 Implements conformance **1.7.0** (vendored from the `v1.7.0` release asset, verified with `fetch.sh --check`;

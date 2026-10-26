@@ -155,6 +155,18 @@ type NativeSettler interface {
 	SettleNative(ctx context.Context, msg *ReceivedMessage, reason, description string) error
 }
 
+// DeadLetterNamer is an optional [Transport] capability: the name of the BabelQueue dead-letter
+// queue for a source queue, for a broker whose queue-name rules the runtime-wide "<queue><suffix>"
+// shape cannot satisfy. The [App] asks it whenever [WithDeadLetterQueue] was not set, passing the
+// suffix set with [WithDeadLetterSuffix], or "" when none was set. Amazon SQS implements it (a queue
+// name cannot contain a dot and a FIFO name must end in ".fifo"): the default is "<queue>-dlq", FIFO
+// "<queue>-dlq.fifo", and an explicit suffix is placed before ".fifo" too ("orders.fifo" + "-x" ->
+// "orders-x.fifo"), never after it (ADR-0037 decision 7). A transport without it keeps
+// "<queue><suffix>" with the default ".dlq".
+type DeadLetterNamer interface {
+	DeadLetterQueueName(queue, suffix string) string
+}
+
 // InMemoryTransport is an in-process [Transport] for tests and broker-free local
 // runs. It is safe for concurrent use. Pop returns immediately (it does not block
 // for the timeout) — when the queue is empty it returns (nil, nil).

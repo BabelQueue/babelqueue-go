@@ -985,3 +985,50 @@ func TestAppPoisonDLQOffIsLeftToTheNativeMechanism(t *testing.T) {
 		}
 	})
 }
+
+// namedDLQTransport has the optional DeadLetterNamer capability (what the sqs module offers).
+type namedDLQTransport struct{ *queueRecordingTransport }
+
+func (namedDLQTransport) DeadLetterQueueName(queue, suffix string) string {
+	if suffix == "" {
+		suffix = "-dlq"
+	}
+	return queue + suffix
+}
+
+// ADR-0037 decision 7: a transport's DeadLetterNamer names the DLQ unless the App has an explicit
+// WithDeadLetterQueue, and receives an explicit WithDeadLetterSuffix ("" when none); without the
+// capability the default stays "<queue>.dlq".
+func TestAppDeadLetterNamerIsTheDefaultOnly(t *testing.T) {
+	const raw = "not json at all"
+	cases := []struct {
+		name  string
+		named bool
+		opts  []babelqueue.AppOption
+		want  string
+	}{
+		{"namer default", true, nil, "orders-dlq"},
+		{"explicit suffix is handed to the namer", true, []babelqueue.AppOption{babelqueue.WithDeadLetterSuffix(".dlq")}, "orders.dlq"},
+		{"explicit queue wins", true, []babelqueue.AppOption{babelqueue.WithDeadLetterQueue("lot")}, "lot"},
+		{"no capability keeps .dlq", false, nil, "orders.dlq"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rec := &queueRecordingTransport{
+				InMemoryTransport: babelqueue.NewInMemoryTransport(),
+				next:              &babelqueue.ReceivedMessage{Body: raw, Queue: "orders"},
+			}
+			var tr babelqueue.Transport = rec
+			if c.named {
+				tr = namedDLQTransport{rec}
+			}
+			app := babelqueue.NewApp(tr, append([]babelqueue.AppOption{babelqueue.WithDeadLetter(true)}, c.opts...)...)
+			if _, err := app.Drain(context.Background(), "orders", 1); err != nil {
+				t.Fatal(err)
+			}
+			if len(rec.queues) != 1 || rec.queues[0] != c.want {
+				t.Fatalf("DLQ write went to %v, want %s", rec.queues, c.want)
+			}
+		})
+	}
+}
