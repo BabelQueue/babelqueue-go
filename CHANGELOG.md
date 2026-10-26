@@ -9,13 +9,14 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.18.0, sqs 1.12.0, azureservicebus 1.3.0] - 2026-10-26
+
 Implements conformance **1.8.0** (vendored from the `v1.8.0` release asset, verified with `fetch.sh --check`;
 `BQ_CONFORMANCE_VERSION` is now `1.8.0` in `ci.yml` and `release.yml`). The envelope stays at
 `schema_version: 1`; nothing here touches the wire (ADR-0037). The new `version_gate_pulsar`,
 `version_gate_artemis`, `version_gate_sqs` and `version_gate_asb` sections run and pass (17 cases each).
-The version numbers of the core and the `sqs` and `azureservicebus` modules are set at release time (core,
-`sqs` and `azureservicebus` are each a MINOR); the two modules' `require` of the core moves to the core
-version that contains `NativeSettler` then.
+The core (`v1.18.0`), `sqs` (`sqs/v1.12.0`) and `azureservicebus` (`azureservicebus/v1.3.0`) are each a MINOR;
+the two modules' `require` of the core moves to `v1.18.0`, the core version that contains `NativeSettler`.
 
 ### Changed
 
@@ -71,6 +72,12 @@ version that contains `NativeSettler` then.
   behaves as before; every other transport keeps `<queue><suffix>` with the default `.dlq`. Deployments that
   relied on the default must name the SQS DLQ `<queue>-dlq`, or set `WithDeadLetterSuffix(".dlq")` /
   `WithDeadLetterQueue` to keep the old name. An explicitly empty `WithDeadLetterSuffix("")` now counts as "no suffix" on SQS (`-dlq`); before, it made the DLQ the source queue itself.
+
+### Release note for the transport modules
+
+Tag the core `v1.18.0` first, then pin `sqs/go.mod` and `azureservicebus/go.mod` to it (they build today only
+through their local `replace => ../`) and tag each as a MINOR: `sqs/v1.12.0` (native settle, `<queue>-dlq`
+default) and `azureservicebus/v1.3.0` (native settle). The other modules are unchanged and keep their pins.
 
 ## [redis 1.4.0, pulsar 1.4.0] - 2026-10-25
 
