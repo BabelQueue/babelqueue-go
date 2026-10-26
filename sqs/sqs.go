@@ -24,8 +24,10 @@
 // the core's supported version is version-gated (§3.7): the body is not decoded and the message
 // is routed to a reserved unsupported-version URN no handler owns, so the App
 // dead-letters it directly, with no retry (whatever the unknown-URN strategy, StrategyRelease
-// included), or drops it when dead-lettering is off. The optional [OnSchemaVersionRejected] hook
-// names the rejected version.
+// included). With dead-lettering off it is not deleted: the transport's [Transport.SettleNative]
+// leaves it to SQS (visibility expiry redelivers it, the queue's RedrivePolicy moves it to the
+// native DLQ after maxReceiveCount); a poison body takes the same native settle on the first
+// delivery. The optional [OnSchemaVersionRejected] hook names the rejected version.
 //
 // Full spec: https://babelqueue.com
 package sqs
@@ -406,6 +408,35 @@ func (t *Transport) Ack(ctx context.Context, msg *babelqueue.ReceivedMessage) er
 	return err
 }
 
+// SettleNative implements [babelqueue.NativeSettler] (ADR-0037 decisions 1 and 2): a
+// version-gated delivery or a poison body that the App may neither process nor drop, with
+// dead-lettering off, is left to SQS itself. It deliberately does nothing: no DeleteMessage, no
+// ChangeMessageVisibility, no re-send. The message becomes visible again when its visibility
+// timeout lapses (the gate or the poison check rejects it again), and the queue's RedrivePolicy
+// moves it to the native DLQ once maxReceiveCount is reached; without a RedrivePolicy it is
+// redelivered until the retention period ends. The body and its attributes are never touched, and
+// the App has already logged the event.
+func (t *Transport) SettleNative(context.Context, *babelqueue.ReceivedMessage, string, string) error {
+	return nil
+}
+
+// DeadLetterQueueName implements [babelqueue.DeadLetterNamer]: the BabelQueue DLQ of an SQS queue is
+// "<queue>-dlq" by default and, for a FIFO queue, "<queue>-dlq.fifo". An explicit suffix (set with
+// [babelqueue.WithDeadLetterSuffix]; "" means none) replaces "-dlq" and is placed before ".fifo" as
+// well: an SQS FIFO queue name must end in ".fifo", so "orders.fifo" + "-x" is "orders-x.fifo", never
+// "orders.fifo-x". An SQS queue name may hold only alphanumerics, hyphens and underscores (plus that
+// one ".fifo" suffix), so the runtime-wide default "<queue>.dlq" cannot be created on SQS (ADR-0037
+// decision 7). An explicit [babelqueue.WithDeadLetterQueue] overrides all of it.
+func (t *Transport) DeadLetterQueueName(queue, suffix string) string {
+	if suffix == "" {
+		suffix = "-dlq"
+	}
+	if base, ok := strings.CutSuffix(queue, ".fifo"); ok {
+		return base + suffix + ".fifo"
+	}
+	return queue + suffix
+}
+
 func (t *Transport) resolveURL(ctx context.Context, name string) (string, error) {
 	t.mu.Lock()
 	if u, ok := t.urls[name]; ok {
@@ -553,6 +584,8 @@ var (
 	_ babelqueue.Transport       = (*Transport)(nil)
 	_ babelqueue.HeaderPublisher = (*Transport)(nil)
 	_ babelqueue.Releaser        = (*Transport)(nil)
+	_ babelqueue.NativeSettler   = (*Transport)(nil)
+	_ babelqueue.DeadLetterNamer = (*Transport)(nil)
 	_ VisibilityAPI              = (*awssqs.Client)(nil)
 )
 

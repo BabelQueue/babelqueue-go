@@ -347,6 +347,16 @@ RabbitMQ transport modules pull a broker driver, and only if you import them.
 Unknown-URN strategy constants (`StrategyFail`, `StrategyDelete`,
 `StrategyRelease`, `StrategyDeadLetter`) drive the runtime's unknown-URN handling.
 
+A delivery the runtime can neither process nor safely drop — a version-gated message (a
+`bq-schema-version` the consumer does not support) or a poison body — is dead-lettered as its raw
+body when dead-lettering is on (or `StrategyDeadLetter`), and dropped with an ack under
+`StrategyDelete`. With dead-lettering off, a transport that offers the optional `NativeSettler`
+capability (the `sqs` and `azureservicebus` modules) is **not** acknowledged: the delivery is left to
+the broker's native mechanism (SQS: no `DeleteMessage`, visibility expiry then `RedrivePolicy`; Azure
+Service Bus: an explicit native `DeadLetter`), logged, never retried by the SDK. Every other transport
+acknowledges and drops a version-gated message as before, and retries a poison body up to
+`WithMaxAttempts` (ADR-0037).
+
 ## Conformance
 
 This core passes the shared **cross-SDK conformance suite** (vendored under

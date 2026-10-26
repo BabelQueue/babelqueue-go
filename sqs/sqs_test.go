@@ -59,6 +59,7 @@ type fakeSQS struct {
 	visibility  []*awssqs.ChangeMessageVisibilityInput
 	err         error // when set, every call returns it
 	deleteErr   error // when set, DeleteMessage alone fails
+	sendErr     error // when set, SendMessage alone fails
 }
 
 func newFakeSQS() *fakeSQS {
@@ -80,6 +81,9 @@ func (f *fakeSQS) SendMessage(_ context.Context, in *awssqs.SendMessageInput, _ 
 	defer f.mu.Unlock()
 	if f.err != nil {
 		return nil, f.err
+	}
+	if f.sendErr != nil {
+		return nil, f.sendErr
 	}
 	f.sent = append(f.sent, in)
 	url := aws.ToString(in.QueueUrl)
@@ -555,8 +559,8 @@ func TestAppRetryUsesChangeMessageVisibility(t *testing.T) {
 		}
 	}
 	// 1 original publish + 1 dead-letter send; no retry re-sends. One delete (the final ack).
-	if len(fake.sent) != 2 || aws.ToString(fake.sent[1].QueueUrl) != "http://fake/orders.dlq" {
-		t.Errorf("sends = %d (want 2, last to orders.dlq)", len(fake.sent))
+	if len(fake.sent) != 2 || aws.ToString(fake.sent[1].QueueUrl) != "http://fake/orders-dlq" {
+		t.Errorf("sends = %d (want 2, last to orders-dlq)", len(fake.sent))
 	}
 	if len(fake.deleted) != 1 {
 		t.Errorf("deletes = %v, want exactly the final ack", fake.deleted)
@@ -564,7 +568,7 @@ func TestAppRetryUsesChangeMessageVisibility(t *testing.T) {
 }
 
 // An undecodable body can never succeed on retry, so with dead-lettering on it is moved to
-// <queue>.dlq wrapped (original object or {"raw": <body>} plus a poison dead_letter block) on the
+// <queue>-dlq wrapped (original object or {"raw": <body>} plus a poison dead_letter block) on the
 // first delivery: no ChangeMessageVisibility release, no retry, and a single delete as the final ack.
 func TestAppUndecodableBodyIsDeadLetteredWrappedWithoutRetry(t *testing.T) {
 	for _, body := range []string{
@@ -590,8 +594,8 @@ func TestAppUndecodableBodyIsDeadLetteredWrappedWithoutRetry(t *testing.T) {
 		if len(fake.visibility) != 0 {
 			t.Errorf("%q: ChangeMessageVisibility calls = %d, want 0", body, len(fake.visibility))
 		}
-		if len(fake.sent) != 1 || aws.ToString(fake.sent[0].QueueUrl) != "http://fake/orders.dlq" {
-			t.Fatalf("%q: sends = %d, want exactly one to orders.dlq", body, len(fake.sent))
+		if len(fake.sent) != 1 || aws.ToString(fake.sent[0].QueueUrl) != "http://fake/orders-dlq" {
+			t.Fatalf("%q: sends = %d, want exactly one to orders-dlq", body, len(fake.sent))
 		}
 		requirePoisonDLQBody(t, aws.ToString(fake.sent[0].MessageBody), body)
 		if len(fake.deleted) != 1 {
@@ -769,8 +773,8 @@ func TestAppUndecodableBodyUnderReleaseStrategyIsDeadLetteredWrapped(t *testing.
 	if len(fake.visibility) != 0 {
 		t.Errorf("ChangeMessageVisibility calls = %d, want 0", len(fake.visibility))
 	}
-	if len(fake.sent) != 1 || aws.ToString(fake.sent[0].QueueUrl) != "http://fake/orders.dlq" {
-		t.Fatalf("sends = %d, want exactly one to orders.dlq", len(fake.sent))
+	if len(fake.sent) != 1 || aws.ToString(fake.sent[0].QueueUrl) != "http://fake/orders-dlq" {
+		t.Fatalf("sends = %d, want exactly one to orders-dlq", len(fake.sent))
 	}
 	requirePoisonDLQBody(t, aws.ToString(fake.sent[0].MessageBody), body)
 	if len(fake.deleted) != 1 {
@@ -941,8 +945,8 @@ func TestAppQuarantinesVersionGatedMessage(t *testing.T) {
 	if n != 1 {
 		t.Errorf("processed %d deliveries, want 1 (dead-lettered directly, no retry)", n)
 	}
-	if len(fake.sent) != 1 || aws.ToString(fake.sent[0].QueueUrl) != "http://fake/orders.dlq" {
-		t.Fatalf("sends = %d, want exactly one to orders.dlq", len(fake.sent))
+	if len(fake.sent) != 1 || aws.ToString(fake.sent[0].QueueUrl) != "http://fake/orders-dlq" {
+		t.Fatalf("sends = %d, want exactly one to orders-dlq", len(fake.sent))
 	}
 	// The DLQ record is the incoming body verbatim (never decoded, no dead_letter block).
 	if got := aws.ToString(fake.sent[0].MessageBody); got != incoming {
@@ -979,5 +983,167 @@ func TestPopSchemaGateTruncatesLongDeclaredVersion(t *testing.T) {
 	exact := strings.Repeat("9", 64)
 	if msg := pop(exact); msg.RouteURN != unsupportedSchemaRoutePrefix+exact {
 		t.Errorf("a 64-character value must not be truncated, got %q", msg.RouteURN)
+	}
+}
+
+// ADR-0037 decision 1 rule 3: DLQ off + fail (default) / release + a version-gated message is not
+// deleted, not re-sent and not released: the SDK leaves it to SQS (visibility expiry, then the
+// queue's RedrivePolicy). delete still deletes; DLQ on writes the raw body then deletes.
+func TestAppVersionGatedDLQOffIsNotDeleted(t *testing.T) {
+	v := "2"
+	incoming := gateBody(t)
+	run := func(opts ...babelqueue.AppOption) (*fakeSQS, int) {
+		fake := newFakeSQS()
+		tr := NewWithClient(fake, WithQueueURLPrefix("http://fake"))
+		handled := 0
+		app := babelqueue.NewApp(tr, append([]babelqueue.AppOption{
+			babelqueue.WithDefaultQueue("orders"), babelqueue.WithMaxAttempts(3)}, opts...)...)
+		app.Handle("urn:babel:orders:created", func(context.Context, babelqueue.Envelope) error { handled++; return nil })
+		fake.seedWithVersion("http://fake/orders", incoming, &v, 1)
+		n, err := app.Drain(context.Background(), "orders", 50)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if handled != 0 {
+			t.Fatal("handler ran for a version-gated message")
+		}
+		return fake, n
+	}
+
+	for name, opts := range map[string][]babelqueue.AppOption{
+		"default fail": nil,
+		"release":      {babelqueue.WithUnknownURNStrategy(babelqueue.StrategyRelease)},
+	} {
+		t.Run(name+": no DeleteMessage, no send, no visibility change", func(t *testing.T) {
+			fake, n := run(opts...)
+			if n != 1 {
+				t.Errorf("processed %d deliveries, want 1", n)
+			}
+			if len(fake.deleted) != 0 || len(fake.sent) != 0 || len(fake.visibility) != 0 {
+				t.Fatalf("deleted = %v, sent = %d, visibility = %d; want none of them",
+					fake.deleted, len(fake.sent), len(fake.visibility))
+			}
+		})
+	}
+
+	t.Run("delete strategy still deletes", func(t *testing.T) {
+		fake, _ := run(babelqueue.WithUnknownURNStrategy(babelqueue.StrategyDelete))
+		if len(fake.deleted) != 1 || len(fake.sent) != 0 {
+			t.Fatalf("deleted = %v, sent = %d; want one delete and no send", fake.deleted, len(fake.sent))
+		}
+	})
+
+	t.Run("dlq on writes the raw body then deletes", func(t *testing.T) {
+		fake, _ := run(babelqueue.WithDeadLetter(true))
+		if len(fake.sent) != 1 || aws.ToString(fake.sent[0].MessageBody) != incoming || len(fake.deleted) != 1 {
+			t.Fatalf("sent = %d, deleted = %v; want the raw body sent once then one delete", len(fake.sent), fake.deleted)
+		}
+	})
+}
+
+// ADR-0037 decision 2 ("Go and Python"): DLQ off + a poison body (invalid JSON, identity-less
+// object) is left to SQS on the first delivery - no DeleteMessage, no empty-envelope re-send, no
+// ChangeMessageVisibility retry. delete deletes; DLQ on writes the ADR-0035 record then deletes.
+func TestAppPoisonDLQOffIsNotDeleted(t *testing.T) {
+	for _, body := range []string{"not json at all", `{"data":{"a":1}}`, `{"job":"","data":{}}`} {
+		for name, opts := range map[string][]babelqueue.AppOption{
+			"default fail": nil,
+			"release":      {babelqueue.WithUnknownURNStrategy(babelqueue.StrategyRelease)},
+		} {
+			t.Run(name+" "+body, func(t *testing.T) {
+				fake := newFakeSQS()
+				tr := NewWithClient(fake, WithQueueURLPrefix("http://fake"))
+				app := babelqueue.NewApp(tr, append([]babelqueue.AppOption{
+					babelqueue.WithDefaultQueue("orders"), babelqueue.WithMaxAttempts(3)}, opts...)...)
+				fake.seed("http://fake/orders", body, 1)
+				n, err := app.Drain(context.Background(), "orders", 50)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if n != 1 || len(fake.deleted) != 0 || len(fake.sent) != 0 || len(fake.visibility) != 0 {
+					t.Fatalf("processed = %d, deleted = %v, sent = %d, visibility = %d; want 1 delivery and nothing else",
+						n, fake.deleted, len(fake.sent), len(fake.visibility))
+				}
+			})
+		}
+	}
+
+	t.Run("delete strategy deletes", func(t *testing.T) {
+		fake := newFakeSQS()
+		app := babelqueue.NewApp(NewWithClient(fake, WithQueueURLPrefix("http://fake")),
+			babelqueue.WithDefaultQueue("orders"), babelqueue.WithUnknownURNStrategy(babelqueue.StrategyDelete))
+		fake.seed("http://fake/orders", "not json", 1)
+		if _, err := app.Drain(context.Background(), "orders", 50); err != nil {
+			t.Fatal(err)
+		}
+		if len(fake.deleted) != 1 || len(fake.sent) != 0 {
+			t.Fatalf("deleted = %v, sent = %d; want one delete and no send", fake.deleted, len(fake.sent))
+		}
+	})
+}
+
+// ADR-0037 decision 7: the default BabelQueue DLQ of an SQS queue is "<queue>-dlq" and, for a FIFO
+// queue, "<queue>-dlq.fifo" (an SQS queue name cannot contain a dot). An explicit suffix replaces
+// "-dlq" and, on a FIFO queue, is placed before ".fifo" as well (a FIFO name must end in ".fifo");
+// an explicit WithDeadLetterQueue always wins.
+func TestDeadLetterQueueNameDefaults(t *testing.T) {
+	tr := NewWithClient(newFakeSQS())
+	for _, c := range []struct{ queue, suffix, want string }{
+		{"orders", "", "orders-dlq"},
+		{"orders_v2", "", "orders_v2-dlq"},
+		{"orders.fifo", "", "orders-dlq.fifo"},
+		{"my-orders.fifo", "", "my-orders-dlq.fifo"},
+		{"fifo", "", "fifo-dlq"},
+		{"orders", "-x", "orders-x"},
+		{"orders", "_failed", "orders_failed"},
+		{"orders.fifo", "-x", "orders-x.fifo"},
+		{"orders.fifo", "-dlq", "orders-dlq.fifo"},
+		{"orders.fifo", "_failed", "orders_failed.fifo"},
+	} {
+		if got := tr.DeadLetterQueueName(c.queue, c.suffix); got != c.want {
+			t.Errorf("DeadLetterQueueName(%q, %q) = %q, want %q", c.queue, c.suffix, got, c.want)
+		}
+	}
+}
+
+func TestAppDeadLetterTargetOnSqs(t *testing.T) {
+	const poison = "not json at all"
+	cases := []struct {
+		name  string
+		queue string
+		fifo  bool
+		opts  []babelqueue.AppOption
+		want  string // queue URL of the DLQ write
+	}{
+		{"default", "orders", false, nil, "http://fake/orders-dlq"},
+		{"default FIFO", "orders.fifo", true, nil, "http://fake/orders-dlq.fifo"},
+		{"explicit suffix wins", "orders", false, []babelqueue.AppOption{babelqueue.WithDeadLetterSuffix("_failed")}, "http://fake/orders_failed"},
+		{"explicit dot suffix wins", "orders", false, []babelqueue.AppOption{babelqueue.WithDeadLetterSuffix(".dlq")}, "http://fake/orders.dlq"},
+		{"explicit suffix on FIFO goes before .fifo", "orders.fifo", true, []babelqueue.AppOption{babelqueue.WithDeadLetterSuffix("-x")}, "http://fake/orders-x.fifo"},
+		{"explicit -dlq suffix on FIFO is the default name", "orders.fifo", true, []babelqueue.AppOption{babelqueue.WithDeadLetterSuffix("-dlq")}, "http://fake/orders-dlq.fifo"},
+		{"explicit queue name wins", "orders", false, []babelqueue.AppOption{babelqueue.WithDeadLetterQueue("parking-lot")}, "http://fake/parking-lot"},
+		{"explicit queue name wins over a suffix", "orders", false, []babelqueue.AppOption{babelqueue.WithDeadLetterSuffix("-x"), babelqueue.WithDeadLetterQueue("parking-lot")}, "http://fake/parking-lot"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			fake := newFakeSQS()
+			opts := []Option{WithQueueURLPrefix("http://fake")}
+			if c.fifo {
+				opts = append(opts, WithFIFO(true))
+			}
+			app := babelqueue.NewApp(NewWithClient(fake, opts...), append([]babelqueue.AppOption{
+				babelqueue.WithDefaultQueue(c.queue), babelqueue.WithDeadLetter(true)}, c.opts...)...)
+			fake.seed("http://fake/"+c.queue, poison, 1)
+			if _, err := app.Drain(context.Background(), c.queue, 5); err != nil {
+				t.Fatal(err)
+			}
+			if len(fake.sent) != 1 || aws.ToString(fake.sent[0].QueueUrl) != c.want {
+				var got []string
+				for _, s := range fake.sent {
+					got = append(got, aws.ToString(s.QueueUrl))
+				}
+				t.Fatalf("DLQ writes went to %v, want exactly %s", got, c.want)
+			}
+		})
 	}
 }

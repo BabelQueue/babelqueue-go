@@ -19,8 +19,10 @@
 // not the core's supported version is version-gated (§4.7): the body is not decoded and the
 // message is routed to a reserved unsupported-version URN no handler owns, so the App
 // dead-letters it directly, with no retry (whatever the unknown-URN strategy, StrategyRelease
-// included), or drops it when dead-lettering is off. The optional [OnSchemaVersionRejected] hook
-// names the rejected version.
+// included). With dead-lettering off it is not completed: the transport's [Transport.SettleNative]
+// dead-letters it natively into $DeadLetterQueue (reason "unsupported schema version"); a poison
+// body takes the same native settle on the first delivery. The optional [OnSchemaVersionRejected]
+// hook names the rejected version.
 //
 // Full spec: https://babelqueue.com
 package azureservicebus
@@ -268,6 +270,34 @@ func (t *Transport) Rewind(ctx context.Context, msg *babelqueue.ReceivedMessage)
 	return nil
 }
 
+// SettleNative implements [babelqueue.NativeSettler] (ADR-0037 decisions 1 and 2): a version-gated
+// delivery or a poison body that the App may neither process nor drop, with dead-lettering off, is
+// moved by an explicit native DeadLetter(reason, description) into the entity's $DeadLetterQueue.
+// Nothing is completed, nothing is re-published or retried, and the body stays exactly as it
+// arrived; reason ("unsupported schema version" or "poison") becomes the DeadLetterReason and
+// description the DeadLetterErrorDescription. A receiver without DeadLetterMessage (a test fake)
+// falls back to Abandon, which leaves the message to MaxDeliveryCount - also a conformant native
+// settle; a receiver with neither lets the lock lapse on its own.
+func (t *Transport) SettleNative(ctx context.Context, msg *babelqueue.ReceivedMessage, reason, description string) error {
+	rm, ok := msg.Handle.(*azservicebus.ReceivedMessage)
+	if !ok || rm == nil {
+		return nil
+	}
+	r, err := t.receiver(msg.Queue)
+	if err != nil {
+		return err
+	}
+	if dl, ok := r.(interface {
+		DeadLetterMessage(ctx context.Context, message *azservicebus.ReceivedMessage, options *azservicebus.DeadLetterOptions) error
+	}); ok {
+		return dl.DeadLetterMessage(ctx, rm, &azservicebus.DeadLetterOptions{
+			Reason:           &reason,
+			ErrorDescription: &description,
+		})
+	}
+	return t.Rewind(ctx, msg)
+}
+
 // message projects the envelope's contract fields onto a native Service Bus message.
 // They are a redundant, routable view of the body — the body stays authoritative.
 func message(body string) *azservicebus.Message {
@@ -323,7 +353,10 @@ func reconcileAttempts(body string, deliveryCount uint32) string {
 
 func strPtr(s string) *string { return &s }
 
-var _ babelqueue.Transport = (*Transport)(nil)
+var (
+	_ babelqueue.Transport     = (*Transport)(nil)
+	_ babelqueue.NativeSettler = (*Transport)(nil)
+)
 
 // unsupportedSchemaRoutePrefix is the reserved [babelqueue.ReceivedMessage.RouteURN] prefix of a
 // version-gated delivery (the same string the core App recognises). It is not a "urn:babel:"

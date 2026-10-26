@@ -9,6 +9,76 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.18.0, sqs 1.12.0, azureservicebus 1.3.0] - 2026-10-26
+
+Implements conformance **1.8.0** (vendored from the `v1.8.0` release asset, verified with `fetch.sh --check`;
+`BQ_CONFORMANCE_VERSION` is now `1.8.0` in `ci.yml` and `release.yml`). The envelope stays at
+`schema_version: 1`; nothing here touches the wire (ADR-0037). The new `version_gate_pulsar`,
+`version_gate_artemis`, `version_gate_sqs` and `version_gate_asb` sections run and pass (17 cases each).
+The core (`v1.18.0`), `sqs` (`sqs/v1.12.0`) and `azureservicebus` (`azureservicebus/v1.3.0`) are each a MINOR;
+the two modules' `require` of the core moves to `v1.18.0`, the core version that contains `NativeSettler`.
+
+### Changed
+
+- **Behaviour change (core `App`, `sqs`, `azureservicebus`): with dead-lettering off, SQS and Azure Service Bus
+  no longer drop a version-gated message or retry a poison body; they are left to the broker's native
+  mechanism (ADR-0037 decision 1 rule 3 and decision 2 "Go and Python"; broker-bindings §3.5, §4.5, §5.7;
+  owner decision 2026-10-25).**
+  - *Version-gated message* (a `bq-schema-version` the consumer does not support), dead-lettering off and a
+    strategy other than `delete` or `dead_letter`: it used to be acknowledged and dropped. It is now
+    **not** acknowledged. On SQS there is no `DeleteMessage`: visibility expiry redelivers it (the gate rejects
+    it again) and the queue's `RedrivePolicy` moves it to the native DLQ after `maxReceiveCount`. On Azure
+    Service Bus it is dead-lettered natively with an explicit `DeadLetter` (reason `unsupported schema version`)
+    into `$DeadLetterQueue` instead of `Complete`.
+  - *Poison body* (invalid JSON or an identity-less object), dead-lettering off and a strategy other than
+    `delete` or `dead_letter`: it used to take the bounded `fail` path (re-publish an empty envelope up to
+    `WithMaxAttempts`, then drop). On SQS and Azure Service Bus it is now settled natively **on the first
+    delivery** exactly as above (Azure Service Bus reason `poison`): no re-publish, no retry, no ack, body
+    unchanged, the event is logged. Every other transport (Pulsar, Artemis, AMQP, Kafka, Redis, memory) keeps
+    its behaviour, and `delete` (drop with an ack), dead-lettering on and `dead_letter` (the raw record, then
+    ack) are unchanged on SQS and Azure Service Bus too.
+  - A deployment that relied on SQS/Azure Service Bus silently dropping these messages now needs a
+    `RedrivePolicy` (SQS) or accepts them in `$DeadLetterQueue` (Azure Service Bus), or sets
+    `WithDeadLetter(true)` / `StrategyDelete`.
+
+### Added
+
+- **Core: the optional `NativeSettler` transport capability** (`SettleNative(ctx, msg, reason, description)`).
+  When dead-lettering is off, the `App` calls it instead of acknowledging a version-gated message (and, in the
+  poison route, instead of the bounded retry) on a transport that offers it; the decision is made by the
+  capability, never by the transport's name. Transports without it are unchanged.
+- **`sqs` and `azureservicebus` implement `NativeSettler`** (SQS: a deliberate no-op, no `DeleteMessage`; Azure
+  Service Bus: `DeadLetterMessage` with the reason and description, falling back to `AbandonMessage` for a
+  receiver without it).
+- **Conformance `version_gate_*` runners** (`version_gate_pulsar` / `version_gate_artemis` through the `App`,
+  `version_gate_sqs` / `version_gate_asb` through the real transports) and their entries in the results writer.
+
+### Fixed
+
+- **`release.yml` tests a module before publishing its tag.** A module tag (`redis/v*`, `sqs/v*`,
+  `azureservicebus/v*`, `pulsar/v*`, `kafka/v*`, `artemis/v*`, `amqp/v*`, `asynq/v*`, `machinery/v*`, `otel/v*`)
+  now runs `go build`, `go vet` and `go test -race` in that module's directory; before, only the core's tests
+  ran, so a module could be tagged without its own tests. The core tag (`v*`) is unchanged.
+
+- **`sqs`: the default dead-letter queue name is now `<queue>-dlq` (FIFO `<queue>-dlq.fifo`) (ADR-0037
+  decision 7).** The old default `<queue>.dlq` was never a valid Amazon SQS queue name (a name may hold only
+  alphanumerics, hyphens and underscores, plus one `.fifo` suffix), so a DLQ write by default could not find a
+  queue on real SQS. The core gains the optional `DeadLetterNamer` transport capability
+  (`DeadLetterQueueName(queue, suffix)`); the `App` asks it for the DLQ name unless `WithDeadLetterQueue` was
+  set, handing it the `WithDeadLetterSuffix` value (empty when none was set), and the `sqs` transport implements
+  it. On a FIFO queue the `.fifo` suffix always stays last, an explicit suffix included: `orders.fifo` with
+  `WithDeadLetterSuffix("-x")` is `orders-x.fifo`, never `orders.fifo-x` (an SQS FIFO name must end in
+  `.fifo`; before, that explicit suffix produced the uncreatable `orders.fifo-x`). An explicit queue name
+  behaves as before; every other transport keeps `<queue><suffix>` with the default `.dlq`. Deployments that
+  relied on the default must name the SQS DLQ `<queue>-dlq`, or set `WithDeadLetterSuffix(".dlq")` /
+  `WithDeadLetterQueue` to keep the old name. An explicitly empty `WithDeadLetterSuffix("")` now counts as "no suffix" on SQS (`-dlq`); before, it made the DLQ the source queue itself.
+
+### Release note for the transport modules
+
+Tag the core `v1.18.0` first, then pin `sqs/go.mod` and `azureservicebus/go.mod` to it (they build today only
+through their local `replace => ../`) and tag each as a MINOR: `sqs/v1.12.0` (native settle, `<queue>-dlq`
+default) and `azureservicebus/v1.3.0` (native settle). The other modules are unchanged and keep their pins.
+
 ## [redis 1.4.0, pulsar 1.4.0] - 2026-10-25
 
 Implements conformance **1.7.0** (vendored from the `v1.7.0` release asset, verified with `fetch.sh --check`;

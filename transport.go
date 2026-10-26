@@ -139,6 +139,34 @@ type Rewinder interface {
 	Rewind(ctx context.Context, msg *ReceivedMessage) error
 }
 
+// NativeSettler is an optional [Transport] capability: leave a delivery the App can neither
+// process nor safely drop to the broker's own mechanism, without acknowledging or deleting it
+// and without re-publishing or retrying it. The [App] uses it, in place of an acknowledgement,
+// for a version-gated delivery (broker-bindings §5.7 rule 3) and for a poison body (error-handling
+// §7) when dead-lettering is off and the unknown-URN strategy is neither [StrategyDelete] nor a
+// writable [StrategyDeadLetter] (ADR-0037 decisions 1 and 2). SQS implements it as "do nothing":
+// no DeleteMessage, so visibility expiry redelivers the message and the queue's RedrivePolicy
+// (maxReceiveCount) moves it to the native DLQ. Azure Service Bus implements it with an explicit
+// native DeadLetter(reason, description) into $DeadLetterQueue. reason and description say why
+// (e.g. "unsupported schema version", "poison"); the body is never altered. A transport that does
+// not implement it keeps the previous settle (ack and drop), so the behaviour is decided by what
+// the transport offers, never by its name.
+type NativeSettler interface {
+	SettleNative(ctx context.Context, msg *ReceivedMessage, reason, description string) error
+}
+
+// DeadLetterNamer is an optional [Transport] capability: the name of the BabelQueue dead-letter
+// queue for a source queue, for a broker whose queue-name rules the runtime-wide "<queue><suffix>"
+// shape cannot satisfy. The [App] asks it whenever [WithDeadLetterQueue] was not set, passing the
+// suffix set with [WithDeadLetterSuffix], or "" when none was set. Amazon SQS implements it (a queue
+// name cannot contain a dot and a FIFO name must end in ".fifo"): the default is "<queue>-dlq", FIFO
+// "<queue>-dlq.fifo", and an explicit suffix is placed before ".fifo" too ("orders.fifo" + "-x" ->
+// "orders-x.fifo"), never after it (ADR-0037 decision 7). A transport without it keeps
+// "<queue><suffix>" with the default ".dlq".
+type DeadLetterNamer interface {
+	DeadLetterQueueName(queue, suffix string) string
+}
+
 // InMemoryTransport is an in-process [Transport] for tests and broker-free local
 // runs. It is safe for concurrent use. Pop returns immediately (it does not block
 // for the timeout) — when the queue is empty it returns (nil, nil).

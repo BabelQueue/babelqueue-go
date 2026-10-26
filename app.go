@@ -34,17 +34,20 @@ type App struct {
 	deadLetter       bool
 	deadLetterQueue  string
 	deadLetterSuffix string
-	pollTimeout      time.Duration
-	retryBackoff     time.Duration
-	retryMultiplier  float64
-	retryBackoffMax  time.Duration
-	retryJitter      RetryJitter
-	unknownURNDelay  time.Duration
-	onAckError       func(ctx context.Context, msg *ReceivedMessage, err error)
-	onReleaseError   func(ctx context.Context, msg *ReceivedMessage, err error)
-	onDeadLetterErr  func(ctx context.Context, msg *ReceivedMessage, err error)
-	rewindPause      time.Duration
-	handlers         map[string]Handler
+	// deadLetterSuffixSet records an explicit WithDeadLetterSuffix, which a transport's
+	// DeadLetterNamer receives instead of choosing its own default.
+	deadLetterSuffixSet bool
+	pollTimeout         time.Duration
+	retryBackoff        time.Duration
+	retryMultiplier     float64
+	retryBackoffMax     time.Duration
+	retryJitter         RetryJitter
+	unknownURNDelay     time.Duration
+	onAckError          func(ctx context.Context, msg *ReceivedMessage, err error)
+	onReleaseError      func(ctx context.Context, msg *ReceivedMessage, err error)
+	onDeadLetterErr     func(ctx context.Context, msg *ReceivedMessage, err error)
+	rewindPause         time.Duration
+	handlers            map[string]Handler
 }
 
 // AppOption customizes NewApp.
@@ -74,9 +77,10 @@ func WithDeadLetterQueue(queue string) AppOption {
 }
 
 // WithDeadLetterSuffix sets the suffix appended to the source queue to derive the
-// dead-letter queue name (default ".dlq").
+// dead-letter queue name (default ".dlq"; on Amazon SQS the transport's [DeadLetterNamer] gives
+// "<queue>-dlq", FIFO "<queue>-dlq.fifo", and places an explicit suffix before ".fifo" too).
 func WithDeadLetterSuffix(suffix string) AppOption {
-	return func(a *App) { a.deadLetterSuffix = suffix }
+	return func(a *App) { a.deadLetterSuffix, a.deadLetterSuffixSet = suffix, true }
 }
 
 // WithPollTimeout sets how long Pop blocks waiting for a message each iteration
@@ -447,7 +451,9 @@ func TruncateDeclaredVersion(v string) string {
 // settleVersionGated settles a version-gated delivery (RouteURN under
 // [unsupportedSchemaRoutePrefix]) without retrying it and without ever running a handler. It is
 // acknowledged (dropped) under [StrategyDelete], dead-lettered when dead-lettering is on
-// (WithDeadLetter, or [StrategyDeadLetter]), and acknowledged (dropped) otherwise. The DLQ record
+// (WithDeadLetter, or [StrategyDeadLetter]), and otherwise left to the broker's native mechanism
+// when the transport has the [NativeSettler] capability (SQS, Azure Service Bus: ADR-0037 decision
+// 1 rule 3) or acknowledged (dropped) when it has not. The DLQ record
 // is the raw body, byte-identical to the incoming one (never decoded, no dead_letter block). This
 // holds for [StrategyFail] and [StrategyRelease] too, and for every transport that gates on a
 // version property.
@@ -464,6 +470,13 @@ func (a *App) settleVersionGated(ctx context.Context, msg *ReceivedMessage) {
 		return
 	}
 	if !a.deadLetter && a.onUnknownURN != StrategyDeadLetter {
+		// Rule 3 (broker-bindings §5.7): no DLQ to write. A transport with a native mechanism
+		// (SQS, Azure Service Bus) leaves the message to it instead of dropping it; any other
+		// transport acknowledges it and logs.
+		if a.settleNative(ctx, msg, "unsupported schema version",
+			"the message declares a schema version this consumer does not support") {
+			return
+		}
 		a.ack(ctx, msg)
 		return
 	}
@@ -476,6 +489,24 @@ func (a *App) settleVersionGated(ctx context.Context, msg *ReceivedMessage) {
 		return
 	}
 	a.settle(ctx, msg, settled)
+}
+
+// settleNative hands msg to the transport's [NativeSettler] capability and reports whether it did:
+// false means the transport has none and the caller keeps its previous settle. The event is logged
+// (never retried by the SDK); a failure of the call is logged too and leaves the message
+// unacknowledged, exactly like the native settle itself, so the broker redelivers it.
+func (a *App) settleNative(ctx context.Context, msg *ReceivedMessage, reason, description string) bool {
+	ns, ok := a.transport.(NativeSettler)
+	if !ok {
+		return false
+	}
+	slog.WarnContext(ctx, "babelqueue: left to the broker's native mechanism (not acknowledged, not retried)",
+		"queue", msg.Queue, "route", msg.RouteURN, "reason", reason)
+	if err := ns.SettleNative(ctx, msg, reason, description); err != nil {
+		slog.ErrorContext(ctx, "babelqueue: native settle failed; the message stays unacknowledged and will be redelivered",
+			"queue", msg.Queue, "reason", reason, "error", err)
+	}
+	return true
 }
 
 // settleTransportPoison dead-letters a delivery the transport flagged [ReceivedMessage.Poison]:
@@ -599,10 +630,21 @@ func (a *App) reportDeadLetterError(ctx context.Context, msg *ReceivedMessage, e
 // dead-lettering is on (WithDeadLetter, or [StrategyDeadLetter]) it is never retried — a retry
 // could only re-publish an empty envelope and lose the body — and it is written to the DLQ
 // wrapped with its original body preserved (see settleRawPoison). [StrategyDelete] still drops
-// it, and with dead-lettering off the strategy paths below apply unchanged.
+// it. With dead-lettering off the strategy paths below apply, except on a transport with the
+// [NativeSettler] capability (SQS, Azure Service Bus), where the body is settled natively on the
+// first delivery instead (see below).
 func (a *App) routePoison(ctx context.Context, msg *ReceivedMessage, env Envelope, decodeErr error) {
 	if decodeErr != nil && a.onUnknownURN != StrategyDelete && (a.deadLetter || a.onUnknownURN == StrategyDeadLetter) {
 		a.settleRawPoison(ctx, msg, decodeErr)
+		return
+	}
+	// Dead-lettering off (and not the writable dead_letter strategy), strategy not delete: on a
+	// transport with a native mechanism (SQS, Azure Service Bus: the [NativeSettler] capability) the
+	// poison body is settled natively on the first delivery - no bounded retry, no empty-envelope
+	// re-publish, body untouched (ADR-0037 decision 2, "Go and Python"). Every other transport
+	// keeps the bounded path below.
+	if a.onUnknownURN != StrategyDelete && !a.deadLetter && a.onUnknownURN != StrategyDeadLetter &&
+		a.settleNative(ctx, msg, "poison", "the body does not decode into a valid envelope") {
 		return
 	}
 	if a.onUnknownURN != StrategyRelease {
@@ -766,6 +808,13 @@ func (a *App) deadLetterMessage(ctx context.Context, msg *ReceivedMessage, env E
 func (a *App) deadLetterTarget(msg *ReceivedMessage) string {
 	if a.deadLetterQueue != "" {
 		return a.deadLetterQueue
+	}
+	if n, ok := a.transport.(DeadLetterNamer); ok {
+		suffix := ""
+		if a.deadLetterSuffixSet {
+			suffix = a.deadLetterSuffix
+		}
+		return n.DeadLetterQueueName(msg.Queue, suffix)
 	}
 	return msg.Queue + a.deadLetterSuffix
 }
