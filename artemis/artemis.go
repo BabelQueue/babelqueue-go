@@ -181,6 +181,22 @@ func (t *Transport) Publish(ctx context.Context, queue, body string) error {
 	return s.Send(ctx, message(body), nil)
 }
 
+// PublishWithHeaders implements [babelqueue.HeaderPublisher]: it sends body like [Transport.Publish]
+// and adds the out-of-band transport headers as extra string-valued AMQP 1.0 application properties
+// beside the §7 bq_ projection - e.g. a W3C traceparent / tracestate for cross-hop span linkage
+// (ADR-0028; the names are hyphen-free, so JMS-legal). The body is the unchanged envelope (GR-1). A
+// bq_ contract property always wins a key collision, and blank keys and values are skipped. A nil or
+// empty map behaves exactly like Publish.
+func (t *Transport) PublishWithHeaders(ctx context.Context, queue, body string, headers map[string]string) error {
+	s, err := t.sender(ctx, queue)
+	if err != nil {
+		return err
+	}
+	m := message(body)
+	m.ApplicationProperties = mergeOutOfBand(m.ApplicationProperties, headers)
+	return s.Send(ctx, m, nil)
+}
+
 // Pop receives the next message, bounded by timeout (and WithMaxWaitTime). It reconciles
 // attempts to max(body.attempts, delivery-count). Returns (nil, nil) when no message arrives.
 func (t *Transport) Pop(ctx context.Context, queue string, timeout time.Duration) (*babelqueue.ReceivedMessage, error) {
@@ -211,9 +227,10 @@ func (t *Transport) Pop(ctx context.Context, queue string, timeout time.Duration
 		v = babelqueue.TruncateDeclaredVersion(v) // bound what the hook, the route and the DLQ record carry
 		notifyRejected(t.onRejected, v, queue)
 		return &babelqueue.ReceivedMessage{
-			Body:   messageBody(msg),
-			Queue:  queue,
-			Handle: msg,
+			Body:    messageBody(msg),
+			Queue:   queue,
+			Handle:  msg,
+			Headers: outOfBandFromProperties(msg.ApplicationProperties),
 			// The AMQP delivery-count is 0-based while ReceivedMessage.DeliveryCount is 1-based, so
 			// the App's floor (DeliveryCount - 1) equals the broker's own redelivery count and
 			// is informational here: the App dead-letters a gated message directly, without retrying it.
@@ -222,7 +239,7 @@ func (t *Transport) Pop(ctx context.Context, queue string, timeout time.Duration
 		}, nil
 	}
 	body := reconcileAttempts(messageBody(msg), deliveryCount(msg))
-	return &babelqueue.ReceivedMessage{Body: body, Queue: queue, Handle: msg}, nil
+	return &babelqueue.ReceivedMessage{Body: body, Queue: queue, Handle: msg, Headers: outOfBandFromProperties(msg.ApplicationProperties)}, nil
 }
 
 // Ack acknowledges (accepts) the reserved message.
@@ -305,6 +322,71 @@ func applicationProperties(env babelqueue.Envelope) map[string]any {
 		props["bq_source_lang"] = env.Meta.Lang
 	}
 	return props
+}
+
+// contractProperties are the application properties the transport owns (the §7.2 bq_ projection).
+// They are never accepted from, nor surfaced as, out-of-band transport headers.
+var contractProperties = map[string]struct{}{
+	"bq_schema_version": {},
+	"bq_attempts":       {},
+	"bq_app_id":         {},
+	"bq_source_lang":    {},
+	"bq_delay":          {}, // §7.4 scheduled-delivery mirror written by other SDKs
+}
+
+// mergeOutOfBand adds the out-of-band headers to props (allocating it when nil) as string values
+// without ever overwriting a key props already holds or writing a contract property name; blank
+// keys and values are skipped. It returns props unchanged when there is nothing to add.
+func mergeOutOfBand(props map[string]any, extra map[string]string) map[string]any {
+	for k, v := range extra {
+		if k == "" || v == "" {
+			continue
+		}
+		if _, reserved := contractProperties[k]; reserved {
+			continue
+		}
+		if _, exists := props[k]; exists {
+			continue
+		}
+		if props == nil {
+			props = make(map[string]any, len(extra))
+		}
+		props[k] = v
+	}
+	return props
+}
+
+// outOfBandFromProperties maps the application properties a producer attached beside the §7.2 bq_
+// projection (traceparent, tracestate, bq-replay-bypass, ...) to a flat map for
+// [babelqueue.ReceivedMessage.Headers]. Only string (and byte-string) values are surfaced - these
+// are text carriers; the bq_ contract properties the transport reads itself are not, and blank
+// values are skipped. It returns nil when nothing remains, so a header-less delivery stays
+// header-less.
+func outOfBandFromProperties(props map[string]any) map[string]string {
+	var out map[string]string
+	for k, raw := range props {
+		if k == "" {
+			continue
+		}
+		if _, reserved := contractProperties[k]; reserved {
+			continue
+		}
+		var v string
+		switch val := raw.(type) {
+		case string:
+			v = val
+		case []byte:
+			v = string(val)
+		}
+		if v == "" {
+			continue
+		}
+		if out == nil {
+			out = make(map[string]string)
+		}
+		out[k] = v
+	}
+	return out
 }
 
 // messageBody returns the message body as text (an AMQP value string, or a UTF-8 Data section).
@@ -404,4 +486,7 @@ func reconcileAttempts(body string, count uint32) string {
 	return body
 }
 
-var _ babelqueue.Transport = (*Transport)(nil)
+var (
+	_ babelqueue.Transport       = (*Transport)(nil)
+	_ babelqueue.HeaderPublisher = (*Transport)(nil)
+)

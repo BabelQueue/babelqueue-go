@@ -31,6 +31,7 @@ import (
 	"errors"
 	"io"
 	"net/url"
+	"sort"
 	"strconv"
 	"sync"
 	"time"
@@ -225,6 +226,19 @@ func (t *Transport) Publish(ctx context.Context, queue, body string) error {
 	return t.writer.WriteMessages(ctx, message(queue, body))
 }
 
+// PublishWithHeaders implements [babelqueue.HeaderPublisher]: it writes body like [Transport.Publish]
+// and adds the out-of-band transport headers as extra record headers (UTF-8 byte values) beside the
+// §6 bq- projection - e.g. a W3C traceparent / tracestate for cross-hop span linkage (ADR-0028).
+// The record value is the unchanged envelope (GR-1). A bq- contract header (and bq-delay /
+// bq-original-topic) always wins a key collision, blank keys and blank values are skipped, and the
+// headers are appended in key order so the record is deterministic. A nil or empty map behaves
+// exactly like Publish.
+func (t *Transport) PublishWithHeaders(ctx context.Context, queue, body string, headers map[string]string) error {
+	m := message(queue, body)
+	m.Headers = appendOutOfBand(m.Headers, headers)
+	return t.writer.WriteMessages(ctx, m)
+}
+
 // PublishFrom implements [babelqueue.KeyedRepublisher]. It has two modes:
 //
 //   - Restore: queue is the topic of the reserved record and body is the body Pop returned for it
@@ -233,7 +247,10 @@ func (t *Transport) Publish(ctx context.Context, queue, body string) error {
 //     the restored copy does not age out of the DLQ early. Nothing is re-projected from the body.
 //   - Republish: any other queue/body (a redrive to the work topic, a retry) is written like
 //     Publish (§6 header projection, created_at timestamp) and carries the key of the reserved
-//     record byte-for-byte — a null key stays null and a non-empty key is unchanged (§6.5). PublishFrom
+//     record byte-for-byte — a null key stays null and a non-empty key is unchanged (§6.5). Only a
+//     republish onto the reserved record's own topic (the App's retry) also forwards its W3C trace headers
+//     (traceparent, tracestate); a redrive or dead-letter write to another topic copies no header, so a
+//     redrive starts a fresh trace. PublishFrom
 //     writes whatever key bytes the reserved record carries, but a record read through Pop has
 //     already lost an empty key: kafka-go's Reader delivers a zero-length key as nil, so it is
 //     written as null (see the CHANGELOG "Known limitations").
@@ -252,12 +269,42 @@ func (t *Transport) PublishFrom(ctx context.Context, queue, body string, from *b
 					Time:    time.Now(),
 				})
 			}
-			m := message(queue, body)
-			m.Key = km.Key
-			return t.writer.WriteMessages(ctx, m)
+			return t.writer.WriteMessages(ctx, republishRecord(queue, body, km, nil))
 		}
 	}
 	return t.writer.WriteMessages(ctx, message(queue, body))
+}
+
+// PublishFromWithHeaders is the header-carrying republish ([babelqueue.HeaderRepublisher]): it
+// writes body like the republish mode of [Transport.PublishFrom] - §6 header projection, created_at
+// timestamp and the key of the reserved record byte-for-byte (§6.5) - and adds the out-of-band
+// transport headers beside the projection, with the same rules as [Transport.PublishWithHeaders]
+// (a bq- contract header wins a collision, blanks are skipped). [babelqueue.Redrive] uses it to stamp
+// bq-replay-bypass without losing the DLQ record's key. There is no restore mode: the headers make it
+// a new record. A from that carries no Kafka record yields a keyless record, as PublishWithHeaders does.
+func (t *Transport) PublishFromWithHeaders(ctx context.Context, queue, body string, from *babelqueue.ReceivedMessage, headers map[string]string) error {
+	if from != nil {
+		if km, ok := from.Handle.(kafkago.Message); ok {
+			return t.writer.WriteMessages(ctx, republishRecord(queue, body, km, headers))
+		}
+	}
+	m := message(queue, body)
+	m.Headers = appendOutOfBand(m.Headers, headers)
+	return t.writer.WriteMessages(ctx, m)
+}
+
+// republishRecord is the record of the republish mode of PublishFrom: like Publish, plus the key of
+// the reserved record km, plus the out-of-band headers, plus (only onto km's own topic, the App's
+// retry) its W3C trace headers - which never override a header the caller supplied.
+func republishRecord(queue, body string, km kafkago.Message, extra map[string]string) kafkago.Message {
+	m := message(queue, body)
+	m.Key = km.Key
+	m.Headers = appendOutOfBand(m.Headers, extra)
+	if queue == km.Topic {
+		// A retry or release re-publish onto the record's own topic stays in the same trace.
+		forwardTraceHeaders(&m, km)
+	}
+	return m
 }
 
 // Pop reserves the next record (FetchMessage, no auto-commit), bounded by timeout (and
@@ -291,9 +338,10 @@ func (t *Transport) Pop(ctx context.Context, queue string, timeout time.Duration
 		v = babelqueue.TruncateDeclaredVersion(v) // bound what the hook, the route and the DLQ record carry
 		notifyRejected(t.onRejected, v, queue)
 		return &babelqueue.ReceivedMessage{
-			Body:   string(msg.Value),
-			Queue:  queue,
-			Handle: msg,
+			Body:    string(msg.Value),
+			Queue:   queue,
+			Handle:  msg,
+			Headers: outOfBandFromRecord(msg.Headers),
 			// Kafka has no native delivery count; the authoritative bq-attempts header (read
 			// without decoding the body) keeps the rejected record's delivery count in line with its earlier
 			// retries (informational: the App dead-letters a gated record directly, with no retry).
@@ -302,7 +350,7 @@ func (t *Transport) Pop(ctx context.Context, queue string, timeout time.Duration
 		}, nil
 	}
 	body := reconcileAttempts(string(msg.Value), msg.Headers)
-	return &babelqueue.ReceivedMessage{Body: body, Queue: queue, Handle: msg}, nil
+	return &babelqueue.ReceivedMessage{Body: body, Queue: queue, Handle: msg, Headers: outOfBandFromRecord(msg.Headers)}, nil
 }
 
 // Ack commits the reserved record's offset (process-then-commit; at-least-once).
@@ -370,6 +418,103 @@ func headers(env babelqueue.Envelope) []kafkago.Header {
 	add("bq-source-lang", env.Meta.Lang)
 	add("bq-attempts", strconv.Itoa(env.Attempts))
 	return h
+}
+
+// Out-of-band header names the transport itself knows (broker-bindings.md §6.3, ADR-0028).
+const (
+	headerTraceparent = "traceparent"
+	headerTracestate  = "tracestate"
+)
+
+// contractHeaders are the record headers the transport owns: the §6.3 projection plus the retry-topic
+// pair of §6.4. They are never accepted from, nor surfaced as, out-of-band transport headers.
+var contractHeaders = map[string]struct{}{
+	"bq-job":            {},
+	"bq-trace-id":       {},
+	"bq-message-id":     {},
+	"bq-schema-version": {},
+	"bq-source-lang":    {},
+	"bq-attempts":       {},
+	headerDelay:         {},
+	headerOriginalTopic: {},
+}
+
+// forwardTraceHeaders copies the W3C trace headers (traceparent, tracestate) of the reserved record
+// from onto the retry record m, so a retried message stays in the same trace.
+// Nothing else is copied: the §6 projection of m is derived from its own body.
+func forwardTraceHeaders(m *kafkago.Message, from kafkago.Message) {
+	for _, h := range from.Headers {
+		if h.Key != headerTraceparent && h.Key != headerTracestate {
+			continue
+		}
+		dup := false
+		for _, e := range m.Headers {
+			if e.Key == h.Key {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			m.Headers = append(m.Headers, h)
+		}
+	}
+}
+
+// appendOutOfBand appends the out-of-band headers to dst as record headers, in key order. It skips
+// blank keys and values, every contract header name (a bq- header always wins) and any key dst
+// already carries.
+func appendOutOfBand(dst []kafkago.Header, extra map[string]string) []kafkago.Header {
+	if len(extra) == 0 {
+		return dst
+	}
+	keys := make([]string, 0, len(extra))
+	for k, v := range extra {
+		if k == "" || v == "" {
+			continue
+		}
+		if _, reserved := contractHeaders[k]; reserved {
+			continue
+		}
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		dup := false
+		for _, h := range dst {
+			if h.Key == k {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			dst = append(dst, kafkago.Header{Key: k, Value: []byte(extra[k])})
+		}
+	}
+	return dst
+}
+
+// outOfBandFromRecord maps the record headers a producer attached beside the contract projection
+// (traceparent, tracestate, bq-replay-bypass, ...) to a flat map for
+// [babelqueue.ReceivedMessage.Headers]. The bq- contract headers the transport reads itself
+// are not surfaced; the first header with a key wins; blank values are skipped. It returns nil
+// when nothing remains, so a header-less delivery stays header-less.
+func outOfBandFromRecord(hdrs []kafkago.Header) map[string]string {
+	var out map[string]string
+	for _, h := range hdrs {
+		if h.Key == "" || len(h.Value) == 0 {
+			continue
+		}
+		if _, reserved := contractHeaders[h.Key]; reserved {
+			continue
+		}
+		if out == nil {
+			out = make(map[string]string)
+		}
+		if _, seen := out[h.Key]; !seen {
+			out[h.Key] = string(h.Value)
+		}
+	}
+	return out
 }
 
 // reconcileAttempts sets the envelope's attempts to the authoritative bq-attempts header
@@ -465,4 +610,5 @@ func notifyRejected(fn OnSchemaVersionRejected, version, queue string) {
 var (
 	_ babelqueue.Transport        = (*Transport)(nil)
 	_ babelqueue.KeyedRepublisher = (*Transport)(nil)
+	_ babelqueue.HeaderPublisher  = (*Transport)(nil)
 )

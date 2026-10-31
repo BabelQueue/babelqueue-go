@@ -230,6 +230,44 @@ func (t *Transport) Publish(ctx context.Context, queue, body string) error {
 	return t.PublishRouted(ctx, queue, body, "")
 }
 
+// PublishWithHeaders implements [babelqueue.HeaderPublisher]: it sends body like [Transport.Publish]
+// and adds the out-of-band transport headers as extra message properties beside the §5 bq-
+// projection - e.g. a W3C traceparent / tracestate for cross-hop span linkage (ADR-0028). The
+// payload is the unchanged envelope (GR-1). A bq- contract property always wins a key collision,
+// and blank keys and values are skipped. A nil or empty map behaves exactly like Publish.
+func (t *Transport) PublishWithHeaders(ctx context.Context, queue, body string, headers map[string]string) error {
+	p, err := t.producer(queue)
+	if err != nil {
+		return err
+	}
+	m := message(body, "")
+	m.Properties = mergeOutOfBand(m.Properties, headers)
+	_, err = p.Send(ctx, m)
+	return err
+}
+
+// PublishFromWithHeaders is the header-carrying republish ([babelqueue.HeaderRepublisher]): it
+// sends body like [Transport.PublishRouted] with from.RouteURN - so the routing property, or the
+// original bq-job / bq-schema-version of a version-gated delivery, is kept exactly as a plain
+// republish keeps it (§5.2/§5.7) - and adds the out-of-band transport headers as extra properties,
+// with the same rules as [Transport.PublishWithHeaders] (a bq- contract property wins a collision,
+// blanks are skipped). [babelqueue.Redrive] uses it to stamp bq-replay-bypass without flipping the
+// route or bypassing the version gate. A nil from, or one with no RouteURN, derives bq-job from the body.
+func (t *Transport) PublishFromWithHeaders(ctx context.Context, queue, body string, from *babelqueue.ReceivedMessage, headers map[string]string) error {
+	p, err := t.producer(queue)
+	if err != nil {
+		return err
+	}
+	routeURN := ""
+	if from != nil {
+		routeURN = from.RouteURN
+	}
+	m := message(body, routeURN)
+	m.Properties = mergeOutOfBand(m.Properties, headers)
+	_, err = p.Send(ctx, m)
+	return err
+}
+
 // PublishRouted is [Publish] with the routing property pinned: a non-empty routeURN is written
 // as bq-job instead of the body's job, so an App retry or release re-publish keeps the original
 // delivery's routing URN (§5.2/§5.7). A blank routeURN derives bq-job from the body.
@@ -272,7 +310,7 @@ func (t *Transport) Pop(ctx context.Context, queue string, timeout time.Duration
 		// Version gate (§5.7 step 3): quarantine before decoding. The body is handed over
 		// untouched; the reserved route keeps the App from dispatching it to any handler.
 		notifyRejected(t.onRejected, v, queue)
-		return &babelqueue.ReceivedMessage{Body: string(msg.Payload()), Queue: queue, Handle: msg, RouteURN: gateRoute(v, msg.Properties())}, nil
+		return &babelqueue.ReceivedMessage{Body: string(msg.Payload()), Queue: queue, Handle: msg, RouteURN: gateRoute(v, msg.Properties()), Headers: outOfBandFromProperties(msg.Properties())}, nil
 	}
 	body, routeURN := reconcile(string(msg.Payload()), msg.Properties(), msg.RedeliveryCount(), t.onMismatch)
 	// A body that does not decode (or has no identity) cannot carry the reconciled count in its
@@ -284,7 +322,7 @@ func (t *Transport) Pop(ctx context.Context, queue string, timeout time.Duration
 	if n, ok := parseAttempts(msg.Properties()["bq-attempts"]); ok && n > floor {
 		floor = n
 	}
-	return &babelqueue.ReceivedMessage{Body: body, Queue: queue, Handle: msg, RouteURN: routeURN, DeliveryCount: floor + 1}, nil
+	return &babelqueue.ReceivedMessage{Body: body, Queue: queue, Handle: msg, RouteURN: routeURN, DeliveryCount: floor + 1, Headers: outOfBandFromProperties(msg.Properties())}, nil
 }
 
 // Rewind hands a reserved message back to the broker with a negative acknowledgement, so it is
@@ -371,6 +409,62 @@ func properties(env babelqueue.Envelope) map[string]string {
 	}
 	props["bq-attempts"] = strconv.Itoa(env.Attempts)
 	return props
+}
+
+// contractProperties are the message properties the transport owns (the §5 bq- projection). They
+// are never accepted from, nor surfaced as, out-of-band transport headers.
+var contractProperties = map[string]struct{}{
+	"bq-job":            {},
+	"bq-trace-id":       {},
+	"bq-message-id":     {},
+	"bq-schema-version": {},
+	"bq-source-lang":    {},
+	"bq-attempts":       {},
+	"bq-delay":          {}, // §5.4 delay mirror written by other SDKs
+}
+
+// mergeOutOfBand adds the out-of-band headers to props (allocating it when nil) without ever
+// overwriting a key props already holds or writing a contract property name; blank keys and
+// values are skipped. It returns props unchanged when there is nothing to add.
+func mergeOutOfBand(props map[string]string, extra map[string]string) map[string]string {
+	for k, v := range extra {
+		if k == "" || v == "" {
+			continue
+		}
+		if _, reserved := contractProperties[k]; reserved {
+			continue
+		}
+		if _, exists := props[k]; exists {
+			continue
+		}
+		if props == nil {
+			props = make(map[string]string, len(extra))
+		}
+		props[k] = v
+	}
+	return props
+}
+
+// outOfBandFromProperties maps the properties a producer attached beside the §5 bq- projection
+// (traceparent, tracestate, bq-replay-bypass, ...) to a fresh map for
+// [babelqueue.ReceivedMessage.Headers]. The bq- contract properties the transport reads itself
+// are not surfaced and blank values are skipped. It returns nil when nothing remains, so a
+// header-less delivery stays header-less.
+func outOfBandFromProperties(props map[string]string) map[string]string {
+	var out map[string]string
+	for k, v := range props {
+		if k == "" || v == "" {
+			continue
+		}
+		if _, reserved := contractProperties[k]; reserved {
+			continue
+		}
+		if out == nil {
+			out = make(map[string]string)
+		}
+		out[k] = v
+	}
+	return out
 }
 
 // unsupportedSchemaRoutePrefix prefixes the reserved route URN a version-gated message is
@@ -531,4 +625,7 @@ func notifyMismatch(fn OnRoutingMismatch, propertyURN string, env babelqueue.Env
 	fn(propertyURN, env.Job, &env)
 }
 
-var _ babelqueue.Transport = (*Transport)(nil)
+var (
+	_ babelqueue.Transport       = (*Transport)(nil)
+	_ babelqueue.HeaderPublisher = (*Transport)(nil)
+)

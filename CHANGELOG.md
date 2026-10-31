@@ -9,6 +9,44 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Added
+
+- **W3C `traceparent` / `tracestate` carriage on the Kafka, Pulsar, Artemis and Azure Service Bus transports
+  (`kafka`, `pulsar`, `artemis`, `azureservicebus`; ADR-0028, broker-bindings §3 to §7 "Trace context").** Each
+  transport now implements `babelqueue.HeaderPublisher`, so `App.PublishWithHeaders` (and `Redrive` with
+  `Bypass`) no longer drops the out-of-band headers. They ride on the broker's own metadata channel beside the
+  contract projection: Kafka record headers, Pulsar message properties, and string application properties on
+  Artemis (AMQP 1.0) and Azure Service Bus. The envelope and the wire body are byte-identical to a plain
+  `Publish`; a `bq-` / `bq_` contract property always wins a key collision; blank keys and values are skipped.
+  On the consume side the headers reach `ReceivedMessage.Headers` (and so `HeadersFromContext`, which the
+  `otel` module's `WrapHandler` reads for cross-hop parent/child spans); the contract projection keys the
+  transport reads itself are not surfaced, and a delivery with no out-of-band headers keeps `Headers` nil.
+  - `kafka`: the retry path keeps the trace - `PublishRetry`, `PublishRetryForAttempt` and the App's retry
+    re-publish onto the record's own topic forward `traceparent` / `tracestate`; the re-inject consumer already
+    kept every header but `bq-delay` / `bq-original-topic`. A redrive or dead-letter write to another topic
+    still copies no header.
+  - `azureservicebus`: new optional `Transport.SettleNativeDeadLetter(ctx, msg, reason, description)
+    (deadLettered bool, err error)` (ADR-0039 §5.1). It settles exactly like `SettleNative` (which now
+    delegates to it) and reports `true` only when `DeadLetterMessage` was called and succeeded, `false` for the
+    Abandon fallback, a foreign handle or an error. `SettleNative` is unchanged.
+- **New optional core capability `HeaderRepublisher`** (`PublishFromWithHeaders(ctx, queue, body, from, headers)`),
+  purely additive: a republish on behalf of a reserved message that also attaches out-of-band headers and keeps
+  what `KeyedRepublisher` / `RoutedPublisher` keep. `Redrive{Bypass: true}` prefers it over a bare
+  `HeaderPublisher.PublishWithHeaders`. `kafka` implements it (record key carried byte-for-byte, §6.5) and
+  `pulsar` implements it (routing property and version-gate properties kept, §5.2/§5.7). Transports are
+  discovered structurally; no existing interface changes.
+
+### Changed
+
+- **Behaviour change (`kafka`, `pulsar`, `artemis`, `azureservicebus`):** because these transports are now
+  `HeaderPublisher`s, a `Redrive` run with `Bypass: true` stamps `bq-replay-bypass` on them and reports
+  `Bypassed = true` (previously it fell back to a plain re-publish and `Bypassed` stayed false). On Kafka the
+  DLQ record's key is still carried, and on Pulsar the original `bq-job` route and `bq-schema-version` are still
+  kept, as on a plain redrive. On Artemis and Azure Service Bus there is no key or route to keep.
+- The optional contract mirrors other SDKs write (`bq-attempts` / `bq-delay` on Azure Service Bus, `bq_delay` on
+  Artemis, `bq-delay` on Pulsar) are reserved names: they are not accepted from `PublishWithHeaders` and are not
+  surfaced in `ReceivedMessage.Headers`.
+
 ## [1.18.0, sqs 1.12.0, azureservicebus 1.3.0] - 2026-10-26
 
 Implements conformance **1.8.0** (vendored from the `v1.8.0` release asset, verified with `fetch.sh --check`;
