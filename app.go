@@ -938,6 +938,8 @@ func (a *App) deadLetterTarget(msg *ReceivedMessage) string {
 // ([App.deadLetterRaw]). settled reports that the write also settled msg; otherwise the caller
 // acks. The caller decides what a failure means.
 func (a *App) writeDeadLetter(ctx context.Context, msg *ReceivedMessage, env Envelope, reason string, cause error) (settled bool, err error) {
+	// The record's dead_letter.original_queue is wire data and keeps its rule: meta.queue when it is
+	// non-empty, else the delivery's queue.
 	originalQueue := msg.Queue
 	if env.Meta.Queue != "" {
 		originalQueue = env.Meta.Queue
@@ -948,5 +950,12 @@ func (a *App) writeDeadLetter(ctx context.Context, msg *ReceivedMessage, env Env
 	if err != nil {
 		return false, err
 	}
-	return a.deadLetterRaw(ctx, msg, string(body), reason, originalQueue)
+	// The observer event's Queue is not wire data: a blank meta.queue (empty or only the ADR-0031
+	// ASCII whitespace set) names no queue, so the delivery's own queue stands in (conformance
+	// metrics: blank means no destination).
+	eventQueue := msg.Queue
+	if !isBlankASCII(env.Meta.Queue) {
+		eventQueue = env.Meta.Queue
+	}
+	return a.deadLetterRaw(ctx, msg, string(body), reason, eventQueue)
 }

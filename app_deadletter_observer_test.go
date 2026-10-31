@@ -351,3 +351,74 @@ func TestDeadLetterObserverNilIsInert(t *testing.T) {
 		t.Fatalf("DLQ records = %d, want 1", got)
 	}
 }
+
+// The observer event's Queue falls back to the delivery's queue when meta.queue is blank (empty or
+// only the ADR-0031 ASCII whitespace set). Any other value, a Unicode space included, is a queue
+// name and is kept as is.
+func TestDeadLetterEventQueueFallbackUsesTheASCIIBlankSet(t *testing.T) {
+	for _, tc := range blankQueueCases {
+		t.Run(tc.name, func(t *testing.T) {
+			rec, _ := deadLetterUnknownURN(t, tc.metaQueue)
+			if len(rec.events) != 1 || rec.events[0].Queue != tc.wantEventQueue {
+				t.Fatalf("events = %+v, want one with Queue %q", rec.events, tc.wantEventQueue)
+			}
+		})
+	}
+}
+
+// The wire is unchanged: the record's dead_letter.original_queue keeps its old rule (meta.queue when
+// non-empty, else the delivery's queue), so a blank-but-not-empty meta.queue is written as is, whatever
+// the observer event reports.
+func TestDeadLetterRecordOriginalQueueIsUnchangedByTheEventFallback(t *testing.T) {
+	for _, tc := range blankQueueCases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, published := deadLetterUnknownURN(t, tc.metaQueue)
+			if len(published) != 1 {
+				t.Fatalf("DLQ records = %d, want 1", len(published))
+			}
+			rec, err := babelqueue.Decode([]byte(published[0]))
+			if err != nil || rec.DeadLetter == nil {
+				t.Fatalf("DLQ record does not decode with a dead_letter block: %v", err)
+			}
+			if rec.DeadLetter.OriginalQueue != tc.wantOriginalQueue {
+				t.Errorf("dead_letter.original_queue = %q, want %q", rec.DeadLetter.OriginalQueue, tc.wantOriginalQueue)
+			}
+		})
+	}
+}
+
+var blankQueueCases = []struct {
+	name              string
+	metaQueue         string
+	wantEventQueue    string // the observer event
+	wantOriginalQueue string // the record on the wire
+}{
+	{"billing", "billing", "billing", "billing"},
+	{"empty", "", "orders", "orders"},
+	{"spaces", "  ", "orders", "  "},
+	{"single space", " ", "orders", " "},
+	{"tab and newline", "\t\n", "orders", "\t\n"},
+	{"vertical tab and form feed", "\v\f\r", "orders", "\v\f\r"},
+	{"no-break space is not blank", "\u00a0", "\u00a0", "\u00a0"},
+	{"ideographic space is not blank", "\u3000", "\u3000", "\u3000"},
+}
+
+// deadLetterUnknownURN dead-letters an unknown-URN message whose meta.queue is metaQueue, consumed
+// from "orders", and returns the observer events and the bodies written to orders.dlq.
+func deadLetterUnknownURN(t *testing.T, metaQueue string) (*obsRecorder, []string) {
+	t.Helper()
+	env, err := babelqueue.Make("urn:bq:orders:unknown", map[string]any{"n": 1}, babelqueue.WithQueue(metaQueue))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, err := env.Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := &obsRecorder{}
+	base := newObsBase(obsMsg(string(body)))
+	app := babelqueue.NewApp(base, babelqueue.WithDeadLetterObserver(rec.observe),
+		babelqueue.WithUnknownURNStrategy(babelqueue.StrategyDeadLetter))
+	drain(t, app)
+	return rec, base.published["orders.dlq"]
+}
