@@ -44,7 +44,7 @@ func TestCrossHopParentChildLinkage(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	consumer := endedByName(t, sr, "process "+env.URN())
+	consumer := endedByName(t, sr, "process "+env.Meta.Queue)
 	prodSC := producer.SpanContext()
 
 	// Same trace across the hop.
@@ -81,7 +81,7 @@ func TestNoHeaderFallsBackToTraceID(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	consumer := endedByName(t, sr, "process "+env.URN())
+	consumer := endedByName(t, sr, "process "+env.Meta.Queue)
 	if consumer.SpanContext().TraceID() != TraceIDOf(env.TraceID) {
 		t.Error("fallback span must be in the trace_id-derived trace (v0.1 behaviour)")
 	}

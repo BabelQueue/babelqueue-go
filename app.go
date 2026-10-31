@@ -46,6 +46,7 @@ type App struct {
 	onAckError          func(ctx context.Context, msg *ReceivedMessage, err error)
 	onReleaseError      func(ctx context.Context, msg *ReceivedMessage, err error)
 	onDeadLetterErr     func(ctx context.Context, msg *ReceivedMessage, err error)
+	onDeadLetter        DeadLetterObserver
 	rewindPause         time.Duration
 	handlers            map[string]Handler
 }
@@ -209,6 +210,42 @@ func WithDeadLetterErrorHandler(fn func(ctx context.Context, msg *ReceivedMessag
 	return func(a *App) { a.onDeadLetterErr = fn }
 }
 
+// DeadLetterEvent describes one dead-letter the SDK itself carried out and confirmed, as
+// reported to a [DeadLetterObserver] (ADR-0039 section 5.1).
+type DeadLetterEvent struct {
+	// Queue is the source queue the message was consumed from (meta.queue of the message when
+	// it has one, else the queue the delivery came from).
+	Queue string
+	// DeadLetterQueue is the BabelQueue DLQ the record was written to. It is empty for a native
+	// dead-letter (the broker's own $DeadLetterQueue sub-entity), where no BabelQueue DLQ is used.
+	DeadLetterQueue string
+	// Reason is the dead_letter.reason the SDK wrote into the record ("failed", "unknown_urn",
+	// "poison"). It is empty for a raw version-gated body (no dead_letter block) and for a native
+	// dead-letter.
+	Reason string
+}
+
+// DeadLetterObserver is called once per dead-letter the App itself carried out, after it is
+// confirmed (ADR-0039 section 5.1):
+//
+//   - a record written to the BabelQueue DLQ (an exhausted retry, an unknown URN under
+//     [StrategyDeadLetter], a poison body, a raw version-gated body);
+//   - a native dead-letter the SDK initiated, when the transport reports it through
+//     [NativeDeadLetterSettler] (Azure Service Bus).
+//
+// It is not called when the write or the native call fails, when the broker dead-letters on its
+// own (SQS RedrivePolicy, Service Bus MaxDeliveryCount), for a native settle that is a no-op, or
+// when dead-lettering is off and the message is dropped. A panic raised by the observer is
+// recovered and logged; it never changes how the message is settled.
+type DeadLetterObserver func(ctx context.Context, event DeadLetterEvent)
+
+// WithDeadLetterObserver registers fn as the [DeadLetterObserver] (ADR-0039). A nil fn
+// unregisters it. The core stays free of any telemetry dependency: the optional otel module
+// provides an observer that increments the babelqueue.dlq.messages counter.
+func WithDeadLetterObserver(fn DeadLetterObserver) AppOption {
+	return func(a *App) { a.onDeadLetter = fn }
+}
+
 // WithRewindPause sets how long the App waits after handing a message whose dead-letter write
 // failed (version-gated, poison, or retries exhausted) back to the broker before polling again
 // (default 1s), so a persistent dead-letter outage does not spin.
@@ -243,18 +280,7 @@ func (a *App) Handle(urn string, handler Handler) {
 // returns the message id (meta.id). Pass envelope options such as [WithQueue] or
 // [WithTraceID] to override the target queue or continue a trace.
 func (a *App) Publish(ctx context.Context, urn string, data map[string]any, opts ...Option) (string, error) {
-	env, err := Make(urn, data, append([]Option{WithQueue(a.queue)}, opts...)...)
-	if err != nil {
-		return "", err
-	}
-	body, err := env.Encode()
-	if err != nil {
-		return "", err
-	}
-	if err := a.transport.Publish(ctx, env.Meta.Queue, string(body)); err != nil {
-		return "", err
-	}
-	return env.Meta.ID, nil
+	return a.PublishWithHeaders(ctx, urn, data, nil, opts...)
 }
 
 // PublishWithHeaders builds the canonical envelope for (urn, data) and publishes it
@@ -276,25 +302,52 @@ func (a *App) PublishWithHeaders(
 	headers map[string]string,
 	opts ...Option,
 ) (string, error) {
-	env, err := Make(urn, data, append([]Option{WithQueue(a.queue)}, opts...)...)
+	env, err := a.PublishEnvelopeWithHeaders(ctx, urn, data, headers, opts...)
 	if err != nil {
-		return "", err
-	}
-	body, err := env.Encode()
-	if err != nil {
-		return "", err
-	}
-	if hp, ok := a.transport.(HeaderPublisher); ok && len(headers) > 0 {
-		if err := hp.PublishWithHeaders(ctx, env.Meta.Queue, string(body), headers); err != nil {
-			return "", err
-		}
-		return env.Meta.ID, nil
-	}
-	if err := a.transport.Publish(ctx, env.Meta.Queue, string(body)); err != nil {
 		return "", err
 	}
 	return env.Meta.ID, nil
 }
+
+// PublishEnvelopeWithHeaders is [App.PublishWithHeaders] that returns the envelope it built
+// instead of only the message id, and returns it on a failed publish too, so a wrapper (such as
+// the otel module's producer span) can describe the message that was attempted.
+//
+// The envelope counts as built only once it has been handed to the transport:
+//
+//   - if [Make] or [Envelope.Encode] fails (an empty URN, a bad meta entry, a payload that
+//     cannot be serialised) nothing reaches the transport, and the result is the zero
+//     [Envelope] and the error;
+//   - if the transport rejects the publish, the result is the envelope that was handed to it
+//     (meta.id, trace_id and meta.queue are filled in) and the transport's error.
+//
+// On success it returns the envelope and a nil error. The envelope is the one the App built, so
+// its queue is the per-call [WithQueue] value when given, else [App.DefaultQueue].
+func (a *App) PublishEnvelopeWithHeaders(
+	ctx context.Context,
+	urn string,
+	data map[string]any,
+	headers map[string]string,
+	opts ...Option,
+) (Envelope, error) {
+	env, err := Make(urn, data, append([]Option{WithQueue(a.queue)}, opts...)...)
+	if err != nil {
+		return Envelope{}, err
+	}
+	body, err := env.Encode()
+	if err != nil {
+		return Envelope{}, err
+	}
+	if hp, ok := a.transport.(HeaderPublisher); ok && len(headers) > 0 {
+		return env, hp.PublishWithHeaders(ctx, env.Meta.Queue, string(body), headers)
+	}
+	return env, a.transport.Publish(ctx, env.Meta.Queue, string(body))
+}
+
+// DefaultQueue returns the queue Publish and Consume use when none is given: the value set with
+// [WithDefaultQueue], else "default". A per-call [WithQueue] overrides it for one publish, which
+// this getter cannot see.
+func (a *App) DefaultQueue() string { return a.queue }
 
 // Consume processes messages from the default queue (or the optional override)
 // until ctx is cancelled. It blocks; run it in its own goroutine. A single bad
@@ -483,7 +536,7 @@ func (a *App) settleVersionGated(ctx context.Context, msg *ReceivedMessage) {
 	// §3.7/§4.7/§5.7/§6.7/§7.7: reject WITHOUT decoding. The DLQ record is the raw body exactly as
 	// it arrived: an unknown schema is never best-effort parsed or re-encoded, so no dead_letter
 	// block is added and the bytes stay identical to the incoming body (Java/.NET/Node parity).
-	settled, err := a.deadLetterRaw(ctx, msg, msg.Body)
+	settled, err := a.deadLetterRaw(ctx, msg, msg.Body, "", msg.Queue)
 	if err != nil {
 		a.leaveDeadLetterUnsettled(ctx, msg, err, "a version-gated message")
 		return
@@ -491,22 +544,75 @@ func (a *App) settleVersionGated(ctx context.Context, msg *ReceivedMessage) {
 	a.settle(ctx, msg, settled)
 }
 
+// NativeDeadLetterSettler is an optional [Transport] capability next to [NativeSettler] (ADR-0039
+// section 5.1): a native settle that also reports whether it dead-lettered the message. SettleNative
+// alone cannot tell the Azure Service Bus explicit DeadLetterMessage (counted as a dead-letter) from
+// the SQS no-op, or from the Service Bus abandon fallback (the broker's own MaxDeliveryCount, not
+// counted), so a transport that can tell implements this as well. deadLettered is true only when
+// the SDK itself moved the message to the broker's dead-letter sub-entity and the call succeeded; it
+// is false whenever err is non-nil. The settle is exactly [NativeSettler.SettleNative]'s. The interface
+// embeds [NativeSettler]: the variant is an addition to the native settle capability, never a
+// replacement for it, so a transport must implement both.
+//
+// When a transport has this method the [App] calls it instead of SettleNative and notifies the
+// [DeadLetterObserver] only on deadLettered == true. A transport with only [NativeSettler] (SQS)
+// is never reported to the observer. The [NativeSettler] interface itself is unchanged.
+type NativeDeadLetterSettler interface {
+	NativeSettler
+	SettleNativeDeadLetter(ctx context.Context, msg *ReceivedMessage, reason, description string) (deadLettered bool, err error)
+}
+
 // settleNative hands msg to the transport's [NativeSettler] capability and reports whether it did:
 // false means the transport has none and the caller keeps its previous settle. The event is logged
 // (never retried by the SDK); a failure of the call is logged too and leaves the message
-// unacknowledged, exactly like the native settle itself, so the broker redelivers it.
+// unacknowledged, exactly like the native settle itself, so the broker redelivers it. A transport
+// that also has [NativeDeadLetterSettler] is asked through it, and a native dead-letter that
+// succeeded is reported to the [DeadLetterObserver].
 func (a *App) settleNative(ctx context.Context, msg *ReceivedMessage, reason, description string) bool {
+	if nd, ok := a.transport.(NativeDeadLetterSettler); ok {
+		a.logNativeSettle(ctx, msg, reason)
+		deadLettered, err := nd.SettleNativeDeadLetter(ctx, msg, reason, description)
+		if err != nil {
+			a.logNativeSettleFailure(ctx, msg, reason, err)
+		} else if deadLettered {
+			a.notifyDeadLetter(ctx, DeadLetterEvent{Queue: msg.Queue})
+		}
+		return true
+	}
 	ns, ok := a.transport.(NativeSettler)
 	if !ok {
 		return false
 	}
-	slog.WarnContext(ctx, "babelqueue: left to the broker's native mechanism (not acknowledged, not retried)",
-		"queue", msg.Queue, "route", msg.RouteURN, "reason", reason)
+	a.logNativeSettle(ctx, msg, reason)
 	if err := ns.SettleNative(ctx, msg, reason, description); err != nil {
-		slog.ErrorContext(ctx, "babelqueue: native settle failed; the message stays unacknowledged and will be redelivered",
-			"queue", msg.Queue, "reason", reason, "error", err)
+		a.logNativeSettleFailure(ctx, msg, reason, err)
 	}
 	return true
+}
+
+func (a *App) logNativeSettle(ctx context.Context, msg *ReceivedMessage, reason string) {
+	slog.WarnContext(ctx, "babelqueue: left to the broker's native mechanism (not acknowledged, not retried)",
+		"queue", msg.Queue, "route", msg.RouteURN, "reason", reason)
+}
+
+func (a *App) logNativeSettleFailure(ctx context.Context, msg *ReceivedMessage, reason string, err error) {
+	slog.ErrorContext(ctx, "babelqueue: native settle failed; the message stays unacknowledged and will be redelivered",
+		"queue", msg.Queue, "reason", reason, "error", err)
+}
+
+// notifyDeadLetter calls the [WithDeadLetterObserver] hook, recovering and logging a panic so the
+// settle outcome and the consume loop are unaffected.
+func (a *App) notifyDeadLetter(ctx context.Context, event DeadLetterEvent) {
+	if a.onDeadLetter == nil {
+		return
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			slog.ErrorContext(ctx, "babelqueue: dead-letter observer panicked; ignored",
+				"queue", event.Queue, "panic", fmt.Sprint(r))
+		}
+	}()
+	a.onDeadLetter(ctx, event)
 }
 
 // settleTransportPoison dead-letters a delivery the transport flagged [ReceivedMessage.Poison]:
@@ -527,12 +633,21 @@ func (a *App) settleTransportPoison(ctx context.Context, msg *ReceivedMessage) {
 
 // deadLetterRaw writes body to msg's dead-letter queue. A transport with the [DeadLetterer]
 // capability does it as one gated step that also settles msg (settled is true: the caller must
-// not ack); otherwise the body is re-published and the caller acks.
-func (a *App) deadLetterRaw(ctx context.Context, msg *ReceivedMessage, body string) (settled bool, err error) {
+// not ack); otherwise the body is re-published and the caller acks. After a confirmed write it
+// notifies the [DeadLetterObserver] with the reason the record carries ("" for a raw body) and the
+// source queue; a failed write notifies nothing.
+func (a *App) deadLetterRaw(ctx context.Context, msg *ReceivedMessage, body, reason, sourceQueue string) (settled bool, err error) {
+	target := a.deadLetterTarget(msg)
 	if dl, ok := a.transport.(DeadLetterer); ok {
-		return true, dl.DeadLetter(ctx, msg, a.deadLetterTarget(msg), body)
+		settled, err = true, dl.DeadLetter(ctx, msg, target, body)
+	} else {
+		settled, err = false, a.republish(ctx, msg, target, body)
 	}
-	return false, a.republish(ctx, msg, a.deadLetterTarget(msg), body)
+	if err != nil {
+		return settled, err
+	}
+	a.notifyDeadLetter(ctx, DeadLetterEvent{Queue: sourceQueue, DeadLetterQueue: target, Reason: reason})
+	return settled, nil
 }
 
 // settle acknowledges msg unless a gated operation already settled it.
@@ -669,7 +784,7 @@ func (a *App) settleRawPoison(ctx context.Context, msg *ReceivedMessage, decodeE
 	body, err := poisonDeadLetterBody(msg, decodeErr)
 	settled := false
 	if err == nil {
-		settled, err = a.deadLetterRaw(ctx, msg, string(body))
+		settled, err = a.deadLetterRaw(ctx, msg, string(body), "poison", msg.Queue)
 	}
 	if err != nil {
 		a.leaveDeadLetterUnsettled(ctx, msg, err, "an undecodable message")
@@ -833,5 +948,5 @@ func (a *App) writeDeadLetter(ctx context.Context, msg *ReceivedMessage, env Env
 	if err != nil {
 		return false, err
 	}
-	return a.deadLetterRaw(ctx, msg, string(body))
+	return a.deadLetterRaw(ctx, msg, string(body), reason, originalQueue)
 }

@@ -35,6 +35,54 @@ The envelope wire format is versioned separately by `meta.schema_version`
   `HeaderPublisher.PublishWithHeaders`. `kafka` implements it (record key carried byte-for-byte, §6.5) and
   `pulsar` implements it (routing property and version-gate properties kept, §5.2/§5.7). Transports are
   discovered structurally; no existing interface changes.
+- **Core: dead-letter observer (ADR-0039 §5.1).** New optional `WithDeadLetterObserver(fn)` with the types
+  `DeadLetterObserver func(ctx, DeadLetterEvent)` and `DeadLetterEvent{Queue, DeadLetterQueue, Reason}`. The `App`
+  calls it once per dead-letter it carried out, after the write is confirmed: from `App.deadLetterRaw` for every
+  record written to the BabelQueue DLQ (an exhausted retry, an unknown URN under `dead_letter`, a poison body, a
+  raw version-gated body), and from `App.settleNative` for a native dead-letter the SDK initiated. It is not
+  called for a failed write, a failed native call, a native no-op (SQS), the broker's own dead-letter or a
+  dropped message. A panic in the observer is recovered and logged and never changes how the message is settled.
+- **Core: new optional capability `NativeDeadLetterSettler`** (`SettleNativeDeadLetter(ctx, msg, reason,
+  description) (deadLettered bool, err error)`), the native-settle variant of ADR-0039 §5.1 that also reports
+  whether it dead-lettered. When a transport has it the `App` calls it in place of `SettleNative` and notifies
+  the observer only on `deadLettered == true`. `azureservicebus` already implements it (the method added with
+  the previous entry); SQS does not, so its no-op is never counted. `NativeSettler` is unchanged.
+- **Core: producer seam for the `otel` span.** `App.PublishEnvelopeWithHeaders(ctx, urn, data, headers, opts...)
+  (Envelope, error)` is `PublishWithHeaders` that returns the envelope: the zero `Envelope` and the error when
+  `Make` or `Encode` fails (the envelope was never handed to the transport), the envelope that was handed to the
+  transport and the transport's error when the publish fails. `App.DefaultQueue()` returns the
+  `WithDefaultQueue` value. `Publish` and `PublishWithHeaders` keep their signatures, results and error
+  semantics (they now delegate to the new method).
+- **`otel`: OpenTelemetry semantic conventions v1.44.0 span shape (ADR-0038).** New `otel.SemconvVersion`
+  (`"1.44.0"`) and `otel.SchemaURL` (`"https://opentelemetry.io/schemas/1.44.0"`); create your tracer and meter
+  with `trace.WithSchemaURL(otel.SchemaURL)` / `metric.WithSchemaURL(otel.SchemaURL)`. New functional options
+  `WithSystem(system)` (the `messaging.system` value: `redis`, `rabbitmq`, `aws_sqs`, `servicebus`, `pulsar`,
+  `kafka`, `activemq`, any other value as given), `WithConsumerGroup(group)` (`messaging.consumer.group.name`
+  on the consumer span) and `WithMeter(meter)`. `WrapHandler(tracer, handler, opts ...Option)` takes them as
+  a trailing variadic (existing calls compile unchanged); the producer is the new `otel.NewPublisher(tracer,
+  app, opts...)` with `Publisher.Publish(ctx, urn, data, babelqueue opts...)`, and `otel.Publish` keeps its
+  signature and uses the defaults.
+  - New attributes: `messaging.operation.type`, `messaging.operation.name`, `babelqueue.urn`,
+    `babelqueue.schema_version`, `babelqueue.attempts`, `messaging.consumer.group.name`, and `error.type`
+    (`%T` of the error) with the error event and status `Error` on a failure.
+  - The producer span starts as the bare `send` and is renamed `send <queue>` (with
+    `messaging.destination.name`, `messaging.message.id` and `messaging.message.conversation_id`) from the
+    envelope the `App` built, once it was handed to the transport. If the build or the encode fails the span
+    stays `send` and carries none of those.
+  - A `trace_id` that is not a UUID is preserved untouched and still mapped by `TraceIDOf` (unchanged); the
+    consumer wrapper logs a `slog` warning the first time it hashes a given value.
+- **`otel`: standard metrics (ADR-0039).** With `WithMeter` the wrappers record `messaging.process.duration`
+  (histogram, `s`, semconv advisory buckets), `messaging.client.sent.messages`,
+  `messaging.client.consumed.messages` and `babelqueue.retries` (counters, `{message}`), with only
+  `messaging.system`, `messaging.operation.name`, `messaging.destination.name` (when known) and `error.type`
+  (on a failure of the duration and sent metrics). `otel.NewDeadLetterObserver(opts...)` returns the observer
+  that feeds `babelqueue.dlq.messages`; register it with `babelqueue.WithDeadLetterObserver`. Without a meter
+  nothing is recorded. The `otel` module now requires `go.opentelemetry.io/otel/metric` directly and needs the
+  core version that contains the observer and the producer seam above (the local `replace` resolves it in this
+  repo).
+- Conformance **1.9.0** vendored from the local `conformance/` copy (`span-shape`, `trace-id` and `metrics`
+  sections, scope `otel`; `CONFORMANCE_VERSION` is `1.9.0`). `otel/conformance_test.go` runs all 37 + 43 + 29
+  cases, and `conformance_results_test.go` maps the three sections so `results.json` reports them.
 
 ### Changed
 
@@ -46,6 +94,14 @@ The envelope wire format is versioned separately by `meta.schema_version`
 - The optional contract mirrors other SDKs write (`bq-attempts` / `bq-delay` on Azure Service Bus, `bq_delay` on
   Artemis, `bq-delay` on Pulsar) are reserved names: they are not accepted from `PublishWithHeaders` and are not
   surfaced in `ReceivedMessage.Headers`.
+- **Dashboard-breaking (`otel`, ADR-0038 §5).** The span names are now `send <queue>` / `process <queue>` (was
+  `publish <urn>` / `process <urn>`; the URN moved to `babelqueue.urn`), the producer's
+  `messaging.destination.name` is the queue (was the URN), and `messaging.system` is the value given to
+  `WithSystem`. Update saved queries and alerts.
+- **Deprecated, one MINOR (`otel`, ADR-0038 §5).** `messaging.operation` and `messaging.babelqueue.attempts` are
+  still written next to `messaging.operation.type` / `.name` and `babelqueue.attempts`; the next MINOR removes
+  them. Leaving `WithSystem` out keeps `messaging.system = babelqueue`, which is deprecated too (the module logs
+  a one-time warning); pass the broker name.
 
 ## [1.18.0, sqs 1.12.0, azureservicebus 1.3.0] - 2026-10-26
 
