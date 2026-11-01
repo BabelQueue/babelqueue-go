@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.19.0, kafka 1.6.0, pulsar 1.5.0, artemis 1.3.0, azureservicebus 1.4.0, otel 0.4.0] - 2026-11-01
+
 ### Added
 
 - **W3C `traceparent` / `tracestate` carriage on the Kafka, Pulsar, Artemis and Azure Service Bus transports
