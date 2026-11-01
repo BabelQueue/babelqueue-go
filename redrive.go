@@ -23,7 +23,7 @@ type RedriveOptions struct {
 	Select func(Envelope) bool
 	// Bypass stamps the bq-replay-bypass transport header on each redriven message, so a
 	// handler can skip external side-effects that already ran (see [BypassExternalEffects]).
-	// It takes effect only when the transport is a [HeaderPublisher]; otherwise it is a no-op
+	// It takes effect only when the transport is a [HeaderRepublisher] or a [HeaderPublisher]; otherwise it is a no-op
 	// and the per-item Bypassed flag stays false (ADR-0027).
 	Bypass bool
 	// Timeout is the per-pop wait passed to the transport (default 1s).
@@ -166,11 +166,16 @@ func sourceQueueOf(env Envelope) string {
 }
 
 // publishRedriven re-publishes a reset message to queue on behalf of the DLQ message from. When
-// bypass is set and the transport is a [HeaderPublisher], it stamps the bq-replay-bypass header
-// and reports bypassed=true (that path carries no record key); otherwise it re-publishes through
-// [republishFrom] and reports bypassed=false.
+// bypass is set and the transport is a [HeaderRepublisher], it stamps the bq-replay-bypass header
+// through it, so the per-delivery metadata (Kafka's record key, Pulsar's route) is carried as on a
+// plain redrive; failing that, with a [HeaderPublisher] it stamps the header through a bare
+// PublishWithHeaders (which carries no record key or route). Either reports bypassed=true;
+// otherwise it re-publishes through [republishFrom] and reports bypassed=false.
 func publishRedriven(ctx context.Context, t Transport, queue, body string, bypass bool, from *ReceivedMessage) (bool, error) {
 	if bypass {
+		if hr, ok := t.(HeaderRepublisher); ok && from != nil {
+			return true, hr.PublishFromWithHeaders(ctx, queue, body, from, map[string]string{HeaderReplayBypass: "1"})
+		}
 		if hp, ok := t.(HeaderPublisher); ok {
 			return true, hp.PublishWithHeaders(ctx, queue, body, map[string]string{HeaderReplayBypass: "1"})
 		}

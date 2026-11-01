@@ -109,7 +109,7 @@ func (t *Transport) PublishDelayed(ctx context.Context, queue, body string, dela
 // PublishRetry republishes the reserved record from to the smallest retry tier that covers delay.
 // It carries the pre-1.x delay-to-tier mapping unchanged: the envelope's attempts and the
 // `bq-attempts` header both become attempts + 1, `bq-original-topic` and `bq-delay` (= delay) are
-// set, and the reserved record's key is carried over. The caller commits the original offset
+// set, and the reserved record's key and W3C trace headers are carried over. The caller commits the original offset
 // afterwards ([Transport.Ack]). It returns [ErrDelayUnsupported] when no tiers are configured or
 // delay exceeds the largest tier.
 //
@@ -132,6 +132,7 @@ func (t *Transport) PublishRetry(ctx context.Context, from *babelqueue.ReceivedM
 	m := retryRecord(topic, from.Queue, string(next), delay)
 	if km, ok := from.Handle.(kafkago.Message); ok {
 		m.Key = km.Key
+		forwardTraceHeaders(&m, km)
 	}
 	return t.writer.WriteMessages(ctx, m)
 }
@@ -167,11 +168,7 @@ func (t *Transport) PublishRetryForAttempt(ctx context.Context, from *babelqueue
 	m := retryRecord(RetryTopic(from.Queue, n), from.Queue, string(next), tier)
 	if km, ok := from.Handle.(kafkago.Message); ok {
 		m.Key = km.Key
-		for _, h := range km.Headers {
-			if h.Key == "traceparent" || h.Key == "tracestate" {
-				m.Headers = append(m.Headers, h)
-			}
-		}
+		forwardTraceHeaders(&m, km)
 	}
 	return t.writer.WriteMessages(ctx, m)
 }

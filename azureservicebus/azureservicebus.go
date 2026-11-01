@@ -190,6 +190,21 @@ func (t *Transport) Publish(ctx context.Context, queue, body string) error {
 	return s.SendMessage(ctx, message(body), nil)
 }
 
+// PublishWithHeaders implements [babelqueue.HeaderPublisher]: it sends body like [Transport.Publish]
+// and adds the out-of-band transport headers as extra string-valued application properties beside
+// the §4 bq- projection - e.g. a W3C traceparent / tracestate for cross-hop span linkage (ADR-0028).
+// The body is the unchanged envelope (GR-1). A bq- contract property always wins a key collision,
+// and blank keys and values are skipped. A nil or empty map behaves exactly like Publish.
+func (t *Transport) PublishWithHeaders(ctx context.Context, queue, body string, headers map[string]string) error {
+	s, err := t.sender(queue)
+	if err != nil {
+		return err
+	}
+	m := message(body)
+	m.ApplicationProperties = mergeOutOfBand(m.ApplicationProperties, headers)
+	return s.SendMessage(ctx, m, nil)
+}
+
 // Pop reserves the next message (PeekLock), bounded by timeout (and WithMaxWaitTime).
 // It reconciles attempts to max(body.attempts, DeliveryCount − 1). Returns (nil, nil)
 // when no message arrives.
@@ -231,10 +246,11 @@ func (t *Transport) Pop(ctx context.Context, queue string, timeout time.Duration
 			Handle:        m,
 			DeliveryCount: int(m.DeliveryCount),
 			RouteURN:      unsupportedSchemaRoutePrefix + url.QueryEscape(v),
+			Headers:       outOfBandFromProperties(m.ApplicationProperties),
 		}, nil
 	}
 	body := reconcileAttempts(string(m.Body), m.DeliveryCount)
-	return &babelqueue.ReceivedMessage{Body: body, Queue: queue, Handle: m}, nil
+	return &babelqueue.ReceivedMessage{Body: body, Queue: queue, Handle: m, Headers: outOfBandFromProperties(m.ApplicationProperties)}, nil
 }
 
 // Ack completes the reserved message (removing it from the entity).
@@ -279,23 +295,39 @@ func (t *Transport) Rewind(ctx context.Context, msg *babelqueue.ReceivedMessage)
 // falls back to Abandon, which leaves the message to MaxDeliveryCount - also a conformant native
 // settle; a receiver with neither lets the lock lapse on its own.
 func (t *Transport) SettleNative(ctx context.Context, msg *babelqueue.ReceivedMessage, reason, description string) error {
+	_, err := t.SettleNativeDeadLetter(ctx, msg, reason, description)
+	return err
+}
+
+// SettleNativeDeadLetter is [Transport.SettleNative] that also reports what it did (ADR-0039 §5.1):
+// deadLettered is true only when DeadLetterMessage was actually called and succeeded, i.e. the
+// message now sits in $DeadLetterQueue by the SDK's own explicit act. It is false for the Abandon
+// fallback of a receiver without DeadLetterMessage (the broker's MaxDeliveryCount, not the SDK,
+// would dead-letter it later), for a handle that is not a Service Bus message, and whenever err is
+// non-nil. The runtime prefers this method over SettleNative (the optional native-settle variant
+// the core App looks for structurally) so a native dead-letter is counted and an abandon is not.
+// The settle itself is exactly SettleNative's, which delegates here.
+func (t *Transport) SettleNativeDeadLetter(ctx context.Context, msg *babelqueue.ReceivedMessage, reason, description string) (deadLettered bool, err error) {
 	rm, ok := msg.Handle.(*azservicebus.ReceivedMessage)
 	if !ok || rm == nil {
-		return nil
+		return false, nil
 	}
 	r, err := t.receiver(msg.Queue)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if dl, ok := r.(interface {
 		DeadLetterMessage(ctx context.Context, message *azservicebus.ReceivedMessage, options *azservicebus.DeadLetterOptions) error
 	}); ok {
-		return dl.DeadLetterMessage(ctx, rm, &azservicebus.DeadLetterOptions{
+		if err := dl.DeadLetterMessage(ctx, rm, &azservicebus.DeadLetterOptions{
 			Reason:           &reason,
 			ErrorDescription: &description,
-		})
+		}); err != nil {
+			return false, err
+		}
+		return true, nil
 	}
-	return t.Rewind(ctx, msg)
+	return false, t.Rewind(ctx, msg)
 }
 
 // message projects the envelope's contract fields onto a native Service Bus message.
@@ -351,11 +383,77 @@ func reconcileAttempts(body string, deliveryCount uint32) string {
 	return body
 }
 
+// contractProperties are the application properties the transport owns (the §4 bq- projection).
+// They are never accepted from, nor surfaced as, out-of-band transport headers.
+var contractProperties = map[string]struct{}{
+	"bq-schema-version": {},
+	"bq-source-lang":    {},
+	"bq-created-at":     {},
+	"bq-attempts":       {}, // optional §4.2 mirror written by other SDKs; DeliveryCount wins (§4.5)
+	"bq-delay":          {}, // optional §4.4 diagnostic written by other SDKs
+}
+
+// mergeOutOfBand adds the out-of-band headers to props (allocating it when nil) as string values
+// without ever overwriting a key props already holds or writing a contract property name; blank
+// keys and values are skipped. It returns props unchanged when there is nothing to add.
+func mergeOutOfBand(props map[string]any, extra map[string]string) map[string]any {
+	for k, v := range extra {
+		if k == "" || v == "" {
+			continue
+		}
+		if _, reserved := contractProperties[k]; reserved {
+			continue
+		}
+		if _, exists := props[k]; exists {
+			continue
+		}
+		if props == nil {
+			props = make(map[string]any, len(extra))
+		}
+		props[k] = v
+	}
+	return props
+}
+
+// outOfBandFromProperties maps the application properties a producer attached beside the §4 bq-
+// projection (traceparent, tracestate, bq-replay-bypass, ...) to a flat map for
+// [babelqueue.ReceivedMessage.Headers]. Only string (and byte-string) values are surfaced - these
+// are text carriers; the bq- contract properties the transport reads itself are not, and blank
+// values are skipped. It returns nil when nothing remains, so a header-less delivery stays
+// header-less.
+func outOfBandFromProperties(props map[string]any) map[string]string {
+	var out map[string]string
+	for k, raw := range props {
+		if k == "" {
+			continue
+		}
+		if _, reserved := contractProperties[k]; reserved {
+			continue
+		}
+		var v string
+		switch val := raw.(type) {
+		case string:
+			v = val
+		case []byte:
+			v = string(val)
+		}
+		if v == "" {
+			continue
+		}
+		if out == nil {
+			out = make(map[string]string)
+		}
+		out[k] = v
+	}
+	return out
+}
+
 func strPtr(s string) *string { return &s }
 
 var (
-	_ babelqueue.Transport     = (*Transport)(nil)
-	_ babelqueue.NativeSettler = (*Transport)(nil)
+	_ babelqueue.Transport       = (*Transport)(nil)
+	_ babelqueue.NativeSettler   = (*Transport)(nil)
+	_ babelqueue.HeaderPublisher = (*Transport)(nil)
 )
 
 // unsupportedSchemaRoutePrefix is the reserved [babelqueue.ReceivedMessage.RouteURN] prefix of a

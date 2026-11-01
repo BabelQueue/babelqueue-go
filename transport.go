@@ -85,6 +85,19 @@ type KeyedRepublisher interface {
 	PublishFrom(ctx context.Context, queue, body string, from *ReceivedMessage) error
 }
 
+// HeaderRepublisher is an optional [Transport] capability: re-publish a body on behalf of a message
+// the transport itself reserved AND attach out-of-band transport headers, keeping everything a
+// [KeyedRepublisher] / [RoutedPublisher] keeps (Kafka: the record key, contract §6.5; Pulsar: the
+// routing and version-gate properties, §5.2/§5.7). It is [HeaderPublisher.PublishWithHeaders] that
+// does not forget the delivery it stands in for. [Redrive] uses it, in preference to a bare
+// PublishWithHeaders, to stamp the bq-replay-bypass marker (ADR-0027) without losing that metadata.
+// from is the reserved message, non-nil. A transport that does not implement it falls back to
+// [HeaderPublisher], which carries the headers but not the per-delivery metadata. Purely additive:
+// no existing interface changes.
+type HeaderRepublisher interface {
+	PublishFromWithHeaders(ctx context.Context, queue, body string, from *ReceivedMessage, headers map[string]string) error
+}
+
 // publishKeepingRoute publishes body to queue, carrying routeURN when it is non-empty and t
 // implements [RoutedPublisher]; otherwise it is a plain Publish. Shared by the App's re-publishes
 // (retry, release, dead-letter) and by [Redrive].
