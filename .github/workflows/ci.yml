@@ -69,10 +69,10 @@ jobs:
           (cd idempotency-redis && go build ./... && go vet ./... && go test -race -count=1 ./...)
 
       - name: Build & vet the otel and idempotency-postgres modules
-        # Every module floors at Go 1.26 (otel 1.47 and the security-fixed pgx / x/crypto
-        # dependencies require it), so they build/test on every matrix entry. The OpenTelemetry module (ADR-0025)
-        # uses an in-memory span recorder; the Postgres idempotency store (ADR-0022) uses go-sqlmock, and its live DB path
-        # skips unless BABELQUEUE_TEST_PG is set.
+        # Every module floors at Go 1.26 (the repo floor; otel 1.47 itself requires go 1.26.0),
+        # so they build/test on every matrix entry. The OpenTelemetry module (ADR-0025) uses an
+        # in-memory span recorder; the Postgres idempotency store (ADR-0022) uses go-sqlmock,
+        # and its live DB path skips unless BABELQUEUE_TEST_PG is set.
         run: |
           (cd otel && go build ./... && go vet ./... && go test -race -count=1 ./...)
           (cd idempotency-postgres && go build ./... && go vet ./... && go test -race -count=1 ./...)
