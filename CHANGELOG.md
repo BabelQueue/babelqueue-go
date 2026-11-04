@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 The envelope wire format is versioned separately by `meta.schema_version`
 (currently **1**) — see the contract at [babelqueue.com](https://babelqueue.com).
 
-## [Unreleased]
+## [1.20.0, amqp 1.3.0, artemis 1.4.0, asynq 1.1.0, azureservicebus 1.5.0, idempotency-postgres 1.1.0, idempotency-redis 1.1.0, kafka 1.7.0, machinery 1.2.0, otel 0.5.0, pulsar 1.6.0, redis 1.5.0, sqs 1.13.0] - 2026-11-04
 
 ### Changed
 
@@ -1079,7 +1079,8 @@ following the deprecation policy. The wire envelope is unchanged
 - Pre-1.0: the public API may change before the `1.0.0` tag.
 - **Zero dependencies** (standard library only); Go `>=1.21`.
 
-[Unreleased]: https://github.com/BabelQueue/babelqueue-go/compare/v1.19.0...HEAD
+[Unreleased]: https://github.com/BabelQueue/babelqueue-go/compare/v1.20.0...HEAD
+[1.20.0, amqp 1.3.0, artemis 1.4.0, asynq 1.1.0, azureservicebus 1.5.0, idempotency-postgres 1.1.0, idempotency-redis 1.1.0, kafka 1.7.0, machinery 1.2.0, otel 0.5.0, pulsar 1.6.0, redis 1.5.0, sqs 1.13.0]: https://github.com/BabelQueue/babelqueue-go/compare/v1.19.0...v1.20.0
 [1.19.0, kafka 1.6.0, pulsar 1.5.0, artemis 1.3.0, azureservicebus 1.4.0, otel 0.4.0]: https://github.com/BabelQueue/babelqueue-go/compare/v1.18.0...v1.19.0
 [1.18.0, sqs 1.12.0, azureservicebus 1.3.0]: https://github.com/BabelQueue/babelqueue-go/compare/v1.17.0...v1.18.0
 [1.17.0]: https://github.com/BabelQueue/babelqueue-go/compare/v1.16.0...v1.17.0
