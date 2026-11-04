@@ -1,6 +1,6 @@
 module github.com/babelqueue/babelqueue-go/amqp
 
-go 1.24
+go 1.26
 
 require (
 	github.com/babelqueue/babelqueue-go v1.16.0

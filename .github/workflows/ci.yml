@@ -32,7 +32,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        go: [ "1.24", "1.25" ]
+        go: [ "1.26", "1.27" ]
     steps:
       - uses: actions/checkout@v7
 
@@ -63,71 +63,60 @@ jobs:
           # client), so they run here across the Go matrix; the live ElasticMQ
           # round-trip is `-tags=integration` in the integration job below.
           (cd sqs && go build ./... && go vet ./... && go test -race -count=1 ./...)
-          # The Redis idempotency store (ADR-0022) floors at Go 1.24 (the core's floor);
+          # The Redis idempotency store (ADR-0022) floors at Go 1.26 (the core's floor);
           # its unit tests are broker-free (a fake client seam), so it runs across the whole
           # Go matrix; the live Redis path skips unless BABELQUEUE_TEST_REDIS is set.
           (cd idempotency-redis && go build ./... && go vet ./... && go test -race -count=1 ./...)
 
-      - name: Build & vet the Go 1.25 modules (otel, idempotency-postgres)
-        # Both floor at Go 1.25 (their security-fixed dependencies — otel/sdk, pgx and
-        # x/crypto — require it), so they build/test only on matrix entries that satisfy
-        # that floor. The OpenTelemetry module (ADR-0025) uses an in-memory span recorder;
-        # the Postgres idempotency store (ADR-0022) uses go-sqlmock, and its live DB path
-        # skips unless BABELQUEUE_TEST_PG is set.
-        if: ${{ matrix.go == '1.25' }}
+      - name: Build & vet the otel and idempotency-postgres modules
+        # Every module floors at Go 1.26 (the repo floor; otel 1.47 itself requires go 1.26.0),
+        # so they build/test on every matrix entry. The OpenTelemetry module (ADR-0025) uses an
+        # in-memory span recorder; the Postgres idempotency store (ADR-0022) uses go-sqlmock,
+        # and its live DB path skips unless BABELQUEUE_TEST_PG is set.
         run: |
           (cd otel && go build ./... && go vet ./... && go test -race -count=1 ./...)
           (cd idempotency-postgres && go build ./... && go vet ./... && go test -race -count=1 ./...)
 
       - name: Build & vet the Azure Service Bus module
-        # This module floors at Go 1.25 (its security-fixed golang.org/x/net requires it), so
-        # it builds/tests only on matrix entries that satisfy that floor (its unit +
-        # conformance tests are network-free — a fake client).
-        if: ${{ matrix.go == '1.25' }}
+        # Its unit + conformance tests are network-free — a fake client.
         run: |
           (cd azureservicebus && go build ./... && go vet ./... && go test -race -count=1 ./...)
 
       - name: Build & vet the Apache Pulsar module
-        # The pure-Go pulsar-client-go (no CGo, no libpulsar) sits behind this module's Go
-        # 1.25 floor (pulsar-client-go and golang.org/x/net require it), so it builds/tests
-        # only on matrix entries that satisfy that floor (its unit tests are network-free —
-        # a fake client).
-        if: ${{ matrix.go == '1.25' }}
+        # The pure-Go pulsar-client-go (no CGo, no libpulsar); its unit tests are
+        # network-free — a fake client.
         run: |
           (cd pulsar && go build ./... && go vet ./... && go test -race -count=1 ./...)
 
       - name: Build & vet the Apache Kafka module
-        # The pure-Go segmentio/kafka-go (no CGo, no librdkafka) sits behind this module's Go
-        # 1.24 floor; its unit tests are network-free (fake Writer/Reader).
+        # The pure-Go segmentio/kafka-go (no CGo, no librdkafka); its unit tests are
+        # network-free (fake Writer/Reader).
         run: |
           (cd kafka && go build ./... && go vet ./... && go test -race -count=1 ./...)
 
       - name: Build & vet the Apache ActiveMQ Artemis module
-        # The pure-Go Azure/go-amqp (AMQP 1.0, no CGo); this module floors at Go 1.25, so it
-        # builds/tests only on matrix entries that satisfy that floor. Its unit tests are
+        # The pure-Go Azure/go-amqp (AMQP 1.0, no CGo); its unit tests are
         # network-free (fake Sender/Receiver/Client seam).
-        if: ${{ matrix.go == '1.25' }}
         run: |
           (cd artemis && go build ./... && go vet ./... && go test -race -count=1 ./...)
 
       - name: Build & vet the asynq adapter module
-        # hibiken/asynq requires Go 1.24+ — every matrix entry satisfies it; its unit +
+        # hibiken/asynq builds on every matrix entry; its unit +
         # conformance tests are network-free (a fake Enqueuer seam — no Redis).
         run: |
           (cd asynq && go build ./... && go vet ./... && go test -race -count=1 ./...)
 
       - name: Build & vet the machinery adapter module
-        # RichardKnop/machinery v2 needs Go 1.22+; this module floors at 1.24. Its unit +
+        # RichardKnop/machinery v2 needs Go 1.22+; this module floors at 1.26. Its unit +
         # conformance tests are network-free (fake Sender/Registrar seams — no broker).
         run: |
           (cd machinery && go build ./... && go vet ./... && go test -race -count=1 ./...)
 
       # The core's TestConformanceResults runs every section's tests (core and the transport
       # modules) and writes results.json (ADR-0032) when BQ_CONFORMANCE_RESULTS is set. It runs
-      # on the Go 1.25 leg because the otel, pulsar, artemis and azureservicebus modules floor
-      # at Go 1.25.
+      # on the oldest matrix leg (Go 1.26) only, since one results.json is enough.
       - name: Conformance results (results.json)
-        if: ${{ matrix.go == '1.25' }}
+        if: ${{ matrix.go == '1.26' }}
         run: go test -count=1 -run '^TestConformanceResults$' -v .
         env:
           BQ_CONFORMANCE_RESULTS: ${{ runner.temp }}/results.json
@@ -135,14 +124,14 @@ jobs:
           REDIS_URL: redis://localhost:6379/0
 
       - uses: actions/setup-python@v6
-        if: ${{ matrix.go == '1.25' }}
+        if: ${{ matrix.go == '1.26' }}
         with:
           python-version: "3.12"
 
       # Schema-valid, no `fail`, bindings derived from the Go modules in the tree, and every
       # in-scope section and case present (an absent transport or section breaks CI).
       - name: Validate results.json
-        if: ${{ matrix.go == '1.25' }}
+        if: ${{ matrix.go == '1.26' }}
         run: |
           python -m pip install --quiet jsonschema==4.23.0
           python -I scripts/check-conformance-results.py "$RUNNER_TEMP/results.json" \

@@ -25,7 +25,7 @@ The mapping is direct and lossless:
 go get github.com/babelqueue/babelqueue-go/asynq
 ```
 
-Requires Go 1.24+ (asynq's floor).
+Requires Go 1.26+.
 
 ## Produce
 

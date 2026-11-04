@@ -1,6 +1,6 @@
 module github.com/babelqueue/babelqueue-go/machinery
 
-go 1.24
+go 1.26
 
 require (
 	github.com/RichardKnop/machinery/v2 v2.0.16

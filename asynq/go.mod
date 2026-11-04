@@ -1,6 +1,6 @@
 module github.com/babelqueue/babelqueue-go/asynq
 
-go 1.24.0
+go 1.26
 
 require (
 	github.com/babelqueue/babelqueue-go v1.0.0
