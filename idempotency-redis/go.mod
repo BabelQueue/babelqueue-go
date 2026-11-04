@@ -1,6 +1,6 @@
 module github.com/babelqueue/babelqueue-go/idempotency-redis
 
-go 1.24
+go 1.26
 
 require (
 	github.com/babelqueue/babelqueue-go v1.6.0

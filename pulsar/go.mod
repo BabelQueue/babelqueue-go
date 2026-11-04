@@ -1,6 +1,6 @@
 module github.com/babelqueue/babelqueue-go/pulsar
 
-go 1.25.0
+go 1.26
 
 require (
 	github.com/apache/pulsar-client-go v0.21.0

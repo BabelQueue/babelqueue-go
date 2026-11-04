@@ -1,6 +1,6 @@
 module github.com/babelqueue/babelqueue-go/sqs
 
-go 1.24
+go 1.26
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.47.1
