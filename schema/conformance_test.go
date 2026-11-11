@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 )
 
@@ -89,6 +90,71 @@ func TestPayloadUnicodeConformance(t *testing.T) {
 			errs := s.Validate(c.Data)
 			if got := len(errs) == 0; got != c.Valid {
 				t.Errorf("got valid=%v, want %v (errors: %v)", got, c.Valid, errs)
+			}
+		})
+	}
+}
+
+// TestPayloadKeywordsConformance runs the shared payload_schema_keywords cases (ADR-0024,
+// K-17): union `type`, numeric equality in const/enum, maxLength in code points, and the
+// registration warnings for keywords outside the supported subset. Unlike payload_schema each
+// case carries its own schema; the case passes when both the verdict and the warning set
+// (compared as a set of {pointer, keyword}, never the message text) match.
+func TestPayloadKeywordsConformance(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "testdata", "conformance", "manifest.json"))
+	if err != nil {
+		t.Fatalf("read vendored conformance manifest: %v", err)
+	}
+
+	var manifest struct {
+		PayloadSchemaKeywords *struct {
+			Cases []struct {
+				Name     string          `json:"name"`
+				Schema   json.RawMessage `json:"schema"`
+				Data     json.RawMessage `json:"data"`
+				Valid    bool            `json:"valid"`
+				Warnings []struct {
+					Pointer string `json:"pointer"`
+					Keyword string `json:"keyword"`
+				} `json:"warnings"`
+			} `json:"cases"`
+		} `json:"payload_schema_keywords"`
+	}
+	if err := json.Unmarshal(raw, &manifest); err != nil {
+		t.Fatalf("decode manifest: %v", err)
+	}
+	if manifest.PayloadSchemaKeywords == nil {
+		t.Fatal("manifest has no payload_schema_keywords section")
+	}
+	if len(manifest.PayloadSchemaKeywords.Cases) == 0 {
+		t.Fatal("payload_schema_keywords has no cases")
+	}
+	for _, c := range manifest.PayloadSchemaKeywords.Cases {
+		c := c
+		t.Run(c.Name, func(t *testing.T) {
+			s, err := Parse(c.Schema)
+			if err != nil {
+				t.Fatalf("parse schema: %v", err)
+			}
+			var data any
+			if err := json.Unmarshal(c.Data, &data); err != nil {
+				t.Fatalf("decode data: %v", err)
+			}
+			errs := s.Validate(data)
+			if got := len(errs) == 0; got != c.Valid {
+				t.Errorf("got valid=%v, want %v (errors: %v)", got, c.Valid, errs)
+			}
+
+			want := map[Warning]int{}
+			for _, w := range c.Warnings {
+				want[Warning{Pointer: w.Pointer, Keyword: w.Keyword}]++
+			}
+			got := map[Warning]int{}
+			for _, w := range s.Warnings() {
+				got[w]++
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("warnings: got %v, want %v", s.Warnings(), c.Warnings)
 			}
 		})
 	}

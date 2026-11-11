@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 The envelope wire format is versioned separately by `meta.schema_version`
 (currently **1**) — see the contract at [babelqueue.com](https://babelqueue.com).
 
+## [Unreleased]
+
+### Added
+
+- **`schema`: payload-validator parity with the other SDKs (ADR-0024; conformance 1.10.0 `payload_schema_keywords`).**
+  `type` may now be an array (`["string","null"]`; a value is valid when it matches any listed type, and
+  `integer` accepts `1.0` and `1e2`); `const` / `enum` compare numbers by mathematical value (`1` = `1.0` = `1e0`),
+  recursively in arrays and objects and across `int*` / `uint*` / `float*` / `json.Number`, while a boolean or a
+  string never equals a number; `maxLength` is enforced in Unicode code points. A keyword outside the supported subset
+  still never changes a verdict, but `schema.Parse` now reports one `schema.Warning{Pointer, Keyword}` per
+  occurrence (read them with `Schema.Warnings()`; they are also logged with `slog.Warn`). Annotation keywords
+  (`$schema`, `$id`, `title`, `description`, `examples`, `default`, `$comment`, `x-*`) never warn. No wire or
+  envelope change (`schema_version` stays 1).
+
+### Changed
+
+- Vendored conformance suite bumped to 1.10.0; the runner executes the new `payload_schema_keywords` section.
+
 ## [1.20.0, amqp 1.3.0, artemis 1.4.0, asynq 1.1.0, azureservicebus 1.5.0, idempotency-postgres 1.1.0, idempotency-redis 1.1.0, kafka 1.7.0, machinery 1.2.0, otel 0.5.0, pulsar 1.6.0, redis 1.5.0, sqs 1.13.0] - 2026-11-04
 
 ### Changed
