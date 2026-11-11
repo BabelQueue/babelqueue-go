@@ -21,6 +21,11 @@ The envelope wire format is versioned separately by `meta.schema_version`
   (`$schema`, `$id`, `title`, `description`, `examples`, `default`, `$comment`, `x-*`) never warn. No wire or
   envelope change (`schema_version` stays 1).
 
+### Fixed
+
+- `schema`: a non-finite `minLength` / `maxLength` (`NaN`, `±Inf`; only reachable from a hand-built map, never from
+  JSON) is ignored; `int(NaN)` is implementation-defined and could reject every non-empty string. Matches the other SDKs.
+
 ### Changed
 
 - Vendored conformance suite bumped to 1.10.0; the runner executes the new `payload_schema_keywords` section.
