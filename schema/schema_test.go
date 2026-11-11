@@ -235,6 +235,38 @@ func TestValidate_UnionKeepsPerTypeConstraints(t *testing.T) {
 	}
 }
 
+func TestValidate_NonFiniteLengthBoundsAreIgnored(t *testing.T) {
+	// NaN / Inf cannot come from JSON; a hand-built map can carry them, and they must not
+	// change a verdict (int(NaN) is implementation-defined and would otherwise reject "a").
+	for _, keyword := range []string{"minLength", "maxLength"} {
+		for _, bound := range []float64{math.NaN(), math.Inf(1), math.Inf(-1)} {
+			s := fromMap(map[string]any{"type": "string", keyword: bound})
+			for _, v := range []string{"", "a", "abc"} {
+				if errs := s.Validate(v); len(errs) != 0 {
+					t.Errorf("%s=%v must be ignored, %q gave %v", keyword, bound, v, errs)
+				}
+			}
+		}
+	}
+}
+
+func TestValidate_FractionalLengthBoundsTruncateTowardZero(t *testing.T) {
+	min := parse(t, `{"type":"string","minLength":2.5}`)
+	if errs := min.Validate("ab"); len(errs) != 0 {
+		t.Errorf("minLength 2.5 behaves as 2: %v", errs)
+	}
+	if errs := min.Validate("a"); len(errs) == 0 {
+		t.Error("a is below minLength 2")
+	}
+	max := parse(t, `{"type":"string","maxLength":-0.5}`)
+	if errs := max.Validate(""); len(errs) != 0 {
+		t.Errorf("maxLength -0.5 behaves as 0: %v", errs)
+	}
+	if errs := max.Validate("a"); len(errs) == 0 {
+		t.Error("a exceeds maxLength 0")
+	}
+}
+
 func TestValidate_MaxLengthCountsCodePoints(t *testing.T) {
 	s := parse(t, `{"type":"string","maxLength":3}`)
 	for _, v := range []string{"abc", "\u011f\u00fc\u015f", "\U0001F600\U0001F600\U0001F600"} {

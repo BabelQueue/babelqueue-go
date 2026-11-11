@@ -16,6 +16,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"math/big"
 	"reflect"
 	"sort"
@@ -189,11 +190,13 @@ func fromMap(m map[string]any) *Schema {
 		s.Const = c
 		s.HasConst = true
 	}
-	if ml, ok := m["minLength"].(float64); ok {
+	// A fractional bound is truncated toward zero; a non-finite one (NaN / +-Inf — unreachable from
+	// JSON, only from a hand-built map) is ignored, as in the other SDKs.
+	if ml, ok := m["minLength"].(float64); ok && !math.IsNaN(ml) && !math.IsInf(ml, 0) {
 		v := int(ml)
 		s.MinLength = &v
 	}
-	if ml, ok := m["maxLength"].(float64); ok {
+	if ml, ok := m["maxLength"].(float64); ok && !math.IsNaN(ml) && !math.IsInf(ml, 0) {
 		v := int(ml)
 		s.MaxLength = &v
 	}
